@@ -1,101 +1,94 @@
+import 'dotenv/config';
+import express, { type Request, type Response } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
-import express from 'express';
 import multer from 'multer';
-import { createServer as createViteServer } from 'vite';
-import { getDb } from './server/db.ts';
+import { and, desc, eq, gte, isNotNull, ne, sql } from 'drizzle-orm';
+import { db } from './src/db/index.ts';
 import {
-  createSessionToken,
-  getSessionTimeoutMinutes,
-  hashPassword,
-  loadUserWithPermissions,
-  requireAuth,
-  requirePermission,
-  revokeSessionToken,
-  userHasPermission,
-  verifyPassword,
-  type AuthenticatedRequest,
-} from './server/auth.ts';
+  tblActivityLogs,
+  tblFats,
+  tblFfats,
+  tblInventoryItems,
+  tblKafos,
+  tblLedger,
+  tblModemBrands,
+  tblOlts,
+  tblPermissions,
+  tblPromotions,
+  tblRolePermissions,
+  tblRoles,
+  tblServiceImages,
+  tblServiceRecords,
+  tblSpools,
+  tblTariffTemplates,
+  tblTicketComments,
+  tblTickets,
+  tblUserTariffs,
+  tblUsers,
+  tblVanStock,
+  type TariffTemplateRulesJson,
+  type TicketTypeKey,
+} from './src/db/schema.ts';
+import { ensureSeeded } from './src/db/seed.ts';
 import {
-  aggregateMonthlyContractorEarnings,
-  calculateTariffSnapshot,
+  TICKET_TYPES,
+  calculateTemplatePriceSnapshot,
   computeLedgerBalance,
+  evaluatePromotionForTicket,
   generateFFatCode,
+  getLowSpoolWarnings,
+  getTicketTypeFieldVisibility,
   validateModemSerial,
   validateSpoolConsumption,
   validateVanModemConsumption,
-  type ModemSource,
+  type CompletedTicketEvent,
+  type PromotionRule,
   type SpoolRecord,
-  type TariffRule,
   type VanStockRecord,
 } from './src/lib/fiberLogic.ts';
-
-const PORT = Number(process.env.PORT) || 3000;
-const UPLOADS_BASE_DIR = path.resolve(process.cwd(), 'uploads');
-if (!fs.existsSync(UPLOADS_BASE_DIR)) {
-  fs.mkdirSync(UPLOADS_BASE_DIR, { recursive: true });
-}
-
-// Initialize DB on startup
-getDb();
-
-function recordActivity(
-  actor: AuthenticatedRequest['authUser'] | undefined,
-  actionType: string,
-  entityType: string,
-  entityId: number | null,
-  summary: string,
-  details?: string | null,
-): void {
-  if (!actor) return;
-  try {
-    getDb()
-      .prepare(
-        `INSERT INTO tbl_activity_logs (user_id, username, user_full_name, action_type, entity_type, entity_id, summary, details)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        actor.id,
-        actor.username,
-        `${actor.first_name} ${actor.last_name}`.trim(),
-        actionType,
-        entityType,
-        entityId,
-        summary,
-        details ?? null,
-      );
-  } catch {
-    // Non-blocking audit trail write
-  }
-}
+import { gregorianToJalali } from './src/lib/jalali.ts';
+import {
+  hashLocalPassword,
+  issueIntranetToken,
+  requireAuth,
+  requirePermission,
+  userHasPermission,
+  verifyLocalPassword,
+  type AuthRequest,
+  type AuthUserContext,
+} from './src/middleware/auth.ts';
 
 const app = express();
-app.disable('x-powered-by');
-app.use(express.json({ limit: '2mb' }));
+const PORT = 3000;
+const UPLOADS_ROOT = path.resolve(process.cwd(), 'uploads');
+fs.mkdirSync(UPLOADS_ROOT, { recursive: true });
 
-// Serve uploaded evidence files safely
-app.use(
-  '/uploads',
-  express.static(UPLOADS_BASE_DIR, {
-    dotfiles: 'deny',
-    index: false,
-  }),
-);
+app.use(express.json({ limit: '4mb' }));
 
-// Multer memory storage so we validate ticketId & magic bytes before writing to disk
+// Static local uploads
+app.use('/uploads', express.static(UPLOADS_ROOT, { index: false }));
+
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 3 * 1024 * 1024 }, // 3MB hard cap (compressed images are ~150KB)
+  limits: { fileSize: 5 * 1024 * 1024 },
 });
 
-function isValidImageBuffer(buf: Buffer): 'jpg' | 'png' | 'webp' | null {
+function detectImageExtension(buf: Buffer): 'jpg' | 'png' | 'webp' | null {
   if (buf.length < 12) return null;
-  // JPEG: FF D8 FF
   if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
-  // PNG: 89 50 4E 47
-  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
-  // WEBP: RIFF....WEBP
+  if (
+    buf[0] === 0x89 &&
+    buf[1] === 0x50 &&
+    buf[2] === 0x4e &&
+    buf[3] === 0x47 &&
+    buf[4] === 0x0d &&
+    buf[5] === 0x0a &&
+    buf[6] === 0x1a &&
+    buf[7] === 0x0a
+  ) {
+    return 'png';
+  }
   if (
     buf.subarray(0, 4).toString('ascii') === 'RIFF' &&
     buf.subarray(8, 12).toString('ascii') === 'WEBP'
@@ -105,1131 +98,1178 @@ function isValidImageBuffer(buf: Buffer): 'jpg' | 'png' | 'webp' | null {
   return null;
 }
 
-function isAdminClaimed(): boolean {
-  const db = getDb();
-  const row = db
-    .prepare('SELECT password_hash FROM tbl_users WHERE username = ?')
-    .get('admin') as { password_hash: string } | undefined;
-  return Boolean(row && row.password_hash && row.password_hash.length > 0);
+async function logActivity(params: {
+  user?: AuthUserContext;
+  actionType: string;
+  entityType: string;
+  entityId?: number | null;
+  summary: string;
+  details?: string | null;
+}): Promise<void> {
+  try {
+    await db.insert(tblActivityLogs).values({
+      user_id: params.user?.id ?? null,
+      username: params.user?.username ?? 'system',
+      user_full_name: params.user?.full_name ?? 'سامانه',
+      action_type: params.actionType,
+      entity_type: params.entityType,
+      entity_id: params.entityId ?? null,
+      summary: params.summary,
+      details: params.details ?? null,
+    });
+  } catch (err) {
+    console.error('Activity log error:', err);
+  }
+}
+
+function handleRouteError(res: Response, err: unknown, fallbackMsg = 'خطای سرور رخ داد.'): void {
+  console.error(err);
+  const pgCode =
+    typeof err === 'object' && err !== null && 'code' in err
+      ? String((err as { code?: unknown }).code)
+      : '';
+  if (pgCode === '23505') {
+    res.status(409).json({ error: 'مقدار تکراری است و قبلاً ثبت شده است.' });
+    return;
+  }
+  if (pgCode === '23503') {
+    res.status(400).json({ error: 'ارجاع انتخاب‌شده در پایگاه داده معتبر نیست.' });
+    return;
+  }
+  if (err instanceof Error && err.message) {
+    res.status(400).json({ error: err.message });
+    return;
+  }
+  res.status(500).json({ error: fallbackMsg });
 }
 
 // ==========================================
-// 1. AUTHENTICATION & SESSION ROUTES
+// AUTHENTICATION & BOOTSTRAP ROUTES
 // ==========================================
 
-app.get('/api/auth/status', (_req, res) => {
-  res.json({
-    adminClaimed: isAdminClaimed(),
-    timeoutMinutes: getSessionTimeoutMinutes(),
-    demoModeAvailable: !isAdminClaimed(),
-  });
+app.get('/api/auth/bootstrap-status', async (_req: Request, res: Response) => {
+  try {
+    await ensureSeeded();
+    const adminRows = await db
+      .select({ id: tblUsers.id, password_hash: tblUsers.password_hash, full_name: tblUsers.full_name })
+      .from(tblUsers)
+      .where(eq(tblUsers.username, 'admin'))
+      .limit(1);
+    const admin = adminRows[0];
+    const adminNeedsClaim = Boolean(admin && !admin.password_hash);
+    res.json({ adminNeedsClaim });
+  } catch (err) {
+    handleRouteError(res, err, 'خطا در بررسی وضعیت اولیه سامانه');
+  }
 });
 
-app.post('/api/auth/claim-admin', (req, res) => {
-  if (isAdminClaimed()) {
-    res.status(403).json({ error: 'رمز عبور مدیر کل قبلاً تنظیم شده است.' });
-    return;
-  }
-  const password = typeof req.body?.password === 'string' ? req.body.password : '';
-  if (password.length < 6 || password.length > 128) {
-    res.status(400).json({ error: 'رمز عبور باید حداقل ۶ کاراکتر باشد.' });
-    return;
-  }
+app.post('/api/auth/claim-admin', async (req: Request, res: Response) => {
+  try {
+    await ensureSeeded();
+    const password = String(req.body?.password || '').trim();
+    const fullName = String(req.body?.full_name || '').trim();
+    if (password.length < 6) {
+      res.status(400).json({ error: 'رمز عبور مدیر کل باید حداقل ۶ کاراکتر باشد.' });
+      return;
+    }
 
-  const db = getDb();
-  const hashed = hashPassword(password);
-  const adminRow = db.prepare('SELECT id, role_id FROM tbl_users WHERE username = ?').get('admin') as
-    | { id: number; role_id: number }
-    | undefined;
-  if (!adminRow) {
-    res.status(404).json({ error: 'حساب مدیر کل یافت نشد.' });
-    return;
+    const adminRows = await db
+      .select({ id: tblUsers.id, username: tblUsers.username, password_hash: tblUsers.password_hash })
+      .from(tblUsers)
+      .where(eq(tblUsers.username, 'admin'))
+      .limit(1);
+
+    const admin = adminRows[0];
+    if (!admin) {
+      res.status(404).json({ error: 'کاربر مدیر کل یافت نشد.' });
+      return;
+    }
+    if (admin.password_hash) {
+      res.status(409).json({ error: 'رمز عبور مدیر کل قبلاً تنظیم شده است.' });
+      return;
+    }
+
+    const hashed = hashLocalPassword(password);
+    await db
+      .update(tblUsers)
+      .set({
+        password_hash: hashed,
+        ...(fullName ? { full_name: fullName } : {}),
+      })
+      .where(eq(tblUsers.id, admin.id));
+
+    const token = issueIntranetToken(admin.id, admin.username);
+    res.json({ token, username: admin.username });
+  } catch (err) {
+    handleRouteError(res, err, 'خطا در فعال‌سازی حساب مدیر کل');
   }
-
-  db.prepare("UPDATE tbl_users SET password_hash = ?, last_login = datetime('now') WHERE id = ?").run(
-    hashed,
-    adminRow.id,
-  );
-
-  const user = loadUserWithPermissions(adminRow.id);
-  const session = createSessionToken(adminRow.id, adminRow.role_id);
-  res.json({ ...session, user });
 });
 
-app.post('/api/auth/demo-login', (req, res) => {
-  if (isAdminClaimed()) {
-    res.status(403).json({ error: 'پس از فعال‌سازی رمز مدیر کل، ورود آزمایشی غیرفعال می‌شود.' });
-    return;
-  }
-  const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
-  if (!['admin', 'operator', 'installer1', 'installer2'].includes(username)) {
-    res.status(400).json({ error: 'حساب نمونه انتخاب‌شده معتبر نیست.' });
-    return;
-  }
+app.post('/api/auth/local-login', async (req: Request, res: Response) => {
+  try {
+    await ensureSeeded();
+    const username = String(req.body?.username || '').trim();
+    const password = String(req.body?.password || '');
+    if (!username || !password) {
+      res.status(400).json({ error: 'نام کاربری و رمز عبور الزامی است.' });
+      return;
+    }
 
-  const db = getDb();
-  const userRow = db
-    .prepare('SELECT id, role_id, is_active FROM tbl_users WHERE username = ?')
-    .get(username) as { id: number; role_id: number; is_active: number } | undefined;
+    const rows = await db
+      .select({
+        id: tblUsers.id,
+        username: tblUsers.username,
+        password_hash: tblUsers.password_hash,
+        is_active: tblUsers.is_active,
+      })
+      .from(tblUsers)
+      .where(eq(tblUsers.username, username))
+      .limit(1);
 
-  if (!userRow || userRow.is_active !== 1) {
-    res.status(401).json({ error: 'حساب کاربری غیرفعال است.' });
-    return;
+    const user = rows[0];
+    if (!user || !user.is_active) {
+      res.status(401).json({ error: 'نام کاربری یا رمز عبور نادرست است.' });
+      return;
+    }
+    if (!user.password_hash) {
+      res.status(401).json({
+        error: 'برای این حساب رمز شبکه داخلی تعریف نشده است. از مدیر کل یا ورود گوگل استفاده کنید.',
+      });
+      return;
+    }
+    if (!verifyLocalPassword(password, user.password_hash)) {
+      res.status(401).json({ error: 'نام کاربری یا رمز عبور نادرست است.' });
+      return;
+    }
+
+    const token = issueIntranetToken(user.id, user.username);
+    res.json({ token });
+  } catch (err) {
+    handleRouteError(res, err, 'خطا در ورود شبکه داخلی');
   }
-
-  db.prepare("UPDATE tbl_users SET last_login = datetime('now') WHERE id = ?").run(userRow.id);
-  const user = loadUserWithPermissions(userRow.id);
-  const session = createSessionToken(userRow.id, userRow.role_id);
-  res.json({ ...session, user });
 });
 
-app.post('/api/auth/login', (req, res) => {
-  const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
-  const password = typeof req.body?.password === 'string' ? req.body.password : '';
-
-  if (!username || !password) {
-    res.status(400).json({ error: 'نام کاربری و رمز عبور الزامی است.' });
-    return;
+app.get('/api/auth/session', async (req: AuthRequest, res: Response, next) => {
+  try {
+    await ensureSeeded();
+    next();
+  } catch (err) {
+    handleRouteError(res, err, 'خطا در بارگذاری اولیه پایگاه داده');
   }
-
-  const db = getDb();
-  const userRow = db
-    .prepare('SELECT id, role_id, password_hash, is_active FROM tbl_users WHERE username = ?')
-    .get(username) as
-    | { id: number; role_id: number; password_hash: string; is_active: number }
-    | undefined;
-
-  if (!userRow || !userRow.password_hash || !verifyPassword(password, userRow.password_hash)) {
-    res.status(401).json({ error: 'نام کاربری یا رمز عبور نادرست است.' });
-    return;
-  }
-
-  if (userRow.is_active !== 1) {
-    res.status(403).json({ error: 'حساب کاربری شما غیرفعال شده است.' });
-    return;
-  }
-
-  db.prepare("UPDATE tbl_users SET last_login = datetime('now') WHERE id = ?").run(userRow.id);
-  const user = loadUserWithPermissions(userRow.id);
-  const session = createSessionToken(userRow.id, userRow.role_id);
-  res.json({ ...session, user });
-});
-
-app.post('/api/auth/logout', requireAuth, (req: AuthenticatedRequest, res) => {
-  if (req.rawToken) {
-    revokeSessionToken(req.rawToken);
-  }
-  res.json({ ok: true });
-});
-
-app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
-  res.json({
-    user: req.authUser,
-    csrfToken: req.sessionPayload?.csrf,
-    timeoutMinutes: getSessionTimeoutMinutes(),
-  });
+}, requireAuth, (req: AuthRequest, res: Response) => {
+  res.json({ user: req.authUser });
 });
 
 // ==========================================
-// 2. DASHBOARD & INSTALLER INBOX
+// UPLOAD ROUTE (Local /uploads/YYYY/MM/<TicketID>/)
 // ==========================================
 
-app.get('/api/dashboard', requireAuth, (req: AuthenticatedRequest, res) => {
-  const user = req.authUser!;
-  const db = getDb();
-  const canViewAll = userHasPermission(user, 'can_view_all_tickets');
+app.post(
+  '/api/upload',
+  requireAuth,
+  upload.single('image'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const file = req.file;
+      const ticketId = Number(req.body?.ticket_id);
+      const imageType = String(req.body?.image_type || 'evidence').replace(/[^a-zA-Z0-9_-]/g, '');
+      if (!file) {
+        res.status(400).json({ error: 'فایل تصویر ارسال نشده است.' });
+        return;
+      }
+      if (!Number.isInteger(ticketId) || ticketId <= 0) {
+        res.status(400).json({ error: 'شناسه تیکت نامعتبر است.' });
+        return;
+      }
 
-  const ticketStats = (
-    canViewAll
-      ? db
-          .prepare(
-            `SELECT
-               COUNT(*) as total,
-               SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-               SUM(CASE WHEN status = 'assigned' THEN 1 ELSE 0 END) as assigned,
-               SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed
-             FROM tbl_tickets`,
-          )
-          .get()
-      : db
-          .prepare(
-            `SELECT
-               COUNT(*) as total,
-               SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-               SUM(CASE WHEN status = 'assigned' THEN 1 ELSE 0 END) as assigned,
-               SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed
-             FROM tbl_tickets
-             WHERE assigned_installer = ?`,
-          )
-          .get(user.id)
-  ) as { total: number; pending: number; assigned: number; completed: number };
+      const ext = detectImageExtension(file.buffer);
+      if (!ext) {
+        res.status(400).json({ error: 'فرمت تصویر معتبر نیست (فقط JPG, PNG, WebP).' });
+        return;
+      }
 
-  const meterRow = (
-    canViewAll
-      ? db
-          .prepare(
-            `SELECT
-               COALESCE(SUM(out_total_meter), 0) as out_meters,
-               COALESCE(SUM(in_total_meter), 0) as in_meters
-             FROM tbl_service_records`,
-          )
-          .get()
-      : db
-          .prepare(
-            `SELECT
-               COALESCE(SUM(out_total_meter), 0) as out_meters,
-               COALESCE(SUM(in_total_meter), 0) as in_meters
-             FROM tbl_service_records
-             WHERE installer_id = ?`,
-          )
-          .get(user.id)
-  ) as { out_meters: number; in_meters: number };
+      const now = new Date();
+      const yyyy = String(now.getFullYear());
+      const mm = String(now.getMonth() + 1).padStart(2, '0');
+      const targetDir = path.join(UPLOADS_ROOT, yyyy, mm, String(ticketId));
+      fs.mkdirSync(targetDir, { recursive: true });
 
-  const spoolRow = (
-    canViewAll
-      ? db
-          .prepare(
-            `SELECT COALESCE(SUM(current_length), 0) as remaining_meters, COUNT(*) as spool_count
-             FROM tbl_spools`,
-          )
-          .get()
-      : db
-          .prepare(
-            `SELECT COALESCE(SUM(current_length), 0) as remaining_meters, COUNT(*) as spool_count
-             FROM tbl_spools
-             WHERE assigned_installer_id = ?`,
-          )
-          .get(user.id)
-  ) as { remaining_meters: number; spool_count: number };
+      const uniqueName = `${imageType || 'img'}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.${ext}`;
+      const fullPath = path.join(targetDir, uniqueName);
+      fs.writeFileSync(fullPath, file.buffer);
 
-  const ledgerRows = db
-    .prepare('SELECT amount, type FROM tbl_ledger WHERE user_id = ?')
-    .all(user.id) as Array<{ amount: number; type: 'credit' | 'debit' }>;
-  const myBalance = computeLedgerBalance(ledgerRows);
+      const publicPath = `/uploads/${yyyy}/${mm}/${ticketId}/${uniqueName}`;
+      res.status(201).json({
+        file_path: publicPath,
+        image_type: imageType || 'evidence',
+        size_bytes: file.size,
+      });
+    } catch (err) {
+      handleRouteError(res, err, 'خطا در ذخیره فایل تصویر');
+    }
+  },
+);
 
-  const inboxTickets = db
-    .prepare(
-      `SELECT t.*, u.first_name || ' ' || u.last_name as installer_name
-       FROM tbl_tickets t
-       LEFT JOIN tbl_users u ON u.id = t.assigned_installer
-       WHERE t.status != 'completed' ${canViewAll ? '' : 'AND t.assigned_installer = ?'}
-       ORDER BY t.id DESC
-       LIMIT 12`,
-    )
-    .all(...(canViewAll ? [] : [user.id]));
+// ==========================================
+// DASHBOARD ROUTE
+// ==========================================
 
-  const now = new Date();
-  const currentMonthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+app.get('/api/dashboard', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    await ensureSeeded();
+    const user = req.authUser!;
+    const canSeeAll = userHasPermission(user, 'can_view_all_tickets');
 
-  const dailyMetrics = db
-    .prepare(
-      `SELECT substr(created_at, 1, 10) as day,
-              COUNT(*) as count,
-              COALESCE(SUM(out_total_meter), 0) as outMeters,
-              COALESCE(SUM(in_total_meter), 0) as inMeters,
-              COALESCE(SUM(out_total_meter + in_total_meter), 0) as meters
-       FROM tbl_service_records
-       WHERE substr(created_at, 1, 7) = ? ${canViewAll ? '' : 'AND installer_id = ?'}
-       GROUP BY substr(created_at, 1, 10)
-       ORDER BY day ASC
-       LIMIT 31`,
-    )
-    .all(...(canViewAll ? [currentMonthPrefix] : [currentMonthPrefix, user.id]));
+    const allTickets = await db
+      .select({
+        id: tblTickets.id,
+        type: tblTickets.type,
+        customer_name: tblTickets.customer_name,
+        address: tblTickets.address,
+        status: tblTickets.status,
+        assigned_installer: tblTickets.assigned_installer,
+        installer_name: tblUsers.full_name,
+        scheduled_date: tblTickets.scheduled_date,
+        scheduled_time: tblTickets.scheduled_time,
+        assigned_at: tblTickets.assigned_at,
+        started_at: tblTickets.started_at,
+        completed_at: tblTickets.completed_at,
+        created_at: tblTickets.created_at,
+      })
+      .from(tblTickets)
+      .leftJoin(tblUsers, eq(tblUsers.id, tblTickets.assigned_installer))
+      .orderBy(desc(tblTickets.id));
 
-  const monthlySpoolStats = db
-    .prepare(
-      `SELECT s.id,
-              s.spool_code,
-              s.cable_type,
-              s.initial_length,
-              s.current_length,
-              COALESCE((
-                SELECT SUM(
-                  CASE WHEN sr.out_spool_id = s.id THEN sr.out_total_meter ELSE 0 END +
-                  CASE WHEN sr.in_spool_id = s.id THEN sr.in_total_meter ELSE 0 END
-                )
-                FROM tbl_service_records sr
-                WHERE substr(sr.created_at, 1, 7) = ?
-                  ${canViewAll ? '' : 'AND sr.installer_id = ?'}
-                  AND (sr.out_spool_id = s.id OR sr.in_spool_id = s.id)
-              ), 0) as usedMetersThisMonth
-       FROM tbl_spools s
-       ${canViewAll ? '' : 'WHERE s.assigned_installer_id = ?'}
-       ORDER BY usedMetersThisMonth DESC, s.id ASC`,
-    )
-    .all(
-      ...(canViewAll
-        ? [currentMonthPrefix]
-        : [currentMonthPrefix, user.id, user.id]),
+    const visibleTickets = canSeeAll
+      ? allTickets
+      : allTickets.filter((t) => t.assigned_installer === user.id);
+
+    const spools = await db
+      .select({
+        id: tblSpools.id,
+        spool_code: tblSpools.spool_code,
+        cable_type: tblSpools.cable_type,
+        initial_length: tblSpools.initial_length,
+        current_length: tblSpools.current_length,
+        assigned_installer_id: tblSpools.assigned_installer_id,
+      })
+      .from(tblSpools);
+
+    const records = await db
+      .select({
+        id: tblServiceRecords.id,
+        installer_id: tblServiceRecords.installer_id,
+        out_total_meter: tblServiceRecords.out_total_meter,
+        in_total_meter: tblServiceRecords.in_total_meter,
+        created_at: tblServiceRecords.created_at,
+      })
+      .from(tblServiceRecords);
+
+    const ledgerFilter = canSeeAll ? undefined : eq(tblLedger.user_id, user.id);
+    const ledgerRows = await db.select().from(tblLedger).where(ledgerFilter);
+    const balanceSummary = computeLedgerBalance(
+      ledgerRows.map((l) => ({
+        amount: l.amount,
+        type: l.type === 'debit' ? 'debit' : 'credit',
+      })),
     );
 
-  const scheduledTickets = db
-    .prepare(
-      `SELECT t.*, u.first_name || ' ' || u.last_name as installer_name
-       FROM tbl_tickets t
-       LEFT JOIN tbl_users u ON u.id = t.assigned_installer
-       WHERE t.status != 'completed' ${canViewAll ? '' : 'AND t.assigned_installer = ?'}
-       ORDER BY COALESCE(t.scheduled_date, substr(t.created_at, 1, 10)) ASC,
-                COALESCE(t.scheduled_time, '23:59') ASC,
-                t.id ASC`,
-    )
-    .all(...(canViewAll ? [] : [user.id]));
+    // Build 6-month Jalali chart series for DashboardPage
+    const now = new Date();
+    const currentJalali = gregorianToJalali(now.getFullYear(), now.getMonth() + 1, now.getDate());
+    const monthlySeries: Array<{
+      monthKey: string;
+      monthLabel: string;
+      completedTickets: number;
+      outdoorMeters: number;
+      indoorMeters: number;
+    }> = [];
 
-  res.json({
-    stats: {
-      totalTickets: ticketStats.total || 0,
-      pendingTickets: ticketStats.pending || 0,
-      assignedTickets: ticketStats.assigned || 0,
-      completedTickets: ticketStats.completed || 0,
-      outMetersUsed: meterRow.out_meters || 0,
-      inMetersUsed: meterRow.in_meters || 0,
-      remainingSpoolMeters: spoolRow.remaining_meters || 0,
-      spoolCount: spoolRow.spool_count || 0,
-      myBalance,
-    },
-    inboxTickets,
-    scheduledTickets,
-    dailyMetrics,
-    monthlySpoolStats,
-  });
+    const jalaliMonths = [
+      'فروردین', 'اردیبهشت', 'خرداد', 'تیر', 'مرداد', 'شهریور',
+      'مهر', 'آبان', 'آذر', 'دی', 'بهمن', 'اسفند',
+    ];
+
+    for (let offset = 5; offset >= 0; offset--) {
+      let jm = currentJalali.jm - offset;
+      let jy = currentJalali.jy;
+      while (jm <= 0) {
+        jm += 12;
+        jy -= 1;
+      }
+      const key = `${jy}-${String(jm).padStart(2, '0')}`;
+      monthlySeries.push({
+        monthKey: key,
+        monthLabel: `${jalaliMonths[jm - 1]} ${jy}`,
+        completedTickets: 0,
+        outdoorMeters: 0,
+        indoorMeters: 0,
+      });
+    }
+
+    const bucketMap = new Map(monthlySeries.map((m) => [m.monthKey, m]));
+    for (const t of visibleTickets) {
+      if (t.status !== 'completed' || !t.completed_at) continue;
+      const d = new Date(t.completed_at);
+      const j = gregorianToJalali(d.getFullYear(), d.getMonth() + 1, d.getDate());
+      const key = `${j.jy}-${String(j.jm).padStart(2, '0')}`;
+      const bucket = bucketMap.get(key);
+      if (bucket) bucket.completedTickets += 1;
+    }
+    for (const r of records) {
+      if (!canSeeAll && r.installer_id !== user.id) continue;
+      const d = new Date(r.created_at);
+      const j = gregorianToJalali(d.getFullYear(), d.getMonth() + 1, d.getDate());
+      const key = `${j.jy}-${String(j.jm).padStart(2, '0')}`;
+      const bucket = bucketMap.get(key);
+      if (bucket) {
+        bucket.outdoorMeters += r.out_total_meter;
+        bucket.indoorMeters += r.in_total_meter;
+      }
+    }
+
+    const lowSpools = getLowSpoolWarnings(
+      spools.map((s) => ({
+        ...s,
+        cable_type: s.cable_type as 'indoor' | 'outdoor',
+      })),
+    );
+
+    res.json({
+      kpis: {
+        pendingTickets: visibleTickets.filter((t) => t.status === 'pending').length,
+        inProgressTickets: visibleTickets.filter((t) => t.status === 'in_progress').length,
+        completedTickets: visibleTickets.filter((t) => t.status === 'completed').length,
+        totalSpoolMeters: spools.reduce((acc, s) => acc + s.current_length, 0),
+        lowSpoolCount: lowSpools.length,
+        balance: balanceSummary.balance,
+      },
+      lowSpools,
+      monthlySeries,
+      scheduledTickets: visibleTickets,
+    });
+  } catch (err) {
+    handleRouteError(res, err, 'خطا در دریافت اطلاعات داشبورد');
+  }
 });
 
 // ==========================================
-// 3. TICKETS & SERVICE EXECUTION
+// 5-TYPE TICKETS, SLA & IMMUTABLE COMMENTS
 // ==========================================
 
-app.get('/api/tickets', requireAuth, (req: AuthenticatedRequest, res) => {
-  const user = req.authUser!;
-  const db = getDb();
-  const canViewAll = userHasPermission(user, 'can_view_all_tickets');
+app.get('/api/tickets', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    await ensureSeeded();
+    const user = req.authUser!;
+    const canSeeAll = userHasPermission(user, 'can_view_all_tickets');
 
-  const statusFilter = typeof req.query.status === 'string' ? req.query.status : '';
-  const typeFilter = typeof req.query.type === 'string' ? req.query.type : '';
+    const rows = await db
+      .select({
+        id: tblTickets.id,
+        type: tblTickets.type,
+        customer_name: tblTickets.customer_name,
+        address: tblTickets.address,
+        pppoe_user: tblTickets.pppoe_user,
+        pppoe_pass: tblTickets.pppoe_pass,
+        vlan_id: tblTickets.vlan_id,
+        voip_config: tblTickets.voip_config,
+        operator_notes: tblTickets.operator_notes,
+        status: tblTickets.status,
+        assigned_installer: tblTickets.assigned_installer,
+        installer_name: tblUsers.full_name,
+        scheduled_date: tblTickets.scheduled_date,
+        scheduled_time: tblTickets.scheduled_time,
+        assigned_at: tblTickets.assigned_at,
+        started_at: tblTickets.started_at,
+        completed_at: tblTickets.completed_at,
+        created_at: tblTickets.created_at,
+      })
+      .from(tblTickets)
+      .leftJoin(tblUsers, eq(tblUsers.id, tblTickets.assigned_installer))
+      .orderBy(desc(tblTickets.id));
 
-  const clauses: string[] = [];
-  const params: Array<string | number> = [];
+    const tickets = canSeeAll ? rows : rows.filter((t) => t.assigned_installer === user.id);
 
-  if (!canViewAll) {
-    clauses.push('t.assigned_installer = ?');
-    params.push(user.id);
+    const installers = await db
+      .select({
+        id: tblUsers.id,
+        full_name: tblUsers.full_name,
+        username: tblUsers.username,
+        role_name: tblRoles.name,
+      })
+      .from(tblUsers)
+      .innerJoin(tblRoles, eq(tblRoles.id, tblUsers.role_id))
+      .where(eq(tblUsers.is_active, true));
+
+    res.json({ tickets, installers });
+  } catch (err) {
+    handleRouteError(res, err, 'خطا در دریافت لیست تیکت‌ها');
   }
-  if (['pending', 'assigned', 'completed'].includes(statusFilter)) {
-    clauses.push('t.status = ?');
-    params.push(statusFilter);
-  }
-  if (['install', 'fault'].includes(typeFilter)) {
-    clauses.push('t.type = ?');
-    params.push(typeFilter);
-  }
-
-  const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-  const rows = db
-    .prepare(
-      `SELECT t.*,
-              u.first_name || ' ' || u.last_name as installer_name,
-              sr.id as service_record_id,
-              sr.modem_serial,
-              ff.ffat_code,
-              f.fat_number,
-              o.name as olt_name,
-              k.name as kaf_name
-       FROM tbl_tickets t
-       LEFT JOIN tbl_users u ON u.id = t.assigned_installer
-       LEFT JOIN tbl_service_records sr ON sr.ticket_id = t.id
-       LEFT JOIN tbl_ffats ff ON ff.id = sr.ffat_id
-       LEFT JOIN tbl_fats f ON f.id = sr.fat_id
-       LEFT JOIN tbl_olts o ON o.id = sr.olt_id
-       LEFT JOIN tbl_kafos k ON k.id = sr.kaf_id
-       ${whereSql}
-       ORDER BY t.id DESC`,
-    )
-    .all(...params);
-
-  res.json({ tickets: rows });
 });
 
 app.post(
   '/api/tickets',
   requireAuth,
   requirePermission('can_create_tickets'),
-  (req: AuthenticatedRequest, res) => {
-    const customerName =
-      typeof req.body?.customer_name === 'string' ? req.body.customer_name.trim() : '';
-    const address = typeof req.body?.address === 'string' ? req.body.address.trim() : '';
-    const type = req.body?.type;
-    const assignedRaw = req.body?.assigned_installer;
-
-    const configPppoeUser =
-      typeof req.body?.config_pppoe_user === 'string' && req.body.config_pppoe_user.trim()
-        ? req.body.config_pppoe_user.trim().slice(0, 100)
-        : null;
-    const configPppoePass =
-      typeof req.body?.config_pppoe_pass === 'string' && req.body.config_pppoe_pass.trim()
-        ? req.body.config_pppoe_pass.trim().slice(0, 100)
-        : null;
-    const configVlanRaw = req.body?.config_vlan;
-    const configVlan =
-      configVlanRaw !== null && configVlanRaw !== undefined && String(configVlanRaw).trim() !== ''
-        ? Math.round(Number(configVlanRaw))
-        : null;
-    const hasVoip = req.body?.has_voip ? 1 : 0;
-    const configVoipData =
-      hasVoip && typeof req.body?.config_voip_data === 'string' && req.body.config_voip_data.trim()
-        ? req.body.config_voip_data.trim().slice(0, 500)
-        : null;
-    const operatorNotes =
-      typeof req.body?.operator_notes === 'string' && req.body.operator_notes.trim()
-        ? req.body.operator_notes.trim().slice(0, 1000)
-        : null;
-    const scheduledDateRaw =
-      typeof req.body?.scheduled_date === 'string' ? req.body.scheduled_date.trim() : '';
-    const scheduledDate = /^\d{4}-\d{2}-\d{2}$/.test(scheduledDateRaw) ? scheduledDateRaw : null;
-    const scheduledTimeRaw =
-      typeof req.body?.scheduled_time === 'string' ? req.body.scheduled_time.trim() : '';
-    const scheduledTime = /^\d{2}:\d{2}$/.test(scheduledTimeRaw) ? scheduledTimeRaw : null;
-
-    if (!customerName || customerName.length > 150) {
-      res.status(400).json({ error: 'نام مشترک الزامی است.' });
-      return;
-    }
-    if (!address || address.length > 1000) {
-      res.status(400).json({ error: 'آدرس محل سرویس الزامی است.' });
-      return;
-    }
-    if (type !== 'install' && type !== 'fault') {
-      res.status(400).json({ error: 'نوع تیکت باید نصب یا خرابی باشد.' });
-      return;
-    }
-    if (configVlan !== null && (!Number.isInteger(configVlan) || configVlan < 1 || configVlan > 4094)) {
-      res.status(400).json({ error: 'شناسه VLAN باید عددی بین ۱ تا ۴۰۹۴ باشد.' });
-      return;
-    }
-
-    const db = getDb();
-    let assignedInstaller: number | null = null;
-    let status: 'pending' | 'assigned' = 'pending';
-
-    if (assignedRaw !== null && assignedRaw !== undefined && assignedRaw !== '') {
-      if (!userHasPermission(req.authUser!, 'can_assign_tickets')) {
-        res.status(403).json({ error: 'مجوز ارجاع تیکت به نصاب را ندارید.' });
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const type = String(req.body?.type || '') as TicketTypeKey;
+      if (!TICKET_TYPES.includes(type)) {
+        res.status(400).json({ error: 'نوع تیکت انتخاب‌شده معتبر نیست.' });
         return;
       }
-      const instId = Number(assignedRaw);
-      const installerRow = db
-        .prepare('SELECT id FROM tbl_users WHERE id = ? AND is_active = 1')
-        .get(instId) as { id: number } | undefined;
-      if (!installerRow) {
-        res.status(400).json({ error: 'نصاب انتخاب‌شده معتبر نیست.' });
+      const customer_name = String(req.body?.customer_name || '').trim();
+      const address = String(req.body?.address || '').trim();
+      if (!customer_name || !address) {
+        res.status(400).json({ error: 'نام مشترک و آدرس الزامی است.' });
         return;
       }
-      assignedInstaller = instId;
-      status = 'assigned';
+
+      const visibility = getTicketTypeFieldVisibility(type);
+      const assignedInstaller = req.body?.assigned_installer
+        ? Number(req.body.assigned_installer)
+        : null;
+
+      const [created] = await db
+        .insert(tblTickets)
+        .values({
+          type,
+          customer_name,
+          address,
+          pppoe_user: visibility.showPppoeVlan ? String(req.body?.pppoe_user || '').trim() || null : null,
+          pppoe_pass: visibility.showPppoeVlan ? String(req.body?.pppoe_pass || '').trim() || null : null,
+          vlan_id: visibility.showPppoeVlan ? String(req.body?.vlan_id || '').trim() || null : null,
+          voip_config: visibility.showVoip ? String(req.body?.voip_config || '').trim() || null : null,
+          operator_notes: String(req.body?.operator_notes || '').trim() || null,
+          status: 'pending',
+          assigned_installer: assignedInstaller,
+          scheduled_date: String(req.body?.scheduled_date || '').trim() || null,
+          scheduled_time: String(req.body?.scheduled_time || '').trim() || null,
+          assigned_at: assignedInstaller ? new Date() : null,
+        })
+        .returning();
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'ticket_created',
+        entityType: 'ticket',
+        entityId: created.id,
+        summary: `ثبت تیکت جدید #${created.id} (${visibility.label})`,
+        details: `${customer_name} - ${address}`,
+      });
+
+      res.status(201).json({ ticket: created });
+    } catch (err) {
+      handleRouteError(res, err, 'خطا در ثبت تیکت جدید');
     }
-
-    const info = db
-      .prepare(
-        `INSERT INTO tbl_tickets
-         (customer_name, address, type, config_pppoe_user, config_pppoe_pass, config_vlan, has_voip, config_voip_data, operator_notes, scheduled_date, scheduled_time, status, assigned_installer)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        customerName,
-        address,
-        type,
-        configPppoeUser,
-        configPppoePass,
-        configVlan,
-        hasVoip,
-        configVoipData,
-        operatorNotes,
-        scheduledDate,
-        scheduledTime,
-        status,
-        assignedInstaller,
-      );
-
-    const createdId = Number(info.lastInsertRowid);
-    const created = db
-      .prepare(
-        `SELECT t.*, u.first_name || ' ' || u.last_name as installer_name
-         FROM tbl_tickets t
-         LEFT JOIN tbl_users u ON u.id = t.assigned_installer
-         WHERE t.id = ?`,
-      )
-      .get(createdId) as { installer_name?: string | null } | undefined;
-
-    recordActivity(
-      req.authUser,
-      'ticket_created',
-      'ticket',
-      createdId,
-      `ثبت تیکت جدید #${createdId} برای مشترک ${customerName}`,
-      assignedInstaller && created?.installer_name
-        ? `نوع: ${type === 'install' ? 'نصب' : 'خرابی'} — ارجاع همزمان به ${created.installer_name}${scheduledDate ? ` — زمان‌بندی: ${scheduledDate}` : ''}`
-        : `نوع: ${type === 'install' ? 'نصب' : 'خرابی'} — در انتظار ارجاع${scheduledDate ? ` — زمان‌بندی: ${scheduledDate}` : ''}`,
-    );
-
-    res.status(201).json({ ticket: created });
   },
 );
 
-app.patch(
-  '/api/tickets/:id/config',
-  requireAuth,
-  requirePermission('can_create_tickets', 'can_assign_tickets'),
-  (req: AuthenticatedRequest, res) => {
-    const ticketId = Number(req.params.id);
-    if (!Number.isInteger(ticketId) || ticketId <= 0) {
-      res.status(400).json({ error: 'شناسه تیکت نامعتبر است.' });
-      return;
-    }
-    const db = getDb();
-    const existing = db.prepare('SELECT id, status FROM tbl_tickets WHERE id = ?').get(ticketId) as
-      | { id: number; status: string }
-      | undefined;
-    if (!existing) {
-      res.status(404).json({ error: 'تیکت یافت نشد.' });
-      return;
-    }
-
-    const configPppoeUser =
-      typeof req.body?.config_pppoe_user === 'string' && req.body.config_pppoe_user.trim()
-        ? req.body.config_pppoe_user.trim().slice(0, 100)
-        : null;
-    const configPppoePass =
-      typeof req.body?.config_pppoe_pass === 'string' && req.body.config_pppoe_pass.trim()
-        ? req.body.config_pppoe_pass.trim().slice(0, 100)
-        : null;
-    const configVlanRaw = req.body?.config_vlan;
-    const configVlan =
-      configVlanRaw !== null && configVlanRaw !== undefined && String(configVlanRaw).trim() !== ''
-        ? Math.round(Number(configVlanRaw))
-        : null;
-    const hasVoip = req.body?.has_voip ? 1 : 0;
-    const configVoipData =
-      hasVoip && typeof req.body?.config_voip_data === 'string' && req.body.config_voip_data.trim()
-        ? req.body.config_voip_data.trim().slice(0, 500)
-        : null;
-    const operatorNotes =
-      typeof req.body?.operator_notes === 'string' && req.body.operator_notes.trim()
-        ? req.body.operator_notes.trim().slice(0, 1000)
-        : null;
-
-    if (configVlan !== null && (!Number.isInteger(configVlan) || configVlan < 1 || configVlan > 4094)) {
-      res.status(400).json({ error: 'شناسه VLAN باید عددی بین ۱ تا ۴۰۹۴ باشد.' });
-      return;
-    }
-
-    db.prepare(
-      `UPDATE tbl_tickets
-       SET config_pppoe_user = ?,
-           config_pppoe_pass = ?,
-           config_vlan = ?,
-           has_voip = ?,
-           config_voip_data = ?,
-           operator_notes = ?
-       WHERE id = ?`,
-    ).run(
-      configPppoeUser,
-      configPppoePass,
-      configVlan,
-      hasVoip,
-      configVoipData,
-      operatorNotes,
-      ticketId,
-    );
-
-    const updated = db
-      .prepare(
-        `SELECT t.*, u.first_name || ' ' || u.last_name as installer_name
-         FROM tbl_tickets t
-         LEFT JOIN tbl_users u ON u.id = t.assigned_installer
-         WHERE t.id = ?`,
-      )
-      .get(ticketId);
-
-    recordActivity(
-      req.authUser,
-      'ticket_config_updated',
-      'ticket',
-      ticketId,
-      `به‌روزرسانی کانفیگ فنی تیکت #${ticketId}`,
-      configPppoeUser ? `PPPoE: ${configPppoeUser}${configVlan ? ` — VLAN: ${configVlan}` : ''}` : null,
-    );
-
-    res.json({ ticket: updated });
-  },
-);
-
-app.patch(
+app.post(
   '/api/tickets/:id/assign',
   requireAuth,
   requirePermission('can_assign_tickets'),
-  (req: AuthenticatedRequest, res) => {
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const ticketId = Number(req.params.id);
+      const installerId = req.body?.assigned_installer ? Number(req.body.assigned_installer) : null;
+      const scheduledDate = String(req.body?.scheduled_date || '').trim() || null;
+      const scheduledTime = String(req.body?.scheduled_time || '').trim() || null;
+
+      const [updated] = await db
+        .update(tblTickets)
+        .set({
+          assigned_installer: installerId,
+          scheduled_date: scheduledDate,
+          scheduled_time: scheduledTime,
+          assigned_at: installerId ? new Date() : null,
+        })
+        .where(eq(tblTickets.id, ticketId))
+        .returning();
+
+      if (!updated) {
+        res.status(404).json({ error: 'تیکت یافت نشد.' });
+        return;
+      }
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'ticket_assigned',
+        entityType: 'ticket',
+        entityId: ticketId,
+        summary: `ارجاع و زمان‌بندی تیکت #${ticketId}`,
+        details: scheduledDate ? `تاریخ زمان‌بندی: ${scheduledDate} ${scheduledTime || ''}` : null,
+      });
+
+      res.json({ ticket: updated });
+    } catch (err) {
+      handleRouteError(res, err, 'خطا در ارجاع تیکت');
+    }
+  },
+);
+
+app.post(
+  '/api/tickets/:id/start',
+  requireAuth,
+  requirePermission('can_execute_service', 'can_assign_tickets'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const ticketId = Number(req.params.id);
+      const user = req.authUser!;
+      const rows = await db
+        .select()
+        .from(tblTickets)
+        .where(eq(tblTickets.id, ticketId))
+        .limit(1);
+      const existing = rows[0];
+      if (!existing) {
+        res.status(404).json({ error: 'تیکت یافت نشد.' });
+        return;
+      }
+      if (
+        !userHasPermission(user, 'can_view_all_tickets') &&
+        existing.assigned_installer !== user.id
+      ) {
+        res.status(403).json({ error: 'این تیکت به شما ارجاع نشده است.' });
+        return;
+      }
+      if (existing.status === 'completed') {
+        res.json({ ticket: existing });
+        return;
+      }
+
+      const [updated] = await db
+        .update(tblTickets)
+        .set({
+          status: 'in_progress',
+          started_at: existing.started_at ?? new Date(),
+        })
+        .where(eq(tblTickets.id, ticketId))
+        .returning();
+
+      await logActivity({
+        user,
+        actionType: 'ticket_started',
+        entityType: 'ticket',
+        entityId: ticketId,
+        summary: `شروع عملیات میدانی تیکت #${ticketId}`,
+        details: existing.customer_name,
+      });
+
+      res.json({ ticket: updated });
+    } catch (err) {
+      handleRouteError(res, err, 'خطا در ثبت شروع عملیات');
+    }
+  },
+);
+
+app.get('/api/tickets/:id/comments', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
     const ticketId = Number(req.params.id);
-    const installerId = Number(req.body?.assigned_installer);
-    if (!Number.isInteger(ticketId) || ticketId <= 0 || !Number.isInteger(installerId)) {
-      res.status(400).json({ error: 'شناسه تیکت یا نصاب نامعتبر است.' });
+    const comments = await db
+      .select({
+        id: tblTicketComments.id,
+        ticket_id: tblTicketComments.ticket_id,
+        user_id: tblTicketComments.user_id,
+        user_full_name: tblUsers.full_name,
+        user_role_name: tblRoles.name,
+        comment: tblTicketComments.comment,
+        created_at: tblTicketComments.created_at,
+      })
+      .from(tblTicketComments)
+      .innerJoin(tblUsers, eq(tblUsers.id, tblTicketComments.user_id))
+      .innerJoin(tblRoles, eq(tblRoles.id, tblUsers.role_id))
+      .where(eq(tblTicketComments.ticket_id, ticketId))
+      .orderBy(tblTicketComments.created_at, tblTicketComments.id);
+
+    res.json({ comments });
+  } catch (err) {
+    handleRouteError(res, err, 'خطا در بارگذاری خط زمانی نظرات');
+  }
+});
+
+// Immutable timeline comments (No PUT/PATCH/DELETE routes by design)
+app.post('/api/tickets/:id/comments', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const ticketId = Number(req.params.id);
+    const commentText = String(req.body?.comment || '').trim();
+    if (!commentText) {
+      res.status(400).json({ error: 'متن گزارش یا نظر نمی‌تواند خالی باشد.' });
       return;
     }
 
-    const db = getDb();
-    const ticket = db.prepare('SELECT id, status FROM tbl_tickets WHERE id = ?').get(ticketId) as
-      | { id: number; status: string }
-      | undefined;
-    if (!ticket) {
+    const ticketExists = await db
+      .select({ id: tblTickets.id })
+      .from(tblTickets)
+      .where(eq(tblTickets.id, ticketId))
+      .limit(1);
+    if (!ticketExists[0]) {
       res.status(404).json({ error: 'تیکت یافت نشد.' });
       return;
     }
-    if (ticket.status === 'completed') {
-      res.status(400).json({ error: 'تیکت تکمیل‌شده قابل ارجاع مجدد نیست.' });
-      return;
-    }
 
-    const installer = db
-      .prepare('SELECT id FROM tbl_users WHERE id = ? AND is_active = 1')
-      .get(installerId) as { id: number } | undefined;
-    if (!installer) {
-      res.status(400).json({ error: 'نصاب انتخاب‌شده فعال نیست.' });
-      return;
-    }
+    const [created] = await db
+      .insert(tblTicketComments)
+      .values({
+        ticket_id: ticketId,
+        user_id: req.authUser!.id,
+        comment: commentText,
+      })
+      .returning();
 
-    db.prepare('UPDATE tbl_tickets SET assigned_installer = ?, status = ? WHERE id = ?').run(
-      installerId,
-      'assigned',
-      ticketId,
-    );
+    await logActivity({
+      user: req.authUser,
+      actionType: 'ticket_comment_added',
+      entityType: 'ticket',
+      entityId: ticketId,
+      summary: `ثبت یادداشت غیرقابل ویرایش برای تیکت #${ticketId}`,
+      details: commentText.slice(0, 120),
+    });
 
-    const updated = db
-      .prepare(
-        `SELECT t.*, u.first_name || ' ' || u.last_name as installer_name
-         FROM tbl_tickets t
-         LEFT JOIN tbl_users u ON u.id = t.assigned_installer
-         WHERE t.id = ?`,
-      )
-      .get(ticketId) as { customer_name?: string; installer_name?: string } | undefined;
-
-    recordActivity(
-      req.authUser,
-      'ticket_assigned',
-      'ticket',
-      ticketId,
-      `تایید و ارجاع تیکت #${ticketId} به ${updated?.installer_name || `#${installerId}`}`,
-      updated?.customer_name ? `مشترک: ${updated.customer_name}` : null,
-    );
-
-    res.json({ ticket: updated });
-  },
-);
-
-app.get('/api/tickets/:id/record', requireAuth, (req: AuthenticatedRequest, res) => {
-  const ticketId = Number(req.params.id);
-  if (!Number.isInteger(ticketId) || ticketId <= 0) {
-    res.status(400).json({ error: 'شناسه تیکت نامعتبر است.' });
-    return;
+    res.status(201).json({
+      comment: {
+        ...created,
+        user_full_name: req.authUser!.full_name,
+        user_role_name: req.authUser!.role_name,
+      },
+    });
+  } catch (err) {
+    handleRouteError(res, err, 'خطا در ثبت نظر');
   }
-
-  const db = getDb();
-  const record = db
-    .prepare(
-      `SELECT sr.*,
-              t.customer_name, t.address, t.type as ticket_type, t.status as ticket_status,
-              t.config_pppoe_user, t.config_pppoe_pass, t.config_vlan, t.has_voip, t.config_voip_data, t.operator_notes,
-              u.first_name || ' ' || u.last_name as installer_name,
-              k.name as kaf_name,
-              o.name as olt_name,
-              f.fat_number,
-              ff.ffat_code,
-              so.spool_code as out_spool_code,
-              si.spool_code as in_spool_code,
-              mb.name as modem_brand_name
-       FROM tbl_service_records sr
-       JOIN tbl_tickets t ON t.id = sr.ticket_id
-       JOIN tbl_users u ON u.id = sr.installer_id
-       JOIN tbl_kafos k ON k.id = sr.kaf_id
-       JOIN tbl_olts o ON o.id = sr.olt_id
-       JOIN tbl_fats f ON f.id = sr.fat_id
-       JOIN tbl_ffats ff ON ff.id = sr.ffat_id
-       LEFT JOIN tbl_spools so ON so.id = sr.out_spool_id
-       LEFT JOIN tbl_spools si ON si.id = sr.in_spool_id
-       LEFT JOIN tbl_modem_brands mb ON mb.id = sr.modem_brand_id
-       WHERE sr.ticket_id = ?`,
-    )
-    .get(ticketId) as Record<string, unknown> | undefined;
-
-  if (!record) {
-    res.status(404).json({ error: 'سابقه اجرایی برای این تیکت ثبت نشده است.' });
-    return;
-  }
-
-  const user = req.authUser!;
-  if (
-    !userHasPermission(user, 'can_view_all_tickets') &&
-    Number(record.installer_id) !== user.id
-  ) {
-    res.status(403).json({ error: 'دسترسی به این پرونده مجاز نیست.' });
-    return;
-  }
-
-  const images = db
-    .prepare('SELECT id, image_type, file_path FROM tbl_images WHERE record_id = ?')
-    .all(Number(record.id));
-
-  res.json({
-    record: {
-      ...record,
-      price_snapshot: JSON.parse(String(record.price_snapshot || '{}')),
-      images,
-    },
-  });
 });
 
-// Upload compressed evidence image to /uploads/YYYY/MM/<TicketID>/
-app.post(
-  '/api/upload',
-  requireAuth,
-  requirePermission('can_execute_service', 'can_create_tickets'),
-  upload.single('image'),
-  (req: AuthenticatedRequest, res) => {
-    const ticketIdRaw = String(req.body?.ticket_id || '').trim();
-    const imageType = String(req.body?.image_type || 'evidence').trim().slice(0, 50);
+// ==========================================
+// SERVICE RECORDS (ATOMIC SPOOL, VAN STOCK & DYNAMIC TARIFF LEDGER)
+// ==========================================
 
-    if (!/^\d{1,10}$/.test(ticketIdRaw)) {
-      res.status(400).json({ error: 'شناسه تیکت برای بارگذاری تصویر نامعتبر است.' });
+app.get('/api/tickets/:id/service-record', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const ticketId = Number(req.params.id);
+    const rows = await db
+      .select()
+      .from(tblServiceRecords)
+      .where(eq(tblServiceRecords.ticket_id, ticketId))
+      .limit(1);
+    const rec = rows[0];
+    if (!rec) {
+      res.status(404).json({ error: 'گزارش تکمیل عملیات برای این تیکت یافت نشد.' });
       return;
     }
 
-    const file = req.file;
-    if (!file || !file.buffer) {
-      res.status(400).json({ error: 'فایل تصویری ارسال نشده است.' });
-      return;
+    const [ticket] = await db.select().from(tblTickets).where(eq(tblTickets.id, ticketId)).limit(1);
+    const [installer] = await db
+      .select({ full_name: tblUsers.full_name })
+      .from(tblUsers)
+      .where(eq(tblUsers.id, rec.installer_id))
+      .limit(1);
+
+    let sourceLabel = '';
+    let kafName = '';
+    let oltName = '';
+    if (rec.source_type === 'FAT') {
+      const fatRow = await db
+        .select({
+          fat_number: tblFats.fat_number,
+          olt_name: tblOlts.name,
+          kaf_name: tblKafos.name,
+        })
+        .from(tblFats)
+        .innerJoin(tblOlts, eq(tblOlts.id, tblFats.olt_id))
+        .innerJoin(tblKafos, eq(tblKafos.id, tblOlts.kaf_id))
+        .where(eq(tblFats.id, rec.source_id))
+        .limit(1);
+      if (fatRow[0]) {
+        sourceLabel = `FAT ${fatRow[0].fat_number}`;
+        oltName = fatRow[0].olt_name;
+        kafName = fatRow[0].kaf_name;
+      }
+    } else {
+      const ffatRow = await db
+        .select({
+          ffat_code: tblFfats.ffat_code,
+          olt_name: tblOlts.name,
+          kaf_name: tblKafos.name,
+        })
+        .from(tblFfats)
+        .innerJoin(tblFats, eq(tblFats.id, tblFfats.fat_id))
+        .innerJoin(tblOlts, eq(tblOlts.id, tblFats.olt_id))
+        .innerJoin(tblKafos, eq(tblKafos.id, tblOlts.kaf_id))
+        .where(eq(tblFfats.id, rec.source_id))
+        .limit(1);
+      if (ffatRow[0]) {
+        sourceLabel = ffatRow[0].ffat_code;
+        oltName = ffatRow[0].olt_name;
+        kafName = ffatRow[0].kaf_name;
+      }
     }
 
-    const detectedExt = isValidImageBuffer(file.buffer);
-    if (!detectedExt) {
-      res.status(400).json({ error: 'فرمت فایل تصویری معتبر نیست (فقط JPEG/PNG/WEBP).' });
-      return;
-    }
+    const outSpool = rec.out_spool_id
+      ? (
+          await db
+            .select({ spool_code: tblSpools.spool_code })
+            .from(tblSpools)
+            .where(eq(tblSpools.id, rec.out_spool_id))
+            .limit(1)
+        )[0]
+      : null;
+    const inSpool = rec.in_spool_id
+      ? (
+          await db
+            .select({ spool_code: tblSpools.spool_code })
+            .from(tblSpools)
+            .where(eq(tblSpools.id, rec.in_spool_id))
+            .limit(1)
+        )[0]
+      : null;
+    const brand = rec.modem_brand_id
+      ? (
+          await db
+            .select({ name: tblModemBrands.name })
+            .from(tblModemBrands)
+            .where(eq(tblModemBrands.id, rec.modem_brand_id))
+            .limit(1)
+        )[0]
+      : null;
+    const images = await db
+      .select({
+        id: tblServiceImages.id,
+        image_type: tblServiceImages.image_type,
+        file_path: tblServiceImages.file_path,
+      })
+      .from(tblServiceImages)
+      .where(eq(tblServiceImages.record_id, rec.id));
 
-    const now = new Date();
-    const yyyy = String(now.getFullYear());
-    const mm = String(now.getMonth() + 1).padStart(2, '0');
-    const filename = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${detectedExt}`;
-
-    const targetDir = path.resolve(UPLOADS_BASE_DIR, yyyy, mm, ticketIdRaw);
-    if (!targetDir.startsWith(UPLOADS_BASE_DIR + path.sep)) {
-      res.status(400).json({ error: 'مسیر ذخیره فایل نامعتبر است.' });
-      return;
-    }
-
-    fs.mkdirSync(targetDir, { recursive: true });
-    const fullFilePath = path.resolve(targetDir, filename);
-    if (!fullFilePath.startsWith(UPLOADS_BASE_DIR + path.sep)) {
-      res.status(400).json({ error: 'مسیر نهایی فایل نامعتبر است.' });
-      return;
-    }
-
-    fs.writeFileSync(fullFilePath, file.buffer);
-    const publicPath = `/uploads/${yyyy}/${mm}/${ticketIdRaw}/${filename}`;
-    res.status(201).json({
-      file_path: publicPath,
-      image_type: imageType,
-      size_bytes: file.buffer.length,
+    res.json({
+      record: {
+        ...rec,
+        installer_name: installer?.full_name || 'نامشخص',
+        customer_name: ticket?.customer_name || '',
+        address: ticket?.address || '',
+        ticket_type: (ticket?.type || 'internet_install') as TicketTypeKey,
+        source_label: sourceLabel || `${rec.source_type} #${rec.source_id}`,
+        kaf_name: kafName,
+        olt_name: oltName,
+        out_spool_code: outSpool?.spool_code || null,
+        in_spool_code: inSpool?.spool_code || null,
+        modem_brand_name: brand?.name || null,
+        images,
+      },
     });
-  },
-);
+  } catch (err) {
+    handleRouteError(res, err, 'خطا در دریافت گزارش عملیات');
+  }
+});
 
-// Submit complex Installation / Fault service form (Server-side calculation + Atomic Spool deduction)
 app.post(
   '/api/service-records',
   requireAuth,
   requirePermission('can_execute_service'),
-  (req: AuthenticatedRequest, res) => {
-    const user = req.authUser!;
-    const db = getDb();
-
-    const ticketId = Number(req.body?.ticket_id);
-    const kafId = Number(req.body?.kaf_id);
-    const oltId = Number(req.body?.olt_id);
-    const fatId = Number(req.body?.fat_id);
-    const ffatId = Number(req.body?.ffat_id);
-    const modemBrandId = Number(req.body?.modem_brand_id);
-    const modemSourceRaw = req.body?.modem_source;
-    const modemSource: ModemSource = modemSourceRaw === 'customer' ? 'customer' : 'company';
-    const vanStockId = req.body?.van_stock_id ? Number(req.body.van_stock_id) : null;
-    const modemSerial =
-      typeof req.body?.modem_serial === 'string' ? req.body.modem_serial.trim() : '';
-
-    const outSpoolId = req.body?.out_spool_id ? Number(req.body.out_spool_id) : null;
-    const outMeter = Math.max(0, Math.round(Number(req.body?.out_total_meter) || 0));
-    const inSpoolId = req.body?.in_spool_id ? Number(req.body.in_spool_id) : null;
-    const inMeter = Math.max(0, Math.round(Number(req.body?.in_total_meter) || 0));
-    const serviceDateJalali =
-      typeof req.body?.service_date_jalali === 'string'
-        ? req.body.service_date_jalali.trim().slice(0, 20)
-        : null;
-    const notes = typeof req.body?.notes === 'string' ? req.body.notes.trim().slice(0, 500) : null;
-
-    const imagesInput = Array.isArray(req.body?.images) ? req.body.images : [];
-
-    if (
-      !Number.isInteger(ticketId) ||
-      !Number.isInteger(kafId) ||
-      !Number.isInteger(oltId) ||
-      !Number.isInteger(fatId) ||
-      !Number.isInteger(ffatId)
-    ) {
-      res.status(400).json({ error: 'انتخاب کامل زنجیره تجهیزات (KAF / OLT / FAT / F-FAT) الزامی است.' });
-      return;
-    }
-
-    const ticket = db
-      .prepare('SELECT id, type, status, assigned_installer FROM tbl_tickets WHERE id = ?')
-      .get(ticketId) as
-      | { id: number; type: 'install' | 'fault'; status: string; assigned_installer: number | null }
-      | undefined;
-
-    if (!ticket) {
-      res.status(404).json({ error: 'تیکت مورد نظر یافت نشد.' });
-      return;
-    }
-    if (ticket.status === 'completed') {
-      res.status(400).json({ error: 'این تیکت قبلاً تکمیل شده است.' });
-      return;
-    }
-    if (
-      !userHasPermission(user, 'can_view_all_tickets') &&
-      ticket.assigned_installer !== user.id
-    ) {
-      res.status(403).json({ error: 'این تیکت به شما ارجاع داده نشده است.' });
-      return;
-    }
-
-    const effectiveInstallerId = ticket.assigned_installer ?? user.id;
-
-    // Validate relational hardware chain
-    const chainValid = db
-      .prepare(
-        `SELECT ff.id
-         FROM tbl_ffats ff
-         JOIN tbl_fats f ON f.id = ff.fat_id
-         JOIN tbl_olts o ON o.id = f.olt_id
-         JOIN tbl_kafos k ON k.id = o.kaf_id
-         WHERE ff.id = ? AND f.id = ? AND o.id = ? AND k.id = ?`,
-      )
-      .get(ffatId, fatId, oltId, kafId);
-    if (!chainValid) {
-      res.status(400).json({ error: 'ارتباط سلسله‌مراتب تجهیزات انتخابی معتبر نیست.' });
-      return;
-    }
-
-    // Validate Modem Brand & Regex on Server
-    const brand = db
-      .prepare('SELECT id, name, serial_pattern, serial_prefix FROM tbl_modem_brands WHERE id = ?')
-      .get(modemBrandId) as
-      | { id: number; name: string; serial_pattern: string; serial_prefix: string }
-      | undefined;
-    if (!brand) {
-      res.status(400).json({ error: 'برند مودم انتخاب نشده است.' });
-      return;
-    }
-    const serialCheck = validateModemSerial(modemSerial, brand);
-    if (!serialCheck.valid) {
-      res.status(400).json({ error: serialCheck.reason || 'سریال مودم نامعتبر است.' });
-      return;
-    }
-
-    // Validate uploaded image paths stay strictly within /uploads/
-    const cleanImages: Array<{ image_type: string; file_path: string }> = [];
-    for (const img of imagesInput) {
-      if (
-        img &&
-        typeof img.file_path === 'string' &&
-        typeof img.image_type === 'string' &&
-        img.file_path.startsWith('/uploads/')
-      ) {
-        const diskPath = path.resolve(process.cwd(), img.file_path.slice(1));
-        if (diskPath.startsWith(UPLOADS_BASE_DIR + path.sep) && fs.existsSync(diskPath)) {
-          cleanImages.push({
-            image_type: img.image_type.trim().slice(0, 50) || 'evidence',
-            file_path: img.file_path,
-          });
-        }
-      }
-    }
-
-    const canCrossUse = userHasPermission(user, 'can_cross_use_cables');
-    const canManageInventory = userHasPermission(user, 'can_manage_inventory');
-
-    db.exec('BEGIN IMMEDIATE;');
+  async (req: AuthRequest, res: Response) => {
     try {
-      let outSpool: SpoolRecord | undefined;
-      if (outMeter > 0) {
-        if (!outSpoolId) {
-          throw new Error('برای متراژ کابل بیرونی، انتخاب قرقره الزامی است.');
-        }
-        outSpool = db
-          .prepare('SELECT * FROM tbl_spools WHERE id = ?')
-          .get(outSpoolId) as SpoolRecord | undefined;
-        const vOut = validateSpoolConsumption(
-          outSpool,
-          'outdoor',
-          outMeter,
-          effectiveInstallerId,
-          canCrossUse,
-        );
-        if (!vOut.ok) throw new Error(vOut.error);
+      const user = req.authUser!;
+      const ticketId = Number(req.body?.ticket_id);
+      const sourceType = String(req.body?.source_type || '');
+      const sourceId = Number(req.body?.source_id);
+      const outSpoolId = req.body?.out_spool_id ? Number(req.body.out_spool_id) : null;
+      const outTotalMeter = Math.max(0, Math.round(Number(req.body?.out_total_meter || 0)));
+      const inSpoolId = req.body?.in_spool_id ? Number(req.body.in_spool_id) : null;
+      const inTotalMeter = Math.max(0, Math.round(Number(req.body?.in_total_meter || 0)));
+      const modemSource = String(req.body?.modem_source || 'customer') as 'company' | 'customer';
+      const modemBrandId = req.body?.modem_brand_id ? Number(req.body.modem_brand_id) : null;
+      const modemSerial = String(req.body?.modem_serial || '').trim();
+      const vanStockId = req.body?.van_stock_id ? Number(req.body.van_stock_id) : null;
+      const notes = String(req.body?.notes || '').trim() || null;
+      const imagesInput = Array.isArray(req.body?.images)
+        ? (req.body.images as Array<{ image_type: string; file_path: string }>)
+        : [];
+
+      if (!Number.isInteger(ticketId) || ticketId <= 0) {
+        res.status(400).json({ error: 'شناسه تیکت معتبر نیست.' });
+        return;
+      }
+      if (sourceType !== 'FAT' && sourceType !== 'FFAT') {
+        res.status(400).json({ error: 'نوع تجهیزات مبدا باید FAT یا FFAT باشد.' });
+        return;
+      }
+      if (!Number.isInteger(sourceId) || sourceId <= 0) {
+        res.status(400).json({ error: 'انتخاب پورت تجهیزات مبدا الزامی است.' });
+        return;
       }
 
-      let inSpool: SpoolRecord | undefined;
-      if (inMeter > 0) {
-        if (!inSpoolId) {
-          throw new Error('برای متراژ کابل داخلی، انتخاب قرقره الزامی است.');
-        }
-        inSpool = db
-          .prepare('SELECT * FROM tbl_spools WHERE id = ?')
-          .get(inSpoolId) as SpoolRecord | undefined;
-        const vIn = validateSpoolConsumption(
-          inSpool,
-          'indoor',
-          inMeter,
-          effectiveInstallerId,
-          canCrossUse,
-        );
-        if (!vIn.ok) throw new Error(vIn.error);
-      }
+      const canCrossUseCable = userHasPermission(user, 'can_cross_use_cable');
+      const canSeeAll = userHasPermission(user, 'can_view_all_tickets');
 
-      // Modem Van Stock validation & atomic deduction when modemSource === 'company'
-      let usedVanStockId: number | null = null;
-      if (modemSource === 'company') {
-        let vanRow: VanStockRecord | undefined;
-        if (vanStockId) {
-          vanRow = db
-            .prepare(
-              `SELECT vs.id, vs.user_id, vs.item_id, ii.type as item_type, vs.serial_number, vs.quantity
-               FROM tbl_van_stock vs
-               JOIN tbl_inventory_items ii ON ii.id = vs.item_id
-               WHERE vs.id = ?`,
-            )
-            .get(vanStockId) as VanStockRecord | undefined;
+      const result = await db.transaction(async (tx) => {
+        const [ticket] = await tx
+          .select()
+          .from(tblTickets)
+          .where(eq(tblTickets.id, ticketId))
+          .limit(1);
+        if (!ticket) {
+          throw new Error('تیکت انتخاب‌شده یافت نشد.');
+        }
+        if (ticket.status === 'completed') {
+          throw new Error('این تیکت قبلاً تکمیل و ثبت شده است.');
+        }
+        if (!canSeeAll && ticket.assigned_installer && ticket.assigned_installer !== user.id) {
+          throw new Error('شما مجاز به تکمیل تیکت نصاب دیگر نیستید.');
+        }
+
+        const installerId = ticket.assigned_installer || user.id;
+
+        // Verify source equipment exists
+        if (sourceType === 'FAT') {
+          const [fat] = await tx.select().from(tblFats).where(eq(tblFats.id, sourceId)).limit(1);
+          if (!fat) throw new Error('پورت FAT انتخاب‌شده در شبکه وجود ندارد.');
         } else {
-          // Auto-match by serial first, then by installer's brand bulk stock if no van_stock_id was explicitly passed
-          vanRow = db
-            .prepare(
-              `SELECT vs.id, vs.user_id, vs.item_id, ii.type as item_type, vs.serial_number, vs.quantity
-               FROM tbl_van_stock vs
-               JOIN tbl_inventory_items ii ON ii.id = vs.item_id
-               WHERE vs.user_id = ? AND ii.type = 'modem' AND vs.quantity > 0
-                 AND (UPPER(vs.serial_number) = UPPER(?) OR (vs.serial_number IS NULL AND (ii.modem_brand_id IS NULL OR ii.modem_brand_id = ?)))
-               ORDER BY CASE WHEN vs.serial_number IS NOT NULL THEN 0 ELSE 1 END, vs.id ASC
-               LIMIT 1`,
-            )
-            .get(effectiveInstallerId, modemSerial, modemBrandId) as VanStockRecord | undefined;
+          const [ffat] = await tx.select().from(tblFfats).where(eq(tblFfats.id, sourceId)).limit(1);
+          if (!ffat) throw new Error('پورت F-FAT انتخاب‌شده در شبکه وجود ندارد.');
         }
 
-        const vModem = validateVanModemConsumption(
-          vanRow,
-          modemSource,
-          modemSerial,
-          effectiveInstallerId,
-          canCrossUse || canManageInventory,
-        );
-        if (!vModem.ok) {
-          throw new Error(vModem.error);
-        }
+        // Validate & atomically deduct outdoor spool
+        const lowSpoolAlerts: Array<{ spool_code: string; percentRemaining: number }> = [];
+        if (outTotalMeter > 0) {
+          const spoolRows = outSpoolId
+            ? await tx.select().from(tblSpools).where(eq(tblSpools.id, outSpoolId)).limit(1)
+            : [];
+          const spoolRow = spoolRows[0] as SpoolRecord | undefined;
+          const outCheck = validateSpoolConsumption(
+            spoolRow,
+            'outdoor',
+            outTotalMeter,
+            installerId,
+            canCrossUseCable,
+          );
+          if (!outCheck.ok) throw new Error(outCheck.error);
 
-        const targetVanId = vanRow!.id;
-        if (vanRow!.quantity <= 1) {
-          const delRes = db
-            .prepare('DELETE FROM tbl_van_stock WHERE id = ? AND quantity = 1')
-            .run(targetVanId);
-          if (delRes.changes !== 1) {
-            throw new Error('موجودی مودم در انبار خودرو تغییر کرده است.');
+          const updatedOut = await tx
+            .update(tblSpools)
+            .set({ current_length: sql`${tblSpools.current_length} - ${outTotalMeter}` })
+            .where(and(eq(tblSpools.id, outSpoolId!), gte(tblSpools.current_length, outTotalMeter)))
+            .returning();
+          if (!updatedOut[0]) {
+            throw new Error('موجودی قرقره فضای باز هنگام تراکنش کافی نبود.');
           }
-        } else {
-          const updRes = db
-            .prepare('UPDATE tbl_van_stock SET quantity = quantity - 1 WHERE id = ? AND quantity >= 1')
-            .run(targetVanId);
-          if (updRes.changes !== 1) {
-            throw new Error('موجودی مودم در انبار خودرو کافی نیست.');
+          const pct = Math.round((updatedOut[0].current_length / updatedOut[0].initial_length) * 100);
+          if (pct < 10 || updatedOut[0].current_length <= 0) {
+            lowSpoolAlerts.push({ spool_code: updatedOut[0].spool_code, percentRemaining: pct });
           }
         }
-        usedVanStockId = targetVanId;
-      }
 
-      // Deduct meters atomically
-      if (outMeter > 0 && outSpoolId) {
-        const upd = db
-          .prepare(
-            'UPDATE tbl_spools SET current_length = current_length - ? WHERE id = ? AND current_length >= ?',
-          )
-          .run(outMeter, outSpoolId, outMeter);
-        if (upd.changes !== 1) {
-          throw new Error('موجودی قرقره بیرونی تغییر کرده و کافی نیست.');
+        // Validate & atomically deduct indoor spool
+        if (inTotalMeter > 0) {
+          const spoolRows = inSpoolId
+            ? await tx.select().from(tblSpools).where(eq(tblSpools.id, inSpoolId)).limit(1)
+            : [];
+          const spoolRow = spoolRows[0] as SpoolRecord | undefined;
+          const inCheck = validateSpoolConsumption(
+            spoolRow,
+            'indoor',
+            inTotalMeter,
+            installerId,
+            canCrossUseCable,
+          );
+          if (!inCheck.ok) throw new Error(inCheck.error);
+
+          const updatedIn = await tx
+            .update(tblSpools)
+            .set({ current_length: sql`${tblSpools.current_length} - ${inTotalMeter}` })
+            .where(and(eq(tblSpools.id, inSpoolId!), gte(tblSpools.current_length, inTotalMeter)))
+            .returning();
+          if (!updatedIn[0]) {
+            throw new Error('موجودی قرقره داخلی هنگام تراکنش کافی نبود.');
+          }
+          const pct = Math.round((updatedIn[0].current_length / updatedIn[0].initial_length) * 100);
+          if (pct < 10 || updatedIn[0].current_length <= 0) {
+            lowSpoolAlerts.push({ spool_code: updatedIn[0].spool_code, percentRemaining: pct });
+          }
         }
-      }
-      if (inMeter > 0 && inSpoolId) {
-        const upd = db
-          .prepare(
-            'UPDATE tbl_spools SET current_length = current_length - ? WHERE id = ? AND current_length >= ?',
-          )
-          .run(inMeter, inSpoolId, inMeter);
-        if (upd.changes !== 1) {
-          throw new Error('موجودی قرقره داخلی تغییر کرده و کافی نیست.');
+
+        // Validate modem brand regex & Van Stock deduction
+        const ticketVis = getTicketTypeFieldVisibility(ticket.type as TicketTypeKey);
+        if (ticketVis.requiresModem || modemSerial) {
+          if (modemBrandId) {
+            const [brand] = await tx
+              .select()
+              .from(tblModemBrands)
+              .where(eq(tblModemBrands.id, modemBrandId))
+              .limit(1);
+            if (!brand) throw new Error('برند مودم انتخاب‌شده نامعتبر است.');
+            const serialRes = validateModemSerial(modemSerial, brand);
+            if (!serialRes.valid) throw new Error(serialRes.reason);
+          } else if (ticketVis.requiresModem) {
+            throw new Error('انتخاب برند مودم برای این نوع سرویس الزامی است.');
+          }
+
+          if (modemSource === 'company') {
+            const vanRows = vanStockId
+              ? await tx
+                  .select({
+                    id: tblVanStock.id,
+                    user_id: tblVanStock.user_id,
+                    item_id: tblVanStock.item_id,
+                    item_type: tblInventoryItems.type,
+                    serial_number: tblVanStock.serial_number,
+                    quantity: tblVanStock.quantity,
+                  })
+                  .from(tblVanStock)
+                  .innerJoin(tblInventoryItems, eq(tblInventoryItems.id, tblVanStock.item_id))
+                  .where(eq(tblVanStock.id, vanStockId))
+                  .limit(1)
+              : [];
+
+            const vanRow = vanRows[0] as VanStockRecord | undefined;
+            const vanCheck = validateVanModemConsumption(
+              vanRow,
+              modemSource,
+              modemSerial,
+              installerId,
+              canSeeAll,
+            );
+            if (!vanCheck.ok) throw new Error(vanCheck.error);
+
+            const [decVan] = await tx
+              .update(tblVanStock)
+              .set({ quantity: sql`${tblVanStock.quantity} - 1` })
+              .where(and(eq(tblVanStock.id, vanStockId!), gte(tblVanStock.quantity, 1)))
+              .returning();
+            if (!decVan) throw new Error('موجودی مودم در انبار خودرو کافی نیست.');
+            if (decVan.quantity <= 0) {
+              await tx.delete(tblVanStock).where(eq(tblVanStock.id, decVan.id));
+            }
+          }
         }
-      }
 
-      // Lookup installer tariff on server (never trust client pricing!)
-      let tariff = db
-        .prepare('SELECT * FROM tbl_tariffs WHERE installer_id = ?')
-        .get(effectiveInstallerId) as TariffRule | undefined;
+        // Compute dynamic tariff + promotion bonus + price_snapshot
+        const userTariffRows = await tx
+          .select({
+            template_name: tblTariffTemplates.name,
+            rules_json: tblTariffTemplates.rules_json,
+            promo_id: tblPromotions.id,
+            promo_name: tblPromotions.name,
+            promo_target_type: tblPromotions.target_type,
+            promo_target_value: tblPromotions.target_value,
+            promo_reward_amount: tblPromotions.reward_amount,
+            promo_reset_cycle: tblPromotions.reset_cycle,
+            promo_start_date: tblPromotions.start_date,
+            promo_end_date: tblPromotions.end_date,
+            promo_carry_over: tblPromotions.carry_over,
+          })
+          .from(tblUserTariffs)
+          .innerJoin(tblTariffTemplates, eq(tblTariffTemplates.id, tblUserTariffs.template_id))
+          .leftJoin(tblPromotions, eq(tblPromotions.id, tblUserTariffs.promotion_id))
+          .where(eq(tblUserTariffs.user_id, installerId))
+          .limit(1);
 
-      if (!tariff) {
-        // Default safe baseline tariff if none configured yet for newly added installer
-        tariff = {
-          id: 0,
-          installer_id: effectiveInstallerId,
-          calc_type: 'fixed',
-          base_price: 500000,
-          meter_limit: 0,
-          extra_meter_price: 0,
-        };
-      }
+        let templateName = 'تعرفه پیش‌فرض';
+        let rulesJson: TariffTemplateRulesJson;
+        if (userTariffRows[0]) {
+          templateName = userTariffRows[0].template_name;
+          rulesJson = userTariffRows[0].rules_json;
+        } else {
+          const [firstTpl] = await tx.select().from(tblTariffTemplates).limit(1);
+          if (!firstTpl) throw new Error('هیچ الگوی تعرفه‌ای در سیستم تعریف نشده است.');
+          templateName = firstTpl.name;
+          rulesJson = firstTpl.rules_json;
+        }
 
-      const priorCountRow = db
-        .prepare('SELECT COUNT(*) as cnt FROM tbl_service_records WHERE installer_id = ?')
-        .get(effectiveInstallerId) as { cnt: number };
-      const completedCountAfterThis = (priorCountRow.cnt || 0) + 1;
+        const now = new Date();
+        const nowIso = now.toISOString();
+        let promoBonus = 0;
+        let promoName: string | null = null;
 
-      const snapshot = calculateTariffSnapshot(
-        tariff,
-        outMeter,
-        inMeter,
-        ticket.type,
-        completedCountAfterThis,
-      );
+        if (userTariffRows[0]?.promo_id) {
+          const promoRule: PromotionRule = {
+            id: userTariffRows[0].promo_id,
+            name: userTariffRows[0].promo_name!,
+            target_type: userTariffRows[0].promo_target_type!,
+            target_value: userTariffRows[0].promo_target_value!,
+            reward_amount: Number(userTariffRows[0].promo_reward_amount!),
+            reset_cycle: userTariffRows[0].promo_reset_cycle! as PromotionRule['reset_cycle'],
+            start_date: String(userTariffRows[0].promo_start_date!),
+            end_date: String(userTariffRows[0].promo_end_date!),
+            carry_over: Boolean(userTariffRows[0].promo_carry_over),
+          };
 
-      const recRes = db
-        .prepare(
-          `INSERT INTO tbl_service_records
-           (ticket_id, installer_id, kaf_id, olt_id, fat_id, ffat_id, out_spool_id, out_total_meter, in_spool_id, in_total_meter, modem_source, modem_brand_id, van_stock_id, modem_serial, price_snapshot, service_date_jalali, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          ticketId,
-          effectiveInstallerId,
-          kafId,
-          oltId,
-          fatId,
-          ffatId,
-          outMeter > 0 ? outSpoolId : null,
-          outMeter,
-          inMeter > 0 ? inSpoolId : null,
-          inMeter,
-          modemSource,
-          modemBrandId,
-          usedVanStockId,
-          modemSerial,
-          JSON.stringify(snapshot),
-          serviceDateJalali,
-          notes,
+          const priorTickets = await tx
+            .select({
+              ticket_id: tblTickets.id,
+              type: tblTickets.type,
+              completed_at: tblTickets.completed_at,
+            })
+            .from(tblTickets)
+            .where(
+              and(
+                eq(tblTickets.assigned_installer, installerId),
+                eq(tblTickets.status, 'completed'),
+                isNotNull(tblTickets.completed_at),
+              ),
+            );
+
+          const priorEvents: CompletedTicketEvent[] = priorTickets.map((pt) => ({
+            ticket_id: pt.ticket_id,
+            type: pt.type as TicketTypeKey,
+            completed_at: new Date(pt.completed_at!).toISOString(),
+          }));
+
+          const promoEval = evaluatePromotionForTicket(
+            promoRule,
+            priorEvents,
+            ticket.type as TicketTypeKey,
+            nowIso,
+          );
+          if (promoEval.bonusEarned > 0) {
+            promoBonus = promoEval.bonusEarned;
+            promoName = promoRule.name;
+          }
+        }
+
+        const priceSnapshot = calculateTemplatePriceSnapshot({
+          templateName,
+          rulesJson,
+          ticketType: ticket.type as TicketTypeKey,
+          outMeter: outTotalMeter,
+          inMeter: inTotalMeter,
+          promotionName: promoName,
+          promotionBonus: promoBonus,
+          computedAt: nowIso,
+        });
+
+        const jNow = gregorianToJalali(now.getFullYear(), now.getMonth() + 1, now.getDate());
+        const serviceDateJalali = `${jNow.jy}/${String(jNow.jm).padStart(2, '0')}/${String(jNow.jd).padStart(2, '0')}`;
+
+        const [record] = await tx
+          .insert(tblServiceRecords)
+          .values({
+            ticket_id: ticketId,
+            installer_id: installerId,
+            source_type: sourceType,
+            source_id: sourceId,
+            out_spool_id: outTotalMeter > 0 ? outSpoolId : null,
+            out_total_meter: outTotalMeter,
+            in_spool_id: inTotalMeter > 0 ? inSpoolId : null,
+            in_total_meter: inTotalMeter,
+            modem_brand_id: modemBrandId,
+            modem_serial: modemSerial || null,
+            modem_source: modemSource,
+            van_stock_id: modemSource === 'company' ? vanStockId : null,
+            price_snapshot: priceSnapshot,
+            service_date_jalali: serviceDateJalali,
+            notes,
+          })
+          .returning();
+
+        const validImgs = imagesInput.filter(
+          (im) => im.file_path && im.file_path.startsWith('/uploads/'),
         );
+        if (validImgs.length > 0) {
+          await tx.insert(tblServiceImages).values(
+            validImgs.map((im) => ({
+              record_id: record.id,
+              ticket_id: ticketId,
+              image_type: String(im.image_type || 'evidence').slice(0, 40),
+              file_path: im.file_path,
+            })),
+          );
+        }
 
-      const recordId = Number(recRes.lastInsertRowid);
+        await tx
+          .update(tblTickets)
+          .set({
+            status: 'completed',
+            assigned_installer: installerId,
+            started_at: ticket.started_at ?? now,
+            completed_at: now,
+          })
+          .where(eq(tblTickets.id, ticketId));
 
-      const imgStmt = db.prepare(
-        'INSERT INTO tbl_images (record_id, image_type, file_path) VALUES (?, ?, ?)',
-      );
-      for (const img of cleanImages) {
-        imgStmt.run(recordId, img.image_type, img.file_path);
-      }
+        await tx.insert(tblLedger).values({
+          user_id: installerId,
+          ticket_id: ticketId,
+          amount: priceSnapshot.total_earned.toFixed(2),
+          type: 'credit',
+          description: `دستمزد تکمیل تیکت #${ticketId} (${priceSnapshot.total_meter} متر کابل${promoBonus > 0 ? ' + پاداش کمپین' : ''})`,
+        });
 
-      // Double-entry ledger credit
-      db.prepare(
-        'INSERT INTO tbl_ledger (user_id, record_id, amount, type, description) VALUES (?, ?, ?, ?, ?)',
-      ).run(
-        effectiveInstallerId,
-        recordId,
-        snapshot.total_earned,
-        'credit',
-        `دستمزد سرویس تیکت #${ticketId} (${snapshot.total_meter} متر کابل)`,
-      );
-
-      db.prepare('UPDATE tbl_tickets SET status = ? WHERE id = ?').run('completed', ticketId);
-
-      db.exec('COMMIT;');
-
-      recordActivity(
-        req.authUser,
-        'service_completed',
-        'ticket',
-        ticketId,
-        `تایید و تکمیل عملیات تیکت #${ticketId}`,
-        `متراژ کل: ${snapshot.total_meter} متر — سریال مودم: ${modemSerial}`,
-      );
-
-      res.status(201).json({
-        record_id: recordId,
-        price_snapshot: snapshot,
-        modem_source: modemSource,
+        return { record, priceSnapshot, lowSpoolAlerts };
       });
+
+      await logActivity({
+        user,
+        actionType: 'service_completed',
+        entityType: 'ticket',
+        entityId: ticketId,
+        summary: `تکمیل عملیات تیکت #${ticketId} و ثبت درآمد ${result.priceSnapshot.total_earned.toLocaleString('en-US')} تومان`,
+        details: `مبدا: ${sourceType} #${sourceId} | مصرف کابل: ${outTotalMeter + inTotalMeter} متر`,
+      });
+
+      res.status(201).json(result);
     } catch (err) {
-      db.exec('ROLLBACK;');
-      res.status(400).json({
-        error: err instanceof Error ? err.message : 'خطا در ثبت عملیات سرویس.',
-      });
+      handleRouteError(res, err, 'خطا در ثبت گزارش عملیات');
     }
   },
 );
 
 // ==========================================
-// 4. HARDWARE TOPOLOGY & MODEM BRANDS
+// HARDWARE TOPOLOGY & MODEM BRANDS
 // ==========================================
 
-app.get('/api/hardware', requireAuth, (_req, res) => {
-  const db = getDb();
-  const kafs = db.prepare('SELECT * FROM tbl_kafos ORDER BY id ASC').all();
-  const olts = db
-    .prepare(
-      `SELECT o.*, k.name as kaf_name
-       FROM tbl_olts o JOIN tbl_kafos k ON k.id = o.kaf_id
-       ORDER BY o.id ASC`,
-    )
-    .all();
-  const fats = db
-    .prepare(
-      `SELECT f.*, o.name as olt_name, o.kaf_id
-       FROM tbl_fats f JOIN tbl_olts o ON o.id = f.olt_id
-       ORDER BY f.fat_number ASC`,
-    )
-    .all();
-  const ffats = db
-    .prepare(
-      `SELECT ff.*, f.fat_number, f.olt_id
-       FROM tbl_ffats ff JOIN tbl_fats f ON f.id = ff.fat_id
-       ORDER BY ff.id DESC`,
-    )
-    .all();
-  const modemBrands = db.prepare('SELECT * FROM tbl_modem_brands ORDER BY id ASC').all();
+app.get('/api/hardware', requireAuth, async (_req: AuthRequest, res: Response) => {
+  try {
+    await ensureSeeded();
+    const kafs = await db.select().from(tblKafos).orderBy(tblKafos.id);
+    const olts = await db
+      .select({
+        id: tblOlts.id,
+        kaf_id: tblOlts.kaf_id,
+        kaf_name: tblKafos.name,
+        name: tblOlts.name,
+      })
+      .from(tblOlts)
+      .innerJoin(tblKafos, eq(tblKafos.id, tblOlts.kaf_id))
+      .orderBy(tblOlts.id);
+    const fats = await db
+      .select({
+        id: tblFats.id,
+        olt_id: tblFats.olt_id,
+        olt_name: tblOlts.name,
+        kaf_id: tblOlts.kaf_id,
+        fat_number: tblFats.fat_number,
+      })
+      .from(tblFats)
+      .innerJoin(tblOlts, eq(tblOlts.id, tblFats.olt_id))
+      .orderBy(tblFats.fat_number);
+    const ffats = await db
+      .select({
+        id: tblFfats.id,
+        fat_id: tblFfats.fat_id,
+        fat_number: tblFats.fat_number,
+        olt_id: tblFats.olt_id,
+        ffat_code: tblFfats.ffat_code,
+      })
+      .from(tblFfats)
+      .innerJoin(tblFats, eq(tblFats.id, tblFfats.fat_id))
+      .orderBy(tblFfats.id);
+    const modemBrands = await db.select().from(tblModemBrands).orderBy(tblModemBrands.id);
 
-  res.json({ kafs, olts, fats, ffats, modemBrands });
+    res.json({ kafs, olts, fats, ffats, modemBrands });
+  } catch (err) {
+    handleRouteError(res, err, 'خطا در دریافت توپولوژی شبکه');
+  }
 });
 
 app.post(
   '/api/hardware/kafs',
   requireAuth,
   requirePermission('can_manage_hardware'),
-  (req, res) => {
-    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
-    if (!name || name.length > 150) {
-      res.status(400).json({ error: 'نام کافو الزامی است.' });
-      return;
-    }
+  async (req: AuthRequest, res: Response) => {
     try {
-      const info = getDb().prepare('INSERT INTO tbl_kafos (name) VALUES (?)').run(name);
-      res.status(201).json({ id: Number(info.lastInsertRowid), name });
-    } catch {
-      res.status(400).json({ error: 'این نام کافو قبلاً ثبت شده است.' });
+      const name = String(req.body?.name || '').trim();
+      if (!name) throw new Error('نام کافو الزامی است.');
+      const [kaf] = await db.insert(tblKafos).values({ name }).returning();
+      res.status(201).json({ kaf });
+    } catch (err) {
+      handleRouteError(res, err);
     }
   },
 );
@@ -1238,66 +1278,53 @@ app.post(
   '/api/hardware/olts',
   requireAuth,
   requirePermission('can_manage_hardware'),
-  (req, res) => {
-    const kafId = Number(req.body?.kaf_id);
-    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
-    if (!Number.isInteger(kafId) || !name || name.length > 150) {
-      res.status(400).json({ error: 'کافو و نام OLT الزامی است.' });
-      return;
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const kaf_id = Number(req.body?.kaf_id);
+      const name = String(req.body?.name || '').trim();
+      if (!kaf_id || !name) throw new Error('انتخاب کافو و نام OLT الزامی است.');
+      const [olt] = await db.insert(tblOlts).values({ kaf_id, name }).returning();
+      res.status(201).json({ olt });
+    } catch (err) {
+      handleRouteError(res, err);
     }
-    const info = getDb()
-      .prepare('INSERT INTO tbl_olts (kaf_id, name) VALUES (?, ?)')
-      .run(kafId, name);
-    res.status(201).json({ id: Number(info.lastInsertRowid), kaf_id: kafId, name });
   },
 );
 
 app.post(
   '/api/hardware/fats',
   requireAuth,
-  requirePermission('can_add_fat', 'can_manage_hardware'),
-  (req, res) => {
-    const oltId = Number(req.body?.olt_id);
-    const fatNumber = Number(req.body?.fat_number);
-    if (!Number.isInteger(oltId) || !Number.isInteger(fatNumber) || fatNumber <= 0) {
-      res.status(400).json({ error: 'OLT و شماره صحیح FAT الزامی است.' });
-      return;
+  requirePermission('can_manage_hardware', 'can_add_fat'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const olt_id = Number(req.body?.olt_id);
+      const fat_number = Number(req.body?.fat_number);
+      if (!olt_id || !Number.isInteger(fat_number) || fat_number <= 0) {
+        throw new Error('انتخاب OLT و شماره صحیح FAT الزامی است.');
+      }
+      const [fat] = await db.insert(tblFats).values({ olt_id, fat_number }).returning();
+      res.status(201).json({ fat });
+    } catch (err) {
+      handleRouteError(res, err);
     }
-    const info = getDb()
-      .prepare('INSERT INTO tbl_fats (olt_id, fat_number) VALUES (?, ?)')
-      .run(oltId, fatNumber);
-    res.status(201).json({ id: Number(info.lastInsertRowid), olt_id: oltId, fat_number: fatNumber });
   },
 );
 
 app.post(
   '/api/hardware/ffats',
   requireAuth,
-  requirePermission('can_add_fat', 'can_manage_hardware'),
-  (req, res) => {
-    const fatId = Number(req.body?.fat_id);
-    const suffix = typeof req.body?.suffix === 'string' ? req.body.suffix : '';
-    const db = getDb();
-    const fat = db.prepare('SELECT id, fat_number FROM tbl_fats WHERE id = ?').get(fatId) as
-      | { id: number; fat_number: number }
-      | undefined;
-    if (!fat) {
-      res.status(404).json({ error: 'FAT والد یافت نشد.' });
-      return;
-    }
+  requirePermission('can_manage_hardware', 'can_add_fat'),
+  async (req: AuthRequest, res: Response) => {
     try {
-      const ffatCode = generateFFatCode(fat.fat_number, suffix);
-      const info = db
-        .prepare('INSERT INTO tbl_ffats (fat_id, ffat_code) VALUES (?, ?)')
-        .run(fatId, ffatCode);
-      res.status(201).json({
-        id: Number(info.lastInsertRowid),
-        fat_id: fatId,
-        ffat_code: ffatCode,
-        fat_number: fat.fat_number,
-      });
+      const fat_id = Number(req.body?.fat_id);
+      const suffix = String(req.body?.suffix || '').trim();
+      const [fat] = await db.select().from(tblFats).where(eq(tblFats.id, fat_id)).limit(1);
+      if (!fat) throw new Error('FAT والد یافت نشد.');
+      const ffat_code = generateFFatCode(fat.fat_number, suffix);
+      const [ffat] = await db.insert(tblFfats).values({ fat_id, ffat_code }).returning();
+      res.status(201).json({ ffat });
     } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : 'خطا در تولید کد F-FAT' });
+      handleRouteError(res, err);
     }
   },
 );
@@ -1306,1007 +1333,766 @@ app.post(
   '/api/hardware/modem-brands',
   requireAuth,
   requirePermission('can_manage_hardware'),
-  (req, res) => {
-    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
-    const serialPattern =
-      typeof req.body?.serial_pattern === 'string' ? req.body.serial_pattern.trim() : '';
-    const serialPrefix =
-      typeof req.body?.serial_prefix === 'string' ? req.body.serial_prefix.trim() : '';
-
-    if (!name || !serialPattern) {
-      res.status(400).json({ error: 'نام برند و الگوی Regex سریال الزامی است.' });
-      return;
-    }
+  async (req: AuthRequest, res: Response) => {
     try {
-      new RegExp(serialPattern);
-    } catch {
-      res.status(400).json({ error: 'عبارت منظم (Regex) وارد شده معتبر نیست.' });
-      return;
+      const name = String(req.body?.name || '').trim();
+      const serial_prefix = String(req.body?.serial_prefix || '').trim();
+      const serial_pattern = String(req.body?.serial_pattern || '').trim();
+      if (!name || !serial_pattern) {
+        throw new Error('نام برند و الگوی Regex الزامی است.');
+      }
+      new RegExp(serial_pattern);
+      const [brand] = await db
+        .insert(tblModemBrands)
+        .values({ name, serial_prefix, serial_pattern })
+        .returning();
+      res.status(201).json({ brand });
+    } catch (err) {
+      handleRouteError(res, err);
     }
-    const info = getDb()
-      .prepare('INSERT INTO tbl_modem_brands (name, serial_pattern, serial_prefix) VALUES (?, ?, ?)')
-      .run(name, serialPattern, serialPrefix);
-    res.status(201).json({
-      id: Number(info.lastInsertRowid),
-      name,
-      serial_pattern: serialPattern,
-      serial_prefix: serialPrefix,
-    });
   },
 );
 
 // ==========================================
-// 5. INVENTORY & SPOOLS (VAN STOCK)
+// INVENTORY, SPOOLS & VAN STOCK
 // ==========================================
 
-app.get('/api/spools', requireAuth, (req: AuthenticatedRequest, res) => {
-  const user = req.authUser!;
-  const db = getDb();
-  const canSeeAll =
-    userHasPermission(user, 'can_manage_inventory') ||
-    userHasPermission(user, 'can_cross_use_cables') ||
-    userHasPermission(user, 'can_view_all_tickets');
+app.get('/api/inventory', requireAuth, async (_req: AuthRequest, res: Response) => {
+  try {
+    await ensureSeeded();
+    const spools = await db
+      .select({
+        id: tblSpools.id,
+        item_id: tblSpools.item_id,
+        spool_code: tblSpools.spool_code,
+        cable_type: tblSpools.cable_type,
+        initial_length: tblSpools.initial_length,
+        current_length: tblSpools.current_length,
+        assigned_installer_id: tblSpools.assigned_installer_id,
+        installer_name: tblUsers.full_name,
+      })
+      .from(tblSpools)
+      .leftJoin(tblUsers, eq(tblUsers.id, tblSpools.assigned_installer_id))
+      .orderBy(tblSpools.id);
 
-  const rows = db
-    .prepare(
-      `SELECT s.*, u.first_name || ' ' || u.last_name as installer_name
-       FROM tbl_spools s
-       LEFT JOIN tbl_users u ON u.id = s.assigned_installer_id
-       ${canSeeAll ? '' : 'WHERE s.assigned_installer_id = ?'}
-       ORDER BY s.id DESC`,
-    )
-    .all(...(canSeeAll ? [] : [user.id]));
+    const rawItems = await db
+      .select({
+        id: tblInventoryItems.id,
+        name: tblInventoryItems.name,
+        type: tblInventoryItems.type,
+        modem_brand_id: tblInventoryItems.modem_brand_id,
+        brand_name: tblModemBrands.name,
+        total_quantity: tblInventoryItems.total_quantity,
+      })
+      .from(tblInventoryItems)
+      .leftJoin(tblModemBrands, eq(tblModemBrands.id, tblInventoryItems.modem_brand_id))
+      .orderBy(tblInventoryItems.id);
 
-  res.json({ spools: rows });
+    const vanStock = await db
+      .select({
+        id: tblVanStock.id,
+        user_id: tblVanStock.user_id,
+        item_id: tblVanStock.item_id,
+        item_name: tblInventoryItems.name,
+        item_type: tblInventoryItems.type,
+        modem_brand_id: tblInventoryItems.modem_brand_id,
+        brand_name: tblModemBrands.name,
+        serial_prefix: tblModemBrands.serial_prefix,
+        serial_pattern: tblModemBrands.serial_pattern,
+        serial_number: tblVanStock.serial_number,
+        quantity: tblVanStock.quantity,
+        installer_name: tblUsers.full_name,
+        created_at: tblVanStock.created_at,
+      })
+      .from(tblVanStock)
+      .innerJoin(tblInventoryItems, eq(tblInventoryItems.id, tblVanStock.item_id))
+      .innerJoin(tblUsers, eq(tblUsers.id, tblVanStock.user_id))
+      .leftJoin(tblModemBrands, eq(tblModemBrands.id, tblInventoryItems.modem_brand_id))
+      .orderBy(desc(tblVanStock.id));
+
+    const vanCountByItem = new Map<number, number>();
+    for (const v of vanStock) {
+      vanCountByItem.set(v.item_id, (vanCountByItem.get(v.item_id) || 0) + v.quantity);
+    }
+
+    const items = rawItems.map((it) => ({
+      ...it,
+      van_allocated_quantity: vanCountByItem.get(it.id) || 0,
+    }));
+
+    const installers = await db
+      .select({ id: tblUsers.id, full_name: tblUsers.full_name })
+      .from(tblUsers)
+      .where(eq(tblUsers.is_active, true));
+
+    res.json({ spools, items, vanStock, installers });
+  } catch (err) {
+    handleRouteError(res, err, 'خطا در دریافت موجودی انبار');
+  }
 });
 
 app.post(
   '/api/spools',
   requireAuth,
   requirePermission('can_manage_inventory'),
-  (req: AuthenticatedRequest, res) => {
-    const spoolCode =
-      typeof req.body?.spool_code === 'string' ? req.body.spool_code.trim().toUpperCase() : '';
-    const cableType = req.body?.cable_type;
-    const initialLength = Math.round(Number(req.body?.initial_length) || 0);
-    const assignedInstallerId = req.body?.assigned_installer_id
-      ? Number(req.body.assigned_installer_id)
-      : null;
-
-    if (!spoolCode || spoolCode.length > 100) {
-      res.status(400).json({ error: 'کد قرقره الزامی است.' });
-      return;
-    }
-    if (cableType !== 'indoor' && cableType !== 'outdoor') {
-      res.status(400).json({ error: 'نوع کابل باید داخلی (indoor) یا بیرونی (outdoor) باشد.' });
-      return;
-    }
-    if (initialLength <= 0 || initialLength > 50000) {
-      res.status(400).json({ error: 'متراژ اولیه قرقره نامعتبر است.' });
-      return;
-    }
-
+  async (req: AuthRequest, res: Response) => {
     try {
-      const info = getDb()
-        .prepare(
-          'INSERT INTO tbl_spools (spool_code, cable_type, initial_length, current_length, assigned_installer_id) VALUES (?, ?, ?, ?, ?)',
-        )
-        .run(spoolCode, cableType, initialLength, initialLength, assignedInstallerId);
-      const newId = Number(info.lastInsertRowid);
-      recordActivity(
-        req.authUser,
-        'spool_created',
-        'spool',
-        newId,
-        `ثبت قرقره کابل جدید ${spoolCode} (${initialLength} متر)`,
-        `نوع کابل: ${cableType === 'outdoor' ? 'فضای باز' : 'داخلی'}`,
-      );
-      res.status(201).json({ id: newId });
-    } catch {
-      res.status(400).json({ error: 'کد قرقره تکراری است.' });
-    }
-  },
-);
-
-app.patch(
-  '/api/spools/:id/transfer',
-  requireAuth,
-  requirePermission('can_manage_inventory'),
-  (req: AuthenticatedRequest, res) => {
-    const spoolId = Number(req.params.id);
-    const assignedId =
-      req.body?.assigned_installer_id === null || req.body?.assigned_installer_id === ''
-        ? null
-        : Number(req.body?.assigned_installer_id);
-
-    const db = getDb();
-    let targetName = 'انبار مرکزی';
-    if (assignedId !== null) {
-      const u = db
-        .prepare('SELECT id, first_name, last_name FROM tbl_users WHERE id = ? AND is_active = 1')
-        .get(assignedId) as { id: number; first_name: string; last_name: string } | undefined;
-      if (!u) {
-        res.status(400).json({ error: 'نصاب مقصد معتبر نیست.' });
-        return;
-      }
-      targetName = `${u.first_name} ${u.last_name}`;
-    }
-    const upd = db
-      .prepare('UPDATE tbl_spools SET assigned_installer_id = ? WHERE id = ?')
-      .run(assignedId, spoolId);
-    if (upd.changes === 0) {
-      res.status(404).json({ error: 'قرقره یافت نشد.' });
-      return;
-    }
-    const spoolRow = db.prepare('SELECT spool_code FROM tbl_spools WHERE id = ?').get(spoolId) as
-      | { spool_code: string }
-      | undefined;
-    recordActivity(
-      req.authUser,
-      'spool_transferred',
-      'spool',
-      spoolId,
-      `انتقال قرقره ${spoolRow?.spool_code || `#${spoolId}`} به ${targetName}`,
-      null,
-    );
-    res.json({ ok: true });
-  },
-);
-
-app.patch(
-  '/api/spools/:id/consume',
-  requireAuth,
-  requirePermission('can_manage_inventory'),
-  (req: AuthenticatedRequest, res) => {
-    const spoolId = Number(req.params.id);
-    const meters = Math.round(Number(req.body?.meters) || 0);
-    if (!Number.isInteger(spoolId) || spoolId <= 0 || !Number.isInteger(meters) || meters <= 0) {
-      res.status(400).json({ error: 'متراژ مصرفی باید یک عدد صحیح مثبت باشد.' });
-      return;
-    }
-
-    const db = getDb();
-    const upd = db
-      .prepare(
-        'UPDATE tbl_spools SET current_length = current_length - ? WHERE id = ? AND current_length >= ?',
-      )
-      .run(meters, spoolId, meters);
-
-    if (upd.changes === 0) {
-      const exists = db.prepare('SELECT id, current_length FROM tbl_spools WHERE id = ?').get(spoolId) as
-        | { id: number; current_length: number }
-        | undefined;
-      if (!exists) {
-        res.status(404).json({ error: 'قرقره مورد نظر یافت نشد.' });
-      } else {
-        res.status(400).json({ error: 'موجودی باقیمانده قرقره برای این متراژ کافی نیست.' });
-      }
-      return;
-    }
-
-    const spool = db
-      .prepare(
-        `SELECT s.*, u.first_name || ' ' || u.last_name as installer_name
-         FROM tbl_spools s
-         LEFT JOIN tbl_users u ON u.id = s.assigned_installer_id
-         WHERE s.id = ?`,
-      )
-      .get(spoolId) as { spool_code: string; current_length: number };
-
-    recordActivity(
-      req.authUser,
-      'spool_consumed',
-      'spool',
-      spoolId,
-      `کسر متراژ ${meters} متر از قرقره ${spool.spool_code}`,
-      `موجودی باقیمانده فعلی: ${spool.current_length} متر`,
-    );
-
-    res.json({ ok: true, spool });
-  },
-);
-
-// General Inventory Items, Modems & Van Stock
-app.get('/api/inventory', requireAuth, (req: AuthenticatedRequest, res) => {
-  const user = req.authUser!;
-  const db = getDb();
-  const canSeeAll =
-    userHasPermission(user, 'can_manage_inventory') ||
-    userHasPermission(user, 'can_cross_use_cables') ||
-    userHasPermission(user, 'can_view_all_tickets');
-
-  const items = db
-    .prepare(
-      `SELECT ii.*,
-              mb.name as brand_name,
-              COALESCE((SELECT SUM(vs.quantity) FROM tbl_van_stock vs WHERE vs.item_id = ii.id), 0) as van_allocated_quantity
-       FROM tbl_inventory_items ii
-       LEFT JOIN tbl_modem_brands mb ON mb.id = ii.modem_brand_id
-       ORDER BY ii.id ASC`,
-    )
-    .all();
-
-  const vanStock = db
-    .prepare(
-      `SELECT vs.*,
-              u.first_name || ' ' || u.last_name as installer_name,
-              ii.name as item_name,
-              ii.type as item_type,
-              ii.modem_brand_id,
-              mb.name as brand_name
-       FROM tbl_van_stock vs
-       JOIN tbl_users u ON u.id = vs.user_id
-       JOIN tbl_inventory_items ii ON ii.id = vs.item_id
-       LEFT JOIN tbl_modem_brands mb ON mb.id = ii.modem_brand_id
-       ${canSeeAll ? '' : 'WHERE vs.user_id = ?'}
-       ORDER BY vs.id DESC`,
-    )
-    .all(...(canSeeAll ? [] : [user.id]));
-
-  const modemBrands = db.prepare('SELECT * FROM tbl_modem_brands ORDER BY id ASC').all();
-
-  res.json({ items, vanStock, modemBrands });
-});
-
-app.post(
-  '/api/inventory/items',
-  requireAuth,
-  requirePermission('can_manage_inventory'),
-  (req: AuthenticatedRequest, res) => {
-    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
-    const type = req.body?.type;
-    const totalQuantity = Math.max(0, Math.round(Number(req.body?.total_quantity) || 0));
-    const modemBrandId =
-      type === 'modem' && req.body?.modem_brand_id ? Number(req.body.modem_brand_id) : null;
-
-    if (!name || name.length > 150) {
-      res.status(400).json({ error: 'نام کالا یا تجهیزات الزامی است.' });
-      return;
-    }
-    if (!['unit', 'spool', 'modem'].includes(type)) {
-      res.status(400).json({ error: 'نوع کالا باید unit، spool یا modem باشد.' });
-      return;
-    }
-
-    const db = getDb();
-    if (modemBrandId !== null) {
-      const b = db.prepare('SELECT id FROM tbl_modem_brands WHERE id = ?').get(modemBrandId);
-      if (!b) {
-        res.status(400).json({ error: 'برند مودم انتخاب‌شده معتبر نیست.' });
-        return;
-      }
-    }
-
-    const info = db
-      .prepare(
-        'INSERT INTO tbl_inventory_items (name, type, modem_brand_id, total_quantity) VALUES (?, ?, ?, ?)',
-      )
-      .run(name, type, modemBrandId, totalQuantity);
-    const itemId = Number(info.lastInsertRowid);
-
-    recordActivity(
-      req.authUser,
-      'inventory_item_created',
-      'inventory',
-      itemId,
-      `افزودن کالای جدید به انبار: ${name}`,
-      `موجودی اولیه: ${totalQuantity} عدد`,
-    );
-
-    res.status(201).json({ id: itemId });
-  },
-);
-
-app.patch(
-  '/api/inventory/items/:id/adjust',
-  requireAuth,
-  requirePermission('can_manage_inventory'),
-  (req: AuthenticatedRequest, res) => {
-    const itemId = Number(req.params.id);
-    const delta = Math.round(Number(req.body?.delta) || 0);
-    if (!Number.isInteger(itemId) || itemId <= 0 || delta === 0) {
-      res.status(400).json({ error: 'مقدار تغییر موجودی نامعتبر است.' });
-      return;
-    }
-    const db = getDb();
-    const upd = db
-      .prepare(
-        'UPDATE tbl_inventory_items SET total_quantity = total_quantity + ? WHERE id = ? AND total_quantity + ? >= 0',
-      )
-      .run(delta, itemId, delta);
-    if (upd.changes === 0) {
-      res.status(400).json({ error: 'کالا یافت نشد یا موجودی کافی نیست.' });
-      return;
-    }
-    const itemRow = db
-      .prepare('SELECT name, total_quantity FROM tbl_inventory_items WHERE id = ?')
-      .get(itemId) as { name: string; total_quantity: number } | undefined;
-    recordActivity(
-      req.authUser,
-      'inventory_adjusted',
-      'inventory',
-      itemId,
-      `تغییر موجودی انبار مرکزی (${itemRow?.name || `#${itemId}`}): ${delta > 0 ? `+${delta}` : delta} عدد`,
-      itemRow ? `موجودی فعلی: ${itemRow.total_quantity} عدد` : null,
-    );
-    res.json({ ok: true });
-  },
-);
-
-app.post(
-  '/api/inventory/van-stock/transfer',
-  requireAuth,
-  requirePermission('can_manage_inventory'),
-  (req: AuthenticatedRequest, res) => {
-    const userId = Number(req.body?.user_id);
-    const itemId = Number(req.body?.item_id);
-    const rawSerial =
-      typeof req.body?.serial_number === 'string' && req.body.serial_number.trim()
-        ? req.body.serial_number.trim().toUpperCase().slice(0, 100)
+      const spool_code = String(req.body?.spool_code || '').trim().toUpperCase();
+      const cable_type = req.body?.cable_type === 'indoor' ? 'indoor' : 'outdoor';
+      const initial_length = Math.max(1, Math.round(Number(req.body?.initial_length || 1000)));
+      const assigned_installer_id = req.body?.assigned_installer_id
+        ? Number(req.body.assigned_installer_id)
         : null;
-    const requestedQty = rawSerial ? 1 : Math.max(1, Math.round(Number(req.body?.quantity) || 1));
+      if (!spool_code) throw new Error('کد قرقره الزامی است.');
 
-    if (!Number.isInteger(userId) || !Number.isInteger(itemId)) {
-      res.status(400).json({ error: 'نصاب مقصد و کالای انبار باید انتخاب شوند.' });
-      return;
-    }
+      const [spool] = await db
+        .insert(tblSpools)
+        .values({
+          spool_code,
+          cable_type,
+          initial_length,
+          current_length: initial_length,
+          assigned_installer_id,
+        })
+        .returning();
 
-    const db = getDb();
-    const installer = db
-      .prepare('SELECT id, first_name, last_name FROM tbl_users WHERE id = ? AND is_active = 1')
-      .get(userId) as { id: number; first_name: string; last_name: string } | undefined;
-    if (!installer) {
-      res.status(400).json({ error: 'نصاب انتخاب‌شده معتبر یا فعال نیست.' });
-      return;
-    }
+      await logActivity({
+        user: req.authUser,
+        actionType: 'spool_created',
+        entityType: 'spool',
+        entityId: spool.id,
+        summary: `ثبت قرقره جدید ${spool_code} (${initial_length} متر)`,
+      });
 
-    const item = db
-      .prepare('SELECT id, name, type, modem_brand_id, total_quantity FROM tbl_inventory_items WHERE id = ?')
-      .get(itemId) as
-      | { id: number; name: string; type: string; modem_brand_id: number | null; total_quantity: number }
-      | undefined;
-
-    if (!item) {
-      res.status(404).json({ error: 'کالای انبار یافت نشد.' });
-      return;
-    }
-
-    if (rawSerial && item.modem_brand_id) {
-      const brand = db
-        .prepare('SELECT name, serial_prefix, serial_pattern FROM tbl_modem_brands WHERE id = ?')
-        .get(item.modem_brand_id) as
-        | { name: string; serial_prefix: string; serial_pattern: string }
-        | undefined;
-      if (brand) {
-        const chk = validateModemSerial(rawSerial, brand);
-        if (!chk.valid) {
-          res.status(400).json({ error: chk.reason || 'سریال واردشده با الگوی برند مودم مطابقت ندارد.' });
-          return;
-        }
-      }
-    }
-
-    db.exec('BEGIN IMMEDIATE;');
-    try {
-      if (rawSerial) {
-        const dup = db
-          .prepare('SELECT id FROM tbl_van_stock WHERE UPPER(serial_number) = UPPER(?)')
-          .get(rawSerial);
-        if (dup) {
-          throw new Error(`سریال ${rawSerial} قبلاً در موجودی خودروی یک نصاب ثبت شده است.`);
-        }
-      }
-
-      const deduct = db
-        .prepare(
-          'UPDATE tbl_inventory_items SET total_quantity = total_quantity - ? WHERE id = ? AND total_quantity >= ?',
-        )
-        .run(requestedQty, itemId, requestedQty);
-      if (deduct.changes !== 1) {
-        throw new Error('موجودی انبار مرکزی برای این تعداد کافی نیست.');
-      }
-
-      if (!rawSerial) {
-        const existingBulk = db
-          .prepare(
-            'SELECT id FROM tbl_van_stock WHERE user_id = ? AND item_id = ? AND serial_number IS NULL LIMIT 1',
-          )
-          .get(userId, itemId) as { id: number } | undefined;
-        if (existingBulk) {
-          db.prepare('UPDATE tbl_van_stock SET quantity = quantity + ? WHERE id = ?').run(
-            requestedQty,
-            existingBulk.id,
-          );
-        } else {
-          db.prepare(
-            'INSERT INTO tbl_van_stock (user_id, item_id, serial_number, quantity) VALUES (?, ?, NULL, ?)',
-          ).run(userId, itemId, requestedQty);
-        }
-      } else {
-        db.prepare(
-          'INSERT INTO tbl_van_stock (user_id, item_id, serial_number, quantity) VALUES (?, ?, ?, 1)',
-        ).run(userId, itemId, rawSerial);
-      }
-
-      db.exec('COMMIT;');
-      recordActivity(
-        req.authUser,
-        'van_stock_transferred',
-        'inventory',
-        itemId,
-        `تحویل ${item.name} به خودروی ${installer.first_name} ${installer.last_name}`,
-        rawSerial ? `شماره سریال: ${rawSerial}` : `تعداد: ${requestedQty} عدد`,
-      );
-      res.status(201).json({ ok: true });
+      res.status(201).json({ spool });
     } catch (err) {
-      db.exec('ROLLBACK;');
-      res.status(400).json({ error: err instanceof Error ? err.message : 'خطا در تحویل کالا به نصاب' });
+      handleRouteError(res, err);
     }
   },
 );
 
 app.post(
-  '/api/inventory/van-stock/:id/return',
+  '/api/spools/transfer',
   requireAuth,
   requirePermission('can_manage_inventory'),
-  (req: AuthenticatedRequest, res) => {
-    const vanStockId = Number(req.params.id);
-    if (!Number.isInteger(vanStockId) || vanStockId <= 0) {
-      res.status(400).json({ error: 'شناسه موجودی خودرو نامعتبر است.' });
-      return;
-    }
-
-    const db = getDb();
-    db.exec('BEGIN IMMEDIATE;');
+  async (req: AuthRequest, res: Response) => {
     try {
-      const row = db
-        .prepare(
-          `SELECT vs.id, vs.item_id, vs.quantity, ii.name as item_name
-           FROM tbl_van_stock vs
-           JOIN tbl_inventory_items ii ON ii.id = vs.item_id
-           WHERE vs.id = ?`,
-        )
-        .get(vanStockId) as { id: number; item_id: number; quantity: number; item_name: string } | undefined;
-      if (!row) {
-        throw new Error('ردیف موجودی خودرو یافت نشد.');
-      }
-      db.prepare('UPDATE tbl_inventory_items SET total_quantity = total_quantity + ? WHERE id = ?').run(
-        row.quantity,
-        row.item_id,
-      );
-      db.prepare('DELETE FROM tbl_van_stock WHERE id = ?').run(vanStockId);
-      db.exec('COMMIT;');
-      recordActivity(
-        req.authUser,
-        'van_stock_returned',
-        'inventory',
-        row.item_id,
-        `عودت ${row.item_name} (${row.quantity} عدد) از خودروی نصاب به انبار مرکزی`,
-        null,
-      );
-      res.json({ ok: true });
+      const spoolId = Number(req.body?.spool_id);
+      const installerId = req.body?.installer_id ? Number(req.body.installer_id) : null;
+      const [updated] = await db
+        .update(tblSpools)
+        .set({ assigned_installer_id: installerId })
+        .where(eq(tblSpools.id, spoolId))
+        .returning();
+      if (!updated) throw new Error('قرقره یافت نشد.');
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'spool_transferred',
+        entityType: 'spool',
+        entityId: spoolId,
+        summary: `تحویل قرقره ${updated.spool_code} به انبار خودرو`,
+      });
+
+      res.json({ spool: updated });
     } catch (err) {
-      db.exec('ROLLBACK;');
-      res.status(400).json({ error: err instanceof Error ? err.message : 'خطا در عودت کالا به انبار' });
+      handleRouteError(res, err);
+    }
+  },
+);
+
+app.post(
+  '/api/spools/consume',
+  requireAuth,
+  requirePermission('can_manage_inventory', 'can_execute_service'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const spoolId = Number(req.body?.spool_id);
+      const meters = Math.max(1, Math.round(Number(req.body?.meters || 0)));
+      const [updated] = await db
+        .update(tblSpools)
+        .set({ current_length: sql`${tblSpools.current_length} - ${meters}` })
+        .where(and(eq(tblSpools.id, spoolId), gte(tblSpools.current_length, meters)))
+        .returning();
+      if (!updated) {
+        res.status(400).json({ error: 'متراژ باقی‌مانده قرقره کافی نیست.' });
+        return;
+      }
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'inventory_adjusted',
+        entityType: 'spool',
+        entityId: spoolId,
+        summary: `کسر ${meters} متر از قرقره ${updated.spool_code}`,
+        details: `باقیمانده جدید: ${updated.current_length} متر`,
+      });
+
+      res.json({ spool: updated });
+    } catch (err) {
+      handleRouteError(res, err);
+    }
+  },
+);
+
+app.post(
+  '/api/inventory/transfer-to-van',
+  requireAuth,
+  requirePermission('can_manage_inventory'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = Number(req.body?.user_id);
+      const itemId = Number(req.body?.item_id);
+      const quantity = Math.max(1, Math.round(Number(req.body?.quantity || 1)));
+      const serialNumber = String(req.body?.serial_number || '').trim() || null;
+
+      if (!userId || !itemId) throw new Error('انتخاب نصاب و کالا الزامی است.');
+
+      const vanItem = await db.transaction(async (tx) => {
+        const [item] = await tx
+          .select()
+          .from(tblInventoryItems)
+          .where(eq(tblInventoryItems.id, itemId))
+          .limit(1);
+        if (!item) throw new Error('کالا یافت نشد.');
+        if (item.type === 'modem') {
+          if (!serialNumber) throw new Error('برای انتقال مودم به خودرو، ورود شماره سریال الزامی است.');
+          if (item.modem_brand_id) {
+            const [brand] = await tx
+              .select()
+              .from(tblModemBrands)
+              .where(eq(tblModemBrands.id, item.modem_brand_id))
+              .limit(1);
+            if (brand) {
+              const check = validateModemSerial(serialNumber, brand);
+              if (!check.valid) throw new Error(check.reason);
+            }
+          }
+        }
+
+        const effectiveQty = item.type === 'modem' ? 1 : quantity;
+        const [dec] = await tx
+          .update(tblInventoryItems)
+          .set({ total_quantity: sql`${tblInventoryItems.total_quantity} - ${effectiveQty}` })
+          .where(and(eq(tblInventoryItems.id, itemId), gte(tblInventoryItems.total_quantity, effectiveQty)))
+          .returning();
+        if (!dec) throw new Error('موجودی انبار مرکزی کافی نیست.');
+
+        const [inserted] = await tx
+          .insert(tblVanStock)
+          .values({
+            user_id: userId,
+            item_id: itemId,
+            serial_number: serialNumber,
+            quantity: effectiveQty,
+          })
+          .returning();
+        return inserted;
+      });
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'van_stock_transferred',
+        entityType: 'inventory',
+        entityId: itemId,
+        summary: `تحویل تجهیزات به انبار خودرو نصاب`,
+        details: serialNumber ? `سریال: ${serialNumber}` : `تعداد: ${quantity}`,
+      });
+
+      res.status(201).json({ vanItem });
+    } catch (err) {
+      handleRouteError(res, err);
     }
   },
 );
 
 // ==========================================
-// 6. FINANCIALS, TARIFFS & DOUBLE-ENTRY LEDGER
+// FINANCIALS, TARIFF TEMPLATES, PROMOTIONS & PAYOUTS
 // ==========================================
 
-app.get(
-  '/api/financial',
-  requireAuth,
-  requirePermission('can_view_financials', 'can_manage_tariffs', 'can_execute_service'),
-  (req: AuthenticatedRequest, res) => {
+app.get('/api/financial', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    await ensureSeeded();
     const user = req.authUser!;
-    const canViewAllFinancials =
-      user.isSuperAdmin ||
-      userHasPermission(user, 'can_view_financials') ||
-      userHasPermission(user, 'can_manage_tariffs');
+    const canSeeAll = userHasPermission(user, 'can_view_financials', 'can_manage_tariffs');
 
-    const db = getDb();
-    const tariffs = (
-      canViewAllFinancials
-        ? db
-            .prepare(
-              `SELECT tf.*, u.first_name || ' ' || u.last_name as installer_name, u.username
-               FROM tbl_tariffs tf
-               JOIN tbl_users u ON u.id = tf.installer_id
-               ORDER BY tf.id ASC`,
-            )
-            .all()
-        : db
-            .prepare(
-              `SELECT tf.*, u.first_name || ' ' || u.last_name as installer_name, u.username
-               FROM tbl_tariffs tf
-               JOIN tbl_users u ON u.id = tf.installer_id
-               WHERE tf.installer_id = ?
-               ORDER BY tf.id ASC`,
-            )
-            .all(user.id)
-    );
+    const templates = await db.select().from(tblTariffTemplates).orderBy(tblTariffTemplates.id);
+    const rawPromos = await db.select().from(tblPromotions).orderBy(tblPromotions.id);
+    const promotions = rawPromos.map((p) => ({
+      ...p,
+      reward_amount: Number(p.reward_amount),
+      start_date: String(p.start_date),
+      end_date: String(p.end_date),
+    }));
 
-    const ledger = (
-      canViewAllFinancials
-        ? db
-            .prepare(
-              `SELECT l.*, u.first_name || ' ' || u.last_name as user_name, sr.ticket_id
-               FROM tbl_ledger l
-               JOIN tbl_users u ON u.id = l.user_id
-               LEFT JOIN tbl_service_records sr ON sr.id = l.record_id
-               ORDER BY l.id DESC
-               LIMIT 250`,
-            )
-            .all()
-        : db
-            .prepare(
-              `SELECT l.*, u.first_name || ' ' || u.last_name as user_name, sr.ticket_id
-               FROM tbl_ledger l
-               JOIN tbl_users u ON u.id = l.user_id
-               LEFT JOIN tbl_service_records sr ON sr.id = l.record_id
-               WHERE l.user_id = ?
-               ORDER BY l.id DESC
-               LIMIT 250`,
-            )
-            .all(user.id)
-    );
+    const userTariffs = await db
+      .select({
+        user_id: tblUserTariffs.user_id,
+        username: tblUsers.username,
+        full_name: tblUsers.full_name,
+        template_id: tblUserTariffs.template_id,
+        template_name: tblTariffTemplates.name,
+        promotion_id: tblUserTariffs.promotion_id,
+        promotion_name: tblPromotions.name,
+      })
+      .from(tblUserTariffs)
+      .innerJoin(tblUsers, eq(tblUsers.id, tblUserTariffs.user_id))
+      .innerJoin(tblTariffTemplates, eq(tblTariffTemplates.id, tblUserTariffs.template_id))
+      .leftJoin(tblPromotions, eq(tblPromotions.id, tblUserTariffs.promotion_id));
 
-    const users = (
-      canViewAllFinancials
-        ? db
-            .prepare(
-              `SELECT u.id, u.first_name || ' ' || u.last_name as full_name, r.role_name
-               FROM tbl_users u JOIN tbl_roles r ON r.id = u.role_id
-               WHERE u.is_active = 1`,
-            )
-            .all()
-        : db
-            .prepare(
-              `SELECT u.id, u.first_name || ' ' || u.last_name as full_name, r.role_name
-               FROM tbl_users u JOIN tbl_roles r ON r.id = u.role_id
-               WHERE u.id = ?`,
-            )
-            .all(user.id)
-    ) as Array<{ id: number; full_name: string; role_name: string }>;
+    const ledgerFilter = canSeeAll ? undefined : eq(tblLedger.user_id, user.id);
+    const ledgerRows = await db
+      .select({
+        id: tblLedger.id,
+        user_id: tblLedger.user_id,
+        user_full_name: tblUsers.full_name,
+        ticket_id: tblLedger.ticket_id,
+        amount: tblLedger.amount,
+        type: tblLedger.type,
+        description: tblLedger.description,
+        created_at: tblLedger.created_at,
+      })
+      .from(tblLedger)
+      .innerJoin(tblUsers, eq(tblUsers.id, tblLedger.user_id))
+      .where(ledgerFilter)
+      .orderBy(desc(tblLedger.created_at), desc(tblLedger.id));
 
-    const allEntries = (
-      canViewAllFinancials
-        ? db.prepare('SELECT user_id, amount, type, created_at FROM tbl_ledger').all()
-        : db
-            .prepare('SELECT user_id, amount, type, created_at FROM tbl_ledger WHERE user_id = ?')
-            .all(user.id)
-    ) as Array<{ user_id: number; amount: number; type: 'credit' | 'debit'; created_at: string }>;
+    const normalizedLedger = ledgerRows.map((l) => ({
+      ...l,
+      amount: Number(l.amount),
+      type: l.type as 'credit' | 'debit',
+    }));
 
-    const balances = users.map((u) => {
-      const userEntries = allEntries.filter((e) => e.user_id === u.id);
-      const summary = computeLedgerBalance(userEntries);
+    const users = await db
+      .select({ id: tblUsers.id, username: tblUsers.username, full_name: tblUsers.full_name })
+      .from(tblUsers)
+      .where(eq(tblUsers.is_active, true));
+
+    const completedAll = await db
+      .select({
+        ticket_id: tblTickets.id,
+        type: tblTickets.type,
+        assigned_installer: tblTickets.assigned_installer,
+        completed_at: tblTickets.completed_at,
+      })
+      .from(tblTickets)
+      .where(and(eq(tblTickets.status, 'completed'), isNotNull(tblTickets.completed_at)));
+
+    const nowIso = new Date().toISOString();
+    const targetUsers = canSeeAll ? users : users.filter((u) => u.id === user.id);
+
+    const contractorSummaries = targetUsers.map((u) => {
+      const userEntries = normalizedLedger.filter((l) => l.user_id === u.id);
+      const bal = computeLedgerBalance(userEntries);
+      const assigned = userTariffs.find((ut) => ut.user_id === u.id);
+      const promo = assigned?.promotion_id
+        ? promotions.find((p) => p.id === assigned.promotion_id)
+        : undefined;
+
+      let promotionProgress = null;
+      if (promo) {
+        const events: CompletedTicketEvent[] = completedAll
+          .filter((t) => t.assigned_installer === u.id)
+          .map((t) => ({
+            ticket_id: t.ticket_id,
+            type: t.type as TicketTypeKey,
+            completed_at: new Date(t.completed_at!).toISOString(),
+          }));
+        const evalRes = evaluatePromotionForTicket(
+          { ...promo, reset_cycle: promo.reset_cycle as PromotionRule['reset_cycle'] },
+          events,
+          'internet_install',
+          nowIso,
+        );
+        const currentInCycle = Math.max(0, evalRes.cycleCountAfterThis - 1);
+        promotionProgress = {
+          promotion_name: promo.name,
+          cycle_count: currentInCycle,
+          target_value: promo.target_value,
+          progress_percent: Math.min(100, Math.round((currentInCycle / promo.target_value) * 100)),
+          reward_amount: promo.reward_amount,
+          carried_over: evalRes.carriedOverCount,
+        };
+      }
+
       return {
         user_id: u.id,
+        username: u.username,
         full_name: u.full_name,
-        role_name: u.role_name,
-        ...summary,
+        ...bal,
+        promotionProgress,
       };
     });
 
-    const monthlyEarnings = aggregateMonthlyContractorEarnings(allEntries);
-
-    res.json({ tariffs, ledger, balances, monthlyEarnings, isScopedToSelf: !canViewAllFinancials });
-  },
-);
-
-app.post(
-  '/api/financial/tariffs',
-  requireAuth,
-  requirePermission('can_manage_tariffs'),
-  (req: AuthenticatedRequest, res) => {
-    const installerId = Number(req.body?.installer_id);
-    const calcType = req.body?.calc_type;
-    const basePrice = Math.max(0, Number(req.body?.base_price) || 0);
-    const meterLimit = Math.max(0, Math.round(Number(req.body?.meter_limit) || 0));
-    const extraMeterPrice = Math.max(0, Number(req.body?.extra_meter_price) || 0);
-    const bonusTargetCount = Math.max(0, Math.round(Number(req.body?.bonus_target_count) || 0));
-    const bonusAmount = Math.max(0, Number(req.body?.bonus_amount) || 0);
-
-    if (!Number.isInteger(installerId) || !['fixed', 'per_meter', 'hybrid'].includes(calcType)) {
-      res.status(400).json({ error: 'مشخصات تعرفه نامعتبر است.' });
-      return;
-    }
-
-    const db = getDb();
-    db.prepare(
-      `INSERT INTO tbl_tariffs (installer_id, calc_type, base_price, meter_limit, extra_meter_price, bonus_target_count, bonus_amount)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(installer_id) DO UPDATE SET
-         calc_type = excluded.calc_type,
-         base_price = excluded.base_price,
-         meter_limit = excluded.meter_limit,
-         extra_meter_price = excluded.extra_meter_price,
-         bonus_target_count = excluded.bonus_target_count,
-         bonus_amount = excluded.bonus_amount`,
-    ).run(installerId, calcType, basePrice, meterLimit, extraMeterPrice, bonusTargetCount, bonusAmount);
-
-    recordActivity(
-      req.authUser,
-      'tariff_updated',
-      'financial',
-      installerId,
-      `به‌روزرسانی تعرفه دستمزد نصاب #${installerId}`,
-      `مدل محاسبه: ${calcType} — مبلغ پایه: ${basePrice.toLocaleString('en-US')} تومان`,
-    );
-
-    res.json({ ok: true });
-  },
-);
-
-app.post(
-  '/api/financial/payout',
-  requireAuth,
-  requirePermission('can_manage_tariffs'),
-  (req: AuthenticatedRequest, res) => {
-    const userId = Number(req.body?.user_id);
-    const amount = Number(req.body?.amount);
-    const description =
-      typeof req.body?.description === 'string' && req.body.description.trim()
-        ? req.body.description.trim().slice(0, 255)
-        : 'پرداخت تسویه حساب به پیمانکار';
-
-    if (!Number.isInteger(userId) || !Number.isFinite(amount) || amount <= 0) {
-      res.status(400).json({ error: 'مبلغ پرداختی و کاربر دریافت‌کننده باید معتبر باشد.' });
-      return;
-    }
-
-    const db = getDb();
-    const u = db.prepare('SELECT id, first_name, last_name FROM tbl_users WHERE id = ?').get(userId) as
-      | { id: number; first_name: string; last_name: string }
-      | undefined;
-    if (!u) {
-      res.status(404).json({ error: 'کاربر یافت نشد.' });
-      return;
-    }
-
-    db.prepare(
-      'INSERT INTO tbl_ledger (user_id, record_id, amount, type, description) VALUES (?, NULL, ?, ?, ?)',
-    ).run(userId, amount, 'debit', description);
-
-    recordActivity(
-      req.authUser,
-      'payout_recorded',
-      'financial',
-      userId,
-      `ثبت سند پرداخت مالی ${Math.round(amount).toLocaleString('en-US')} تومان برای ${u.first_name} ${u.last_name}`,
-      description,
-    );
-
-    res.status(201).json({ ok: true });
-  },
-);
-
-// ==========================================
-// 7. USERS & CUSTOM RBAC
-// ==========================================
-
-app.get(
-  '/api/users/installers',
-  requireAuth,
-  requirePermission(
-    'can_assign_tickets',
-    'can_manage_inventory',
-    'can_manage_tariffs',
-    'can_manage_users',
-    'can_view_all_tickets',
-  ),
-  (_req, res) => {
-    const rows = getDb()
-      .prepare(
-        `SELECT u.id, u.username, u.first_name, u.last_name, r.role_name
-         FROM tbl_users u
-         JOIN tbl_roles r ON r.id = u.role_id
-         WHERE u.is_active = 1
-         ORDER BY u.id ASC`,
-      )
-      .all();
-    res.json({ users: rows });
-  },
-);
-
-app.get(
-  '/api/rbac',
-  requireAuth,
-  requirePermission('can_manage_users'),
-  (_req, res) => {
-    const db = getDb();
-    const permissions = db.prepare('SELECT * FROM tbl_permissions ORDER BY id ASC').all();
-    const roles = db.prepare('SELECT * FROM tbl_roles ORDER BY id ASC').all() as Array<{
-      id: number;
-      role_name: string;
-    }>;
-    const rolePerms = db.prepare('SELECT role_id, perm_id FROM tbl_role_perms').all() as Array<{
-      role_id: number;
-      perm_id: number;
-    }>;
-
-    const rolesWithPerms = roles.map((r) => ({
-      ...r,
-      perm_ids: rolePerms.filter((rp) => rp.role_id === r.id).map((rp) => rp.perm_id),
-    }));
-
-    const users = db
-      .prepare(
-        `SELECT u.id, u.username, u.first_name, u.last_name, u.role_id, u.is_active, u.last_login,
-                r.role_name,
-                CASE WHEN length(u.password_hash) > 0 THEN 1 ELSE 0 END as has_password
-         FROM tbl_users u
-         JOIN tbl_roles r ON r.id = u.role_id
-         ORDER BY u.id ASC`,
-      )
-      .all();
-
-    const activityLogs = db
-      .prepare('SELECT * FROM tbl_activity_logs ORDER BY id DESC LIMIT 120')
-      .all();
-
     res.json({
-      permissions,
-      roles: rolesWithPerms,
+      templates,
+      promotions,
+      userTariffs,
+      ledger: normalizedLedger,
+      contractorSummaries,
       users,
-      activityLogs,
-      timeoutMinutes: getSessionTimeoutMinutes(),
     });
-  },
-);
-
-app.get(
-  '/api/rbac/activity-logs',
-  requireAuth,
-  requirePermission('can_manage_users'),
-  (_req, res) => {
-    const logs = getDb()
-      .prepare('SELECT * FROM tbl_activity_logs ORDER BY id DESC LIMIT 150')
-      .all();
-    res.json({ activityLogs: logs });
-  },
-);
-
-// Only SuperAdmin can create/modify custom roles and permission matrices
-app.post('/api/rbac/roles', requireAuth, (req: AuthenticatedRequest, res) => {
-  if (!req.authUser!.isSuperAdmin) {
-    res.status(403).json({ error: 'تنها مدیر کل (SuperAdmin) مجاز به ایجاد نقش جدید است.' });
-    return;
-  }
-  const roleName = typeof req.body?.role_name === 'string' ? req.body.role_name.trim() : '';
-  const permIds = Array.isArray(req.body?.perm_ids)
-    ? req.body.perm_ids.map(Number).filter(Number.isInteger)
-    : [];
-
-  if (!roleName || roleName.length > 100) {
-    res.status(400).json({ error: 'نام نقش الزامی است.' });
-    return;
-  }
-
-  const db = getDb();
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    const info = db.prepare('INSERT INTO tbl_roles (role_name) VALUES (?)').run(roleName);
-    const roleId = Number(info.lastInsertRowid);
-    const ins = db.prepare('INSERT OR IGNORE INTO tbl_role_perms (role_id, perm_id) VALUES (?, ?)');
-    for (const pid of permIds) {
-      ins.run(roleId, pid);
-    }
-    db.exec('COMMIT;');
-    recordActivity(
-      req.authUser,
-      'role_created',
-      'role',
-      roleId,
-      `ایجاد نقش دسترسی جدید «${roleName}»`,
-      `تعداد مجوزها: ${permIds.length}`,
-    );
-    res.status(201).json({ id: roleId, role_name: roleName, perm_ids: permIds });
-  } catch {
-    db.exec('ROLLBACK;');
-    res.status(400).json({ error: 'نام نقش تکراری است.' });
-  }
-});
-
-app.put('/api/rbac/roles/:id', requireAuth, (req: AuthenticatedRequest, res) => {
-  if (!req.authUser!.isSuperAdmin) {
-    res.status(403).json({ error: 'تنها مدیر کل (SuperAdmin) مجاز به ویرایش دسترسی نقش‌هاست.' });
-    return;
-  }
-  const roleId = Number(req.params.id);
-  const permIds = Array.isArray(req.body?.perm_ids)
-    ? req.body.perm_ids.map(Number).filter(Number.isInteger)
-    : [];
-
-  const db = getDb();
-  const role = db.prepare('SELECT id, role_name FROM tbl_roles WHERE id = ?').get(roleId) as
-    | { id: number; role_name: string }
-    | undefined;
-  if (!role) {
-    res.status(404).json({ error: 'نقش یافت نشد.' });
-    return;
-  }
-  if (role.role_name === 'SuperAdmin') {
-    res.status(400).json({ error: 'دسترسی‌های مدیر کل همیشه کامل است و قابل محدود کردن نیست.' });
-    return;
-  }
-
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    db.prepare('DELETE FROM tbl_role_perms WHERE role_id = ?').run(roleId);
-    const ins = db.prepare('INSERT OR IGNORE INTO tbl_role_perms (role_id, perm_id) VALUES (?, ?)');
-    for (const pid of permIds) {
-      ins.run(roleId, pid);
-    }
-    db.exec('COMMIT;');
-    recordActivity(
-      req.authUser,
-      'role_updated',
-      'role',
-      roleId,
-      `به‌روزرسانی مجوزهای نقش «${role.role_name}»`,
-      `تعداد مجوزهای فعال: ${permIds.length}`,
-    );
-    res.json({ ok: true });
-  } catch {
-    db.exec('ROLLBACK;');
-    res.status(400).json({ error: 'خطا در به‌روزرسانی دسترسی‌ها.' });
+  } catch (err) {
+    handleRouteError(res, err, 'خطا در دریافت اطلاعات مالی');
   }
 });
 
 app.post(
-  '/api/rbac/users',
+  '/api/financial/templates',
+  requireAuth,
+  requirePermission('can_manage_tariffs'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const id = req.body?.id ? Number(req.body.id) : null;
+      const name = String(req.body?.name || '').trim();
+      const rules_json = req.body?.rules_json as TariffTemplateRulesJson;
+      if (!name || !rules_json) throw new Error('نام الگو و قوانین ۵گانه الزامی است.');
+
+      if (id) {
+        const [updated] = await db
+          .update(tblTariffTemplates)
+          .set({ name, rules_json })
+          .where(eq(tblTariffTemplates.id, id))
+          .returning();
+        await logActivity({
+          user: req.authUser,
+          actionType: 'tariff_updated',
+          entityType: 'tariff',
+          entityId: id,
+          summary: `بروزرسانی الگوی تعرفه «${name}»`,
+        });
+        res.json({ template: updated });
+      } else {
+        const [created] = await db
+          .insert(tblTariffTemplates)
+          .values({ name, rules_json })
+          .returning();
+        await logActivity({
+          user: req.authUser,
+          actionType: 'tariff_created',
+          entityType: 'tariff',
+          entityId: created.id,
+          summary: `ایجاد الگوی تعرفه جدید «${name}»`,
+        });
+        res.status(201).json({ template: created });
+      }
+    } catch (err) {
+      handleRouteError(res, err);
+    }
+  },
+);
+
+app.post(
+  '/api/financial/promotions',
+  requireAuth,
+  requirePermission('can_manage_tariffs'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const name = String(req.body?.name || '').trim();
+      const target_type = String(req.body?.target_type || 'installs');
+      const target_value = Math.max(1, Math.round(Number(req.body?.target_value || 10)));
+      const reward_amount = Math.max(0, Number(req.body?.reward_amount || 0));
+      const reset_cycle = String(req.body?.reset_cycle || 'monthly');
+      const start_date = String(req.body?.start_date || '').trim();
+      const end_date = String(req.body?.end_date || '').trim();
+      const carry_over = Boolean(req.body?.carry_over);
+
+      if (!name || !start_date || !end_date) {
+        throw new Error('عنوان کمپین، تاریخ شروع و تاریخ پایان الزامی است.');
+      }
+
+      const [promo] = await db
+        .insert(tblPromotions)
+        .values({
+          name,
+          target_type,
+          target_value,
+          reward_amount: reward_amount.toFixed(2),
+          reset_cycle,
+          start_date,
+          end_date,
+          carry_over,
+        })
+        .returning();
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'promotion_created',
+        entityType: 'promotion',
+        entityId: promo.id,
+        summary: `تعریف کمپین پاداش «${name}» (هدف ${target_value} مورد)`,
+      });
+
+      res.status(201).json({ promotion: promo });
+    } catch (err) {
+      handleRouteError(res, err);
+    }
+  },
+);
+
+app.post(
+  '/api/financial/assign-tariff',
+  requireAuth,
+  requirePermission('can_manage_tariffs'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const user_id = Number(req.body?.user_id);
+      const template_id = Number(req.body?.template_id);
+      const promotion_id = req.body?.promotion_id ? Number(req.body.promotion_id) : null;
+      if (!user_id || !template_id) throw new Error('انتخاب نصاب و الگوی تعرفه الزامی است.');
+
+      await db
+        .insert(tblUserTariffs)
+        .values({ user_id, template_id, promotion_id })
+        .onConflictDoUpdate({
+          target: tblUserTariffs.user_id,
+          set: { template_id, promotion_id },
+        });
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'user_tariff_assigned',
+        entityType: 'financial',
+        entityId: user_id,
+        summary: `تخصیص الگوی تعرفه و کمپین به نصاب #${user_id}`,
+      });
+
+      res.json({ ok: true });
+    } catch (err) {
+      handleRouteError(res, err);
+    }
+  },
+);
+
+app.post(
+  '/api/financial/payouts',
+  requireAuth,
+  requirePermission('can_manage_tariffs'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const user_id = Number(req.body?.user_id);
+      const amount = Number(req.body?.amount || 0);
+      const description = String(req.body?.description || 'تسویه حساب پیمانکار').trim();
+      if (!user_id || amount <= 0) throw new Error('انتخاب نصاب و مبلغ معتبر الزامی است.');
+
+      const [entry] = await db
+        .insert(tblLedger)
+        .values({
+          user_id,
+          ticket_id: null,
+          amount: amount.toFixed(2),
+          type: 'debit',
+          description,
+        })
+        .returning();
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'payout_recorded',
+        entityType: 'financial',
+        entityId: entry.id,
+        summary: `ثبت پرداخت تسویه حساب به مبلغ ${amount.toLocaleString('en-US')} تومان`,
+        details: description,
+      });
+
+      res.status(201).json({ entry });
+    } catch (err) {
+      handleRouteError(res, err);
+    }
+  },
+);
+
+// ==========================================
+// USERS, GRANULAR RBAC & ACTIVITY LOGS
+// ==========================================
+
+app.get(
+  '/api/users',
   requireAuth,
   requirePermission('can_manage_users'),
-  (req: AuthenticatedRequest, res) => {
-    const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
-    const password = typeof req.body?.password === 'string' ? req.body.password : '';
-    const firstName = typeof req.body?.first_name === 'string' ? req.body.first_name.trim() : '';
-    const lastName = typeof req.body?.last_name === 'string' ? req.body.last_name.trim() : '';
-    const roleId = Number(req.body?.role_id);
-
-    if (!username || !/^[a-zA-Z0-9_.-]{3,50}$/.test(username)) {
-      res.status(400).json({ error: 'نام کاربری باید بین ۳ تا ۵۰ کاراکتر انگلیسی/عدد باشد.' });
-      return;
-    }
-    if (password.length < 6) {
-      res.status(400).json({ error: 'رمز عبور باید حداقل ۶ کاراکتر باشد.' });
-      return;
-    }
-    if (!firstName || !lastName || !Number.isInteger(roleId)) {
-      res.status(400).json({ error: 'نام، نام خانوادگی و نقش الزامی است.' });
-      return;
-    }
-
-    const db = getDb();
-    const role = db.prepare('SELECT id, role_name FROM tbl_roles WHERE id = ?').get(roleId) as
-      | { id: number; role_name: string }
-      | undefined;
-    if (!role) {
-      res.status(400).json({ error: 'نقش انتخابی یافت نشد.' });
-      return;
-    }
-    if (role.role_name === 'SuperAdmin' && !req.authUser!.isSuperAdmin) {
-      res.status(403).json({ error: 'فقط مدیر کل می‌تواند کاربر SuperAdmin ایجاد کند.' });
-      return;
-    }
-
+  async (_req: AuthRequest, res: Response) => {
     try {
-      const info = db
-        .prepare(
-          'INSERT INTO tbl_users (username, password_hash, first_name, last_name, role_id, is_active) VALUES (?, ?, ?, ?, ?, 1)',
-        )
-        .run(username, hashPassword(password), firstName, lastName, roleId);
-      const newUid = Number(info.lastInsertRowid);
-      recordActivity(
-        req.authUser,
-        'user_created',
-        'user',
-        newUid,
-        `ایجاد حساب کاربری جدید برای ${firstName} ${lastName} (${username})`,
-        `نقش سازمانی: ${role.role_name}`,
-      );
-      res.status(201).json({ id: newUid });
-    } catch {
-      res.status(400).json({ error: 'این نام کاربری قبلاً ثبت شده است.' });
+      await ensureSeeded();
+      const users = await db
+        .select({
+          id: tblUsers.id,
+          uid: tblUsers.uid,
+          username: tblUsers.username,
+          email: tblUsers.email,
+          full_name: tblUsers.full_name,
+          role_id: tblUsers.role_id,
+          role_name: tblRoles.name,
+          is_active: tblUsers.is_active,
+        })
+        .from(tblUsers)
+        .innerJoin(tblRoles, eq(tblRoles.id, tblUsers.role_id))
+        .orderBy(tblUsers.id);
+
+      const rolesRows = await db.select().from(tblRoles).orderBy(tblRoles.id);
+      const permissions = await db.select().from(tblPermissions).orderBy(tblPermissions.id);
+      const rolePerms = await db.select().from(tblRolePermissions);
+
+      const roles = rolesRows.map((r) => ({
+        ...r,
+        permissionIds: rolePerms
+          .filter((rp) => rp.role_id === r.id)
+          .map((rp) => rp.permission_id),
+      }));
+
+      res.json({ users, roles, permissions });
+    } catch (err) {
+      handleRouteError(res, err);
+    }
+  },
+);
+
+app.post(
+  '/api/users',
+  requireAuth,
+  requirePermission('can_manage_users'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const username = String(req.body?.username || '').trim();
+      const full_name = String(req.body?.full_name || '').trim();
+      const email = String(req.body?.email || '').trim().toLowerCase() || null;
+      const password = String(req.body?.password || '').trim();
+      const role_id = Number(req.body?.role_id);
+
+      if (!username || !full_name || !role_id) {
+        throw new Error('نام کاربری، نام کامل و نقش الزامی است.');
+      }
+
+      const [created] = await db
+        .insert(tblUsers)
+        .values({
+          username,
+          full_name,
+          email,
+          password_hash: password ? hashLocalPassword(password) : '',
+          role_id,
+          is_active: true,
+        })
+        .returning({ id: tblUsers.id, username: tblUsers.username, full_name: tblUsers.full_name });
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'user_created',
+        entityType: 'user',
+        entityId: created.id,
+        summary: `ایجاد کاربر جدید «${full_name}» (${username})`,
+      });
+
+      res.status(201).json({ user: created });
+    } catch (err) {
+      handleRouteError(res, err);
     }
   },
 );
 
 app.patch(
-  '/api/rbac/users/:id',
+  '/api/users/:id',
   requireAuth,
   requirePermission('can_manage_users'),
-  (req: AuthenticatedRequest, res) => {
-    const userId = Number(req.params.id);
-    const db = getDb();
-    const existing = db
-      .prepare('SELECT id, username, first_name, last_name, role_id, is_active FROM tbl_users WHERE id = ?')
-      .get(userId) as
-      | { id: number; username: string; first_name: string; last_name: string; role_id: number; is_active: number }
-      | undefined;
-    if (!existing) {
-      res.status(404).json({ error: 'کاربر یافت نشد.' });
-      return;
-    }
-
-    const roleId = req.body?.role_id !== undefined ? Number(req.body.role_id) : existing.role_id;
-    const isActive =
-      req.body?.is_active !== undefined ? (req.body.is_active ? 1 : 0) : existing.is_active;
-    const newPassword = typeof req.body?.password === 'string' ? req.body.password : '';
-
-    if (existing.username === 'admin' && isActive === 0) {
-      res.status(400).json({ error: 'حساب مدیر کل اصلی را نمی‌توان غیرفعال کرد.' });
-      return;
-    }
-
-    if (newPassword) {
-      if (newPassword.length < 6) {
-        res.status(400).json({ error: 'رمز عبور جدید باید حداقل ۶ کاراکتر باشد.' });
-        return;
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = Number(req.params.id);
+      const updates: Partial<typeof tblUsers.$inferInsert> = {};
+      if (req.body?.role_id) updates.role_id = Number(req.body.role_id);
+      if (typeof req.body?.is_active === 'boolean') updates.is_active = req.body.is_active;
+      if (req.body?.full_name) updates.full_name = String(req.body.full_name).trim();
+      if (req.body?.password && String(req.body.password).length >= 6) {
+        updates.password_hash = hashLocalPassword(String(req.body.password));
       }
-      db.prepare('UPDATE tbl_users SET role_id = ?, is_active = ?, password_hash = ? WHERE id = ?').run(
-        roleId,
-        isActive,
-        hashPassword(newPassword),
-        userId,
-      );
-    } else {
-      db.prepare('UPDATE tbl_users SET role_id = ?, is_active = ? WHERE id = ?').run(
-        roleId,
-        isActive,
-        userId,
-      );
+
+      const [updated] = await db
+        .update(tblUsers)
+        .set(updates)
+        .where(eq(tblUsers.id, userId))
+        .returning({ id: tblUsers.id, username: tblUsers.username, full_name: tblUsers.full_name });
+
+      if (!updated) throw new Error('کاربر یافت نشد.');
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'user_updated',
+        entityType: 'user',
+        entityId: userId,
+        summary: `تغییر وضعیت یا نقش کاربر «${updated.full_name}»`,
+      });
+
+      res.json({ user: updated });
+    } catch (err) {
+      handleRouteError(res, err);
     }
-
-    recordActivity(
-      req.authUser,
-      'user_updated',
-      'user',
-      userId,
-      `به‌روزرسانی وضعیت حساب ${existing.first_name} ${existing.last_name} (${existing.username})`,
-      `وضعیت: ${isActive === 1 ? 'فعال' : 'غیرفعال'}`,
-    );
-
-    res.json({ ok: true });
   },
 );
 
-app.patch('/api/rbac/settings', requireAuth, (req: AuthenticatedRequest, res) => {
-  if (!req.authUser!.isSuperAdmin) {
-    res.status(403).json({ error: 'تنظیمات امنیتی فقط توسط مدیر کل قابل تغییر است.' });
-    return;
-  }
-  const minutes = Math.round(Number(req.body?.session_timeout_minutes));
-  if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
-    res.status(400).json({ error: 'زمان خروج خودکار باید بین ۱ تا ۱۴۴۰ دقیقه باشد.' });
-    return;
-  }
-  getDb()
-    .prepare(
-      'INSERT INTO tbl_settings (key_name, value) VALUES (?, ?) ON CONFLICT(key_name) DO UPDATE SET value = excluded.value',
-    )
-    .run('session_timeout_minutes', String(minutes));
-  recordActivity(
-    req.authUser,
-    'settings_updated',
-    'settings',
-    null,
-    `تغییر زمان خروج خودکار سامانه به ${minutes} دقیقه`,
-    null,
-  );
-  res.json({ timeoutMinutes: minutes });
-});
+app.post(
+  '/api/roles/:id/permissions',
+  requireAuth,
+  requirePermission('can_manage_users'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const roleId = Number(req.params.id);
+      const permissionIds = Array.isArray(req.body?.permissionIds)
+        ? (req.body.permissionIds as number[]).map(Number).filter((n) => Number.isInteger(n) && n > 0)
+        : [];
+
+      const [role] = await db.select().from(tblRoles).where(eq(tblRoles.id, roleId)).limit(1);
+      if (!role) throw new Error('نقش یافت نشد.');
+      if (role.name === 'SuperAdmin') {
+        throw new Error('دسترسی‌های نقش SuperAdmin قابل محدودسازی نیست.');
+      }
+
+      await db.transaction(async (tx) => {
+        await tx.delete(tblRolePermissions).where(eq(tblRolePermissions.role_id, roleId));
+        if (permissionIds.length > 0) {
+          await tx
+            .insert(tblRolePermissions)
+            .values(permissionIds.map((permission_id) => ({ role_id: roleId, permission_id })));
+        }
+      });
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'rbac_updated',
+        entityType: 'role',
+        entityId: roleId,
+        summary: `بروزرسانی ماتریس مجوزهای نقش «${role.name}» (${permissionIds.length} مجوز)`,
+      });
+
+      res.json({ ok: true });
+    } catch (err) {
+      handleRouteError(res, err);
+    }
+  },
+);
+
+app.get(
+  '/api/activity-logs',
+  requireAuth,
+  requirePermission('can_manage_users'),
+  async (_req: AuthRequest, res: Response) => {
+    try {
+      const logs = await db
+        .select()
+        .from(tblActivityLogs)
+        .orderBy(desc(tblActivityLogs.created_at), desc(tblActivityLogs.id))
+        .limit(120);
+      res.json({ logs });
+    } catch (err) {
+      handleRouteError(res, err, 'خطا در دریافت گزارش فعالیت‌ها');
+    }
+  },
+);
 
 // ==========================================
-// 8. VITE DEV / STATIC PRODUCTION SERVING
+// START SERVER + VITE MIDDLEWARE (PORT 3000)
 // ==========================================
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -2321,8 +2107,11 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Fiber ERP local server running on http://localhost:${PORT}`);
+    console.log(`AvaNetwork Fiber ERP server listening on http://localhost:${PORT}`);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
+});

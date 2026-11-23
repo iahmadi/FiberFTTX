@@ -1,142 +1,175 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { Calendar, ChevronLeft, ChevronRight } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Calendar as CalendarIcon, ChevronLeft, ChevronRight, X } from 'lucide-react';
 import {
   JALALI_MONTH_NAMES,
-  JALALI_WEEKDAY_SHORT,
-  formatJalaliYmd,
-  getJalaliMonthLength,
-  getJalaliWeekdayIndex,
+  JALALI_WEEKDAYS_SHORT,
+  getJalaliMonthStartWeekday,
   getTodayJalali,
+  gregorianToJalali,
+  jalaliMonthLength,
+  jalaliToGregorian,
   toPersianDigits,
 } from '../lib/jalali';
 
 interface JalaliDatePickerProps {
-  label: string;
-  value: string; // YYYY/MM/DD
-  onChange: (value: string) => void;
+  valueIso: string;
+  onChangeIso: (isoDate: string) => void;
+  placeholder?: string;
+  disabled?: boolean;
 }
 
-export function JalaliDatePicker({ label, value, onChange }: JalaliDatePickerProps) {
-  const inputId = useId();
-  const containerRef = useRef<HTMLDivElement>(null);
-  const today = useMemo(() => getTodayJalali(), []);
-
-  const parsed = useMemo(() => {
-    const m = /^(\d{4})\/(\d{1,2})\/(\d{1,2})$/.exec(value);
-    if (!m) return today;
-    return { jy: Number(m[1]), jm: Number(m[2]), jd: Number(m[3]) };
-  }, [value, today]);
+export function JalaliDatePicker({
+  valueIso,
+  onChangeIso,
+  placeholder = 'انتخاب تاریخ شمسی',
+  disabled = false,
+}: JalaliDatePickerProps) {
+  const today = getTodayJalali();
+  const initial = useMemo(() => {
+    if (valueIso && /^\d{4}-\d{2}-\d{2}/.test(valueIso)) {
+      const [gy, gm, gd] = valueIso.slice(0, 10).split('-').map(Number);
+      return gregorianToJalali(gy, gm, gd);
+    }
+    return today;
+  }, [valueIso, today]);
 
   const [open, setOpen] = useState(false);
-  const [viewYear, setViewYear] = useState(parsed.jy);
-  const [viewMonth, setViewMonth] = useState(parsed.jm);
+  const [viewYear, setViewYear] = useState(initial.jy);
+  const [viewMonth, setViewMonth] = useState(initial.jm);
+  const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    setViewYear(parsed.jy);
-    setViewMonth(parsed.jm);
-  }, [parsed.jy, parsed.jm]);
+    setViewYear(initial.jy);
+    setViewMonth(initial.jm);
+  }, [initial.jy, initial.jm]);
 
   useEffect(() => {
-    function handleOutside(e: MouseEvent) {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+    const onDocClick = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
         setOpen(false);
       }
-    }
-    document.addEventListener('mousedown', handleOutside);
-    return () => document.removeEventListener('mousedown', handleOutside);
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
   }, []);
 
-  const daysInMonth = getJalaliMonthLength(viewYear, viewMonth);
-  const startOffset = getJalaliWeekdayIndex(viewYear, viewMonth, 1);
+  const daysInMonth = jalaliMonthLength(viewYear, viewMonth);
+  const startWeekday = getJalaliMonthStartWeekday(viewYear, viewMonth);
 
-  const prevMonth = () => {
-    if (viewMonth === 1) {
-      setViewMonth(12);
-      setViewYear((y) => y - 1);
-    } else {
-      setViewMonth((m) => m - 1);
+  const selectedJalali = useMemo(() => {
+    if (!valueIso || !/^\d{4}-\d{2}-\d{2}/.test(valueIso)) return null;
+    const [gy, gm, gd] = valueIso.slice(0, 10).split('-').map(Number);
+    return gregorianToJalali(gy, gm, gd);
+  }, [valueIso]);
+
+  const displayValue = selectedJalali
+    ? toPersianDigits(
+        `${selectedJalali.jy}/${String(selectedJalali.jm).padStart(2, '0')}/${String(
+          selectedJalali.jd,
+        ).padStart(2, '0')}`,
+      )
+    : '';
+
+  const shiftMonth = (delta: number) => {
+    let nextM = viewMonth + delta;
+    let nextY = viewYear;
+    if (nextM > 12) {
+      nextM = 1;
+      nextY += 1;
+    } else if (nextM < 1) {
+      nextM = 12;
+      nextY -= 1;
     }
+    setViewMonth(nextM);
+    setViewYear(nextY);
   };
 
-  const nextMonth = () => {
-    if (viewMonth === 12) {
-      setViewMonth(1);
-      setViewYear((y) => y + 1);
-    } else {
-      setViewMonth((m) => m + 1);
-    }
+  const handleSelectDay = (day: number) => {
+    const { gy, gm, gd } = jalaliToGregorian(viewYear, viewMonth, day);
+    const iso = `${gy}-${String(gm).padStart(2, '0')}-${String(gd).padStart(2, '0')}`;
+    onChangeIso(iso);
+    setOpen(false);
   };
 
   return (
-    <div ref={containerRef} className="relative">
-      <label htmlFor={inputId} className="mb-1.5 block text-xs font-medium text-slate-700">
-        {label}
-      </label>
-      <button
-        id={inputId}
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="flex h-10 w-full items-center justify-between rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-900 hover:border-slate-400 focus:border-teal-600 focus:outline-none focus:ring-2 focus:ring-teal-600/15"
-      >
-        <span className="tabular-nums">{toPersianDigits(value || formatJalaliYmd(today.jy, today.jm, today.jd))}</span>
-        <Calendar className="h-4 w-4 text-slate-400" />
-      </button>
+    <div ref={rootRef} className="relative">
+      <div className="flex items-center gap-1.5">
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => setOpen((prev) => !prev)}
+          className="flex min-h-[44px] w-full items-center justify-between rounded-lg border border-slate-300 bg-white px-3 py-2 text-right text-sm text-slate-900 hover:border-teal-600 focus:border-teal-700 focus:outline-none disabled:bg-slate-100"
+        >
+          <span className="tabular-nums">
+            {displayValue || <span className="text-slate-400">{placeholder}</span>}
+          </span>
+          <CalendarIcon className="h-4 w-4 text-slate-500" />
+        </button>
+        {valueIso && !disabled && (
+          <button
+            type="button"
+            onClick={() => onChangeIso('')}
+            aria-label="پاک کردن تاریخ"
+            className="inline-flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-100"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        )}
+      </div>
 
-      {open && (
-        <div className="absolute z-40 mt-1 w-72 rounded-lg border border-slate-200 bg-white p-3 shadow-lg">
+      {open && !disabled && (
+        <div className="absolute z-40 mt-1.5 w-72 rounded-xl border border-slate-200 bg-white p-3 shadow-xl">
           <div className="mb-3 flex items-center justify-between">
             <button
               type="button"
-              onClick={prevMonth}
-              aria-label="ماه قبل"
-              className="rounded-md p-1.5 text-slate-600 hover:bg-slate-100"
+              onClick={() => shiftMonth(-1)}
+              className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50"
             >
               <ChevronRight className="h-4 w-4" />
             </button>
-            <div className="text-sm font-semibold text-slate-800 tabular-nums">
+            <span className="text-sm font-bold text-slate-900">
               {JALALI_MONTH_NAMES[viewMonth - 1]} {toPersianDigits(viewYear)}
-            </div>
+            </span>
             <button
               type="button"
-              onClick={nextMonth}
-              aria-label="ماه بعد"
-              className="rounded-md p-1.5 text-slate-600 hover:bg-slate-100"
+              onClick={() => shiftMonth(1)}
+              className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50"
             >
               <ChevronLeft className="h-4 w-4" />
             </button>
           </div>
 
-          <div className="mb-1 grid grid-cols-7 gap-1 text-center text-xs font-medium text-slate-400">
-            {JALALI_WEEKDAY_SHORT.map((d) => (
-              <div key={d} className="py-1">
-                {d}
+          <div className="mb-1.5 grid grid-cols-7 gap-1 text-center text-xs font-medium text-slate-500">
+            {JALALI_WEEKDAYS_SHORT.map((w) => (
+              <div key={w} className="py-1">
+                {w}
               </div>
             ))}
           </div>
 
-          <div className="grid grid-cols-7 gap-1 text-center text-xs">
-            {Array.from({ length: startOffset }).map((_, i) => (
+          <div className="grid grid-cols-7 gap-1 text-center">
+            {Array.from({ length: startWeekday }).map((_, i) => (
               <div key={`empty-${i}`} />
             ))}
             {Array.from({ length: daysInMonth }).map((_, idx) => {
               const day = idx + 1;
               const isSelected =
-                parsed.jy === viewYear && parsed.jm === viewMonth && parsed.jd === day;
+                selectedJalali?.jy === viewYear &&
+                selectedJalali?.jm === viewMonth &&
+                selectedJalali?.jd === day;
               const isToday =
                 today.jy === viewYear && today.jm === viewMonth && today.jd === day;
+
               return (
                 <button
                   key={day}
                   type="button"
-                  onClick={() => {
-                    onChange(formatJalaliYmd(viewYear, viewMonth, day, false));
-                    setOpen(false);
-                  }}
-                  className={`flex h-8 w-8 items-center justify-center rounded-md tabular-nums transition-colors ${
+                  onClick={() => handleSelectDay(day)}
+                  className={`h-8 rounded-lg text-xs tabular-nums transition-colors ${
                     isSelected
-                      ? 'bg-teal-600 font-semibold text-white'
+                      ? 'bg-teal-700 font-bold text-white'
                       : isToday
-                        ? 'border border-teal-600 font-medium text-teal-700 hover:bg-teal-50'
+                        ? 'border border-teal-500 font-semibold text-teal-800 hover:bg-teal-50'
                         : 'text-slate-700 hover:bg-slate-100'
                   }`}
                 >
@@ -144,28 +177,6 @@ export function JalaliDatePicker({ label, value, onChange }: JalaliDatePickerPro
                 </button>
               );
             })}
-          </div>
-
-          <div className="mt-3 flex justify-between border-t border-slate-100 pt-2">
-            <button
-              type="button"
-              onClick={() => {
-                onChange(formatJalaliYmd(today.jy, today.jm, today.jd, false));
-                setViewYear(today.jy);
-                setViewMonth(today.jm);
-                setOpen(false);
-              }}
-              className="text-xs font-medium text-teal-700 hover:text-teal-800"
-            >
-              انتخاب امروز
-            </button>
-            <button
-              type="button"
-              onClick={() => setOpen(false)}
-              className="text-xs text-slate-500 hover:text-slate-700"
-            >
-              بستن
-            </button>
           </div>
         </div>
       )}

@@ -1,47 +1,78 @@
-import { useState, type FormEvent } from 'react';
-import { Cable, KeyRound, Lock, Shield, UserCheck } from 'lucide-react';
-import type { AuthUser } from '../types/erp';
-import { apiFetch, setMemorySession } from '../utils/api';
-
-interface LoginResponse {
-  token: string;
-  csrfToken: string;
-  timeoutMinutes: number;
-  user: AuthUser;
-}
+import { useEffect, useState, type FormEvent } from 'react';
+import { Cable, KeyRound, Lock, ShieldCheck, UserCheck } from 'lucide-react';
+import { GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
+import { auth } from '../lib/firebase';
+import { apiFetch, setMemoryAuthToken } from '../utils/api';
 
 interface LoginPageProps {
-  adminClaimed: boolean;
-  demoModeAvailable: boolean;
-  onAuthenticated: (user: AuthUser, timeoutMinutes: number) => void;
-  sessionNotice?: string | null;
+  onAuthenticated: () => Promise<void>;
 }
 
-export function LoginPage({
-  adminClaimed,
-  demoModeAvailable,
-  onAuthenticated,
-  sessionNotice,
-}: LoginPageProps) {
-  const [username, setUsername] = useState('');
+export function LoginPage({ onAuthenticated }: LoginPageProps) {
+  const [adminNeedsClaim, setAdminNeedsClaim] = useState<boolean>(false);
+  const [checkingStatus, setCheckingStatus] = useState<boolean>(true);
+  const [mode, setMode] = useState<'login' | 'claim'>('login');
+
+  const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
+  const [claimFullName, setClaimFullName] = useState('مدیر کل آوانتورک');
   const [claimPassword, setClaimPassword] = useState('');
   const [claimConfirm, setClaimConfirm] = useState('');
-  const [showClaimForm, setShowClaimForm] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const handleLogin = async (e: FormEvent) => {
+  useEffect(() => {
+    let active = true;
+    apiFetch<{ adminNeedsClaim: boolean }>('/api/auth/bootstrap-status')
+      .then((res) => {
+        if (!active) return;
+        setAdminNeedsClaim(res.adminNeedsClaim);
+        if (res.adminNeedsClaim) {
+          setMode('claim');
+        }
+      })
+      .catch(() => {
+        // Offline or unreachable
+      })
+      .finally(() => {
+        if (active) setCheckingStatus(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const handleGoogleSignIn = async () => {
+    setError(null);
+    setLoading(true);
+    try {
+      const provider = new GoogleAuthProvider();
+      const cred = await signInWithPopup(auth, provider);
+      const idToken = await cred.user.getIdToken();
+      setMemoryAuthToken(idToken);
+      await onAuthenticated();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'ورود با حساب گوگل ناموفق بود. در شبکه اینترانت بدون اینترنت از ورود محلی استفاده کنید.',
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleLocalLogin = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
     setLoading(true);
     try {
-      const res = await apiFetch<LoginResponse>('/api/auth/login', {
+      const res = await apiFetch<{ token: string }>('/api/auth/local-login', {
         method: 'POST',
         body: JSON.stringify({ username, password }),
       });
-      setMemorySession(res.token, res.csrfToken);
-      onAuthenticated(res.user, res.timeoutMinutes);
+      setMemoryAuthToken(res.token);
+      await onAuthenticated();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'ورود ناموفق بود.');
     } finally {
@@ -62,216 +93,161 @@ export function LoginPage({
     }
     setLoading(true);
     try {
-      const res = await apiFetch<LoginResponse>('/api/auth/claim-admin', {
+      const res = await apiFetch<{ token: string }>('/api/auth/claim-admin', {
         method: 'POST',
-        body: JSON.stringify({ password: claimPassword }),
+        body: JSON.stringify({
+          password: claimPassword,
+          full_name: claimFullName,
+        }),
       });
-      setMemorySession(res.token, res.csrfToken);
-      onAuthenticated(res.user, res.timeoutMinutes);
+      setMemoryAuthToken(res.token);
+      await onAuthenticated();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'تنظیم رمز عبور ناموفق بود.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleDemoLogin = async (demoUsername: string) => {
-    setError(null);
-    setLoading(true);
-    try {
-      const res = await apiFetch<LoginResponse>('/api/auth/demo-login', {
-        method: 'POST',
-        body: JSON.stringify({ username: demoUsername }),
-      });
-      setMemorySession(res.token, res.csrfToken);
-      onAuthenticated(res.user, res.timeoutMinutes);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'ورود آزمایشی ناموفق بود.');
+      setError(err instanceof Error ? err.message : 'فعال‌سازی حساب مدیر کل ناموفق بود.');
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-slate-50 px-4 py-10">
-      <div className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-6 sm:p-8">
-        <div className="mb-6 flex items-center gap-3">
-          <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-teal-600 text-white">
-            <Cable className="h-5 w-5" />
+    <div className="flex min-h-screen items-center justify-center bg-slate-100 p-4">
+      <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-xl sm:p-8">
+        <div className="mb-6 flex items-center gap-3 border-b border-slate-100 pb-4">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-teal-700 text-white">
+            <Cable className="h-6 w-6" />
           </div>
           <div>
-            <h1 className="text-lg font-bold text-slate-900">سامانه جامع فیبر نوری</h1>
-            <p className="text-xs text-slate-500">مدیریت عملیات نصب، انبار، تیکتینگ و امور مالی</p>
+            <h1 className="text-lg font-bold text-slate-900">آوانتورک ERP فیبر نوری</h1>
+            <p className="text-xs text-slate-500">سامانه یکپارچه عملیات، انبار و مالی (آفلاین-اول)</p>
           </div>
         </div>
 
-        {sessionNotice && (
-          <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-800">
-            {sessionNotice}
-          </div>
-        )}
-
         {error && (
-          <div
-            role="alert"
-            className="mb-4 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs text-red-700"
-          >
+          <div className="mb-4 rounded-lg border border-red-200 bg-red-50 p-3 text-xs font-medium text-red-800">
             {error}
           </div>
         )}
 
-        {!adminClaimed && showClaimForm ? (
-          <form onSubmit={handleClaimAdmin} className="space-y-4">
-            <div className="rounded-lg border border-teal-200 bg-teal-50/60 p-3 text-xs text-teal-900">
-              راه‌اندازی اولیه: برای حساب مدیر کل (admin) یک رمز عبور امن تعیین کنید تا دسترسی‌های مدیریتی قفل شوند.
+        {/* Primary Google Sign-In */}
+        <button
+          type="button"
+          onClick={handleGoogleSignIn}
+          disabled={loading}
+          className="flex min-h-[46px] w-full items-center justify-center gap-2.5 rounded-xl bg-teal-700 px-4 py-2.5 text-sm font-bold text-white shadow-xs hover:bg-teal-800 disabled:opacity-60"
+        >
+          <ShieldCheck className="h-5 w-5" />
+          <span>ورود امن با حساب گوگل</span>
+        </button>
+
+        <div className="my-5 flex items-center gap-3">
+          <div className="h-px flex-1 bg-slate-200" />
+          <span className="text-[11px] font-medium text-slate-400">
+            ورود شبکه داخلی (اینترانت بدون اینترنت)
+          </span>
+          <div className="h-px flex-1 bg-slate-200" />
+        </div>
+
+        {checkingStatus ? (
+          <div className="py-4 text-center text-xs text-slate-500">در حال بررسی وضعیت سامانه...</div>
+        ) : adminNeedsClaim && mode === 'claim' ? (
+          <form onSubmit={handleClaimAdmin} className="space-y-3.5">
+            <div className="rounded-lg border border-teal-200 bg-teal-50 p-3 text-xs text-teal-900">
+              <strong className="block font-bold">راه‌اندازی اولیه مدیر کل (SuperAdmin)</strong>
+              <span className="mt-0.5 block opacity-90">
+                برای فعال‌سازی حساب کاربری <code>admin</code> در شبکه داخلی، رمز عبور دلخواه تعیین
+                کنید.
+              </span>
             </div>
+
             <div>
-              <label htmlFor="claim-pass" className="mb-1.5 block text-xs font-medium text-slate-700">
-                رمز عبور جدید مدیر کل
+              <label className="mb-1 block text-xs font-semibold text-slate-700">نام کامل مدیر</label>
+              <input
+                type="text"
+                value={claimFullName}
+                onChange={(e) => setClaimFullName(e.target.value)}
+                required
+                className="min-h-[44px] w-full rounded-lg border border-slate-300 px-3 text-sm focus:border-teal-700 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">
+                رمز عبور جدید (حداقل ۶ کاراکتر)
               </label>
               <input
-                id="claim-pass"
                 type="password"
-                required
-                minLength={6}
                 value={claimPassword}
                 onChange={(e) => setClaimPassword(e.target.value)}
-                placeholder="حداقل ۶ کاراکتر"
-                className="h-10 w-full rounded-lg border border-slate-300 px-3 text-sm focus:border-teal-600 focus:outline-none focus:ring-2 focus:ring-teal-600/15"
+                required
+                minLength={6}
+                placeholder="رمز عبور امن مدیر"
+                className="min-h-[44px] w-full rounded-lg border border-slate-300 px-3 text-sm focus:border-teal-700 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">تکرار رمز عبور</label>
+              <input
+                type="password"
+                value={claimConfirm}
+                onChange={(e) => setClaimConfirm(e.target.value)}
+                required
+                minLength={6}
+                className="min-h-[44px] w-full rounded-lg border border-slate-300 px-3 text-sm focus:border-teal-700 focus:outline-none"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={loading}
+              className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-lg border border-slate-800 bg-slate-900 px-4 text-sm font-bold text-white hover:bg-slate-800 disabled:opacity-60"
+            >
+              <KeyRound className="h-4 w-4" />
+              <span>تعیین رمز مدیر کل و ورود</span>
+            </button>
+          </form>
+        ) : (
+          <form onSubmit={handleLocalLogin} className="space-y-3.5">
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">نام کاربری</label>
+              <input
+                type="text"
+                dir="ltr"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                required
+                className="min-h-[44px] w-full rounded-lg border border-slate-300 px-3 text-left text-sm focus:border-teal-700 focus:outline-none"
               />
             </div>
             <div>
-              <label htmlFor="claim-confirm" className="mb-1.5 block text-xs font-medium text-slate-700">
-                تکرار رمز عبور
-              </label>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">رمز عبور</label>
               <input
-                id="claim-confirm"
                 type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
                 required
-                minLength={6}
-                value={claimConfirm}
-                onChange={(e) => setClaimConfirm(e.target.value)}
-                placeholder="تکرار رمز عبور"
-                className="h-10 w-full rounded-lg border border-slate-300 px-3 text-sm focus:border-teal-600 focus:outline-none focus:ring-2 focus:ring-teal-600/15"
+                className="min-h-[44px] w-full rounded-lg border border-slate-300 px-3 text-sm focus:border-teal-700 focus:outline-none"
               />
             </div>
             <button
               type="submit"
               disabled={loading}
-              className="flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-teal-600 text-sm font-medium text-white hover:bg-teal-700 disabled:opacity-60"
+              className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-lg border border-slate-300 bg-slate-900 px-4 text-sm font-bold text-white hover:bg-slate-800 disabled:opacity-60"
             >
-              <KeyRound className="h-4 w-4" />
-              <span>{loading ? 'در حال ثبت...' : 'تنظیم رمز مدیر کل و ورود'}</span>
+              <Lock className="h-4 w-4" />
+              <span>ورود با حساب شبکه داخلی</span>
             </button>
-            <button
-              type="button"
-              onClick={() => setShowClaimForm(false)}
-              className="w-full text-center text-xs text-slate-500 hover:text-slate-700"
-            >
-              بازگشت به صفحه ورود
-            </button>
-          </form>
-        ) : (
-          <>
-            <form onSubmit={handleLogin} className="space-y-4">
-              <div>
-                <label htmlFor="login-username" className="mb-1.5 block text-xs font-medium text-slate-700">
-                  نام کاربری
-                </label>
-                <input
-                  id="login-username"
-                  type="text"
-                  dir="ltr"
-                  required
-                  autoComplete="username"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  placeholder="admin / installer1"
-                  className="h-10 w-full rounded-lg border border-slate-300 px-3 text-left text-sm focus:border-teal-600 focus:outline-none focus:ring-2 focus:ring-teal-600/15"
-                />
-              </div>
-
-              <div>
-                <label htmlFor="login-password" className="mb-1.5 block text-xs font-medium text-slate-700">
-                  رمز عبور
-                </label>
-                <input
-                  id="login-password"
-                  type="password"
-                  dir="ltr"
-                  required
-                  autoComplete="current-password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="••••••••"
-                  className="h-10 w-full rounded-lg border border-slate-300 px-3 text-left text-sm focus:border-teal-600 focus:outline-none focus:ring-2 focus:ring-teal-600/15"
-                />
-              </div>
-
+            {adminNeedsClaim && (
               <button
-                type="submit"
-                disabled={loading}
-                className="flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-teal-600 text-sm font-medium text-white hover:bg-teal-700 disabled:opacity-60"
+                type="button"
+                onClick={() => setMode('claim')}
+                className="flex w-full items-center justify-center gap-1 pt-1 text-xs font-medium text-teal-700 hover:underline"
               >
-                <Lock className="h-4 w-4" />
-                <span>{loading ? 'در حال بررسی...' : 'ورود به سامانه'}</span>
+                <UserCheck className="h-3.5 w-3.5" />
+                <span>تنظیم اولیه رمز مدیر کل</span>
               </button>
-            </form>
-
-            {demoModeAvailable && (
-              <div className="mt-6 border-t border-slate-200 pt-5">
-                <div className="mb-3 flex items-center justify-between text-xs text-slate-500">
-                  <span>ورود سریع محیط ارزیابی محلی (پیش از تنظیم رمز)</span>
-                  <button
-                    type="button"
-                    onClick={() => setShowClaimForm(true)}
-                    className="font-medium text-teal-700 hover:underline"
-                  >
-                    تنظیم رمز مدیر کل
-                  </button>
-                </div>
-
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    disabled={loading}
-                    onClick={() => handleDemoLogin('admin')}
-                    className="flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-800 hover:border-teal-600 hover:bg-teal-50"
-                  >
-                    <Shield className="h-3.5 w-3.5 text-teal-700" />
-                    <span>مدیر کل (SuperAdmin)</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={loading}
-                    onClick={() => handleDemoLogin('operator')}
-                    className="flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-800 hover:border-teal-600 hover:bg-teal-50"
-                  >
-                    <UserCheck className="h-3.5 w-3.5 text-slate-600" />
-                    <span>اپراتور تیکتینگ</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={loading}
-                    onClick={() => handleDemoLogin('installer1')}
-                    className="flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-800 hover:border-teal-600 hover:bg-teal-50"
-                  >
-                    <Cable className="h-3.5 w-3.5 text-slate-600" />
-                    <span>نصاب ۱ (حسین کریمی)</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={loading}
-                    onClick={() => handleDemoLogin('installer2')}
-                    className="flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-800 hover:border-teal-600 hover:bg-teal-50"
-                  >
-                    <Cable className="h-3.5 w-3.5 text-slate-600" />
-                    <span>نصاب ۲ (رضا قاسمی)</span>
-                  </button>
-                </div>
-              </div>
             )}
-          </>
+          </form>
         )}
       </div>
     </div>

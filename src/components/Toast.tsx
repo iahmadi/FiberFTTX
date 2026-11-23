@@ -1,14 +1,14 @@
-import { AlertTriangle, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Info, X } from 'lucide-react';
 
-export interface ToastNotice {
+export interface ToastMessage {
   id: string;
+  type: 'success' | 'error' | 'warning' | 'info';
   title: string;
-  message: string;
-  variant: 'danger' | 'success';
+  description?: string;
 }
 
 interface ToastContainerProps {
-  toasts: ToastNotice[];
+  toasts: ToastMessage[];
   onDismiss: (id: string) => void;
 }
 
@@ -17,32 +17,46 @@ export function ToastContainer({ toasts, onDismiss }: ToastContainerProps) {
 
   return (
     <div
-      className="pointer-events-none fixed bottom-5 left-5 z-50 flex w-full max-w-md flex-col gap-2.5 px-4 sm:px-0"
-      aria-live="assertive"
+      className="no-print fixed bottom-4 left-4 z-[60] flex w-[calc(100%-2rem)] max-w-sm flex-col gap-2.5"
+      aria-live="polite"
     >
       {toasts.map((toast) => {
-        const isDanger = toast.variant === 'danger';
+        const isWarningOrError = toast.type === 'error' || toast.type === 'warning';
+        const palette =
+          toast.type === 'error'
+            ? 'border-red-300 bg-red-600 text-white'
+            : toast.type === 'warning'
+              ? 'border-red-200 bg-red-50 text-red-900'
+              : toast.type === 'success'
+                ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+                : 'border-slate-200 bg-white text-slate-900';
+
+        const Icon =
+          toast.type === 'error' || toast.type === 'warning'
+            ? AlertTriangle
+            : toast.type === 'success'
+              ? CheckCircle2
+              : Info;
+
         return (
           <div
             key={toast.id}
-            role="alert"
-            data-testid={isDanger ? 'toast-warning-red' : 'toast-success'}
-            className={`pointer-events-auto flex items-start gap-3 rounded-xl border px-4 py-3 shadow-lg ${
-              isDanger
-                ? 'border-red-700 bg-red-600 text-white'
-                : 'border-emerald-700 bg-emerald-600 text-white'
-            }`}
+            data-toast-type={toast.type}
+            role={isWarningOrError ? 'alert' : 'status'}
+            className={`flex items-start gap-3 rounded-xl border p-3.5 shadow-lg ${palette}`}
           >
-            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-white" />
+            <Icon className="mt-0.5 h-5 w-5 shrink-0" />
             <div className="min-w-0 flex-1">
-              <div className="text-xs font-bold leading-5">{toast.title}</div>
-              <div className="mt-0.5 text-xs leading-5 text-white/95">{toast.message}</div>
+              <p className="text-sm font-bold leading-5">{toast.title}</p>
+              {toast.description && (
+                <p className="mt-1 text-xs leading-5 opacity-90">{toast.description}</p>
+              )}
             </div>
             <button
               type="button"
               onClick={() => onDismiss(toast.id)}
-              aria-label="بستن هشدار"
-              className="shrink-0 rounded-md p-1 text-white/80 transition-colors hover:bg-white/15 hover:text-white"
+              aria-label="بستن اعلان"
+              className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md opacity-80 hover:opacity-100"
             >
               <X className="h-4 w-4" />
             </button>

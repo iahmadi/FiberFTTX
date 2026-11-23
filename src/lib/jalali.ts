@@ -1,17 +1,5 @@
 // Pure offline Jalali (Solar Hijri) calendar converter & Persian formatting utilities
 
-export interface JalaliDate {
-  jy: number;
-  jm: number;
-  jd: number;
-}
-
-export interface GregorianDate {
-  gy: number;
-  gm: number;
-  gd: number;
-}
-
 export const JALALI_MONTH_NAMES = [
   'فروردین',
   'اردیبهشت',
@@ -27,199 +15,146 @@ export const JALALI_MONTH_NAMES = [
   'اسفند',
 ];
 
-export const JALALI_WEEKDAY_SHORT = ['ش', 'ی', 'د', 'س', 'چ', 'پ', 'ج'];
-export const JALALI_WEEKDAY_FULL = [
-  'شنبه',
-  'یکشنبه',
-  'دوشنبه',
-  'سه‌شنبه',
-  'چهارشنبه',
-  'پنجشنبه',
-  'جمعه',
-];
+export const JALALI_WEEKDAYS_SHORT = ['ش', 'ی', 'د', 'س', 'چ', 'پ', 'ج'];
 
-function div(a: number, b: number): number {
-  return Math.trunc(a / b);
+export function toPersianDigits(input: string | number): string {
+  const map = ['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '۹'];
+  return String(input).replace(/\d/g, (d) => map[Number(d)]);
 }
 
-function mod(a: number, b: number): number {
-  return a - div(a, b) * b;
+export function formatCurrencyToman(amount: number): string {
+  const formatted = Math.round(amount).toLocaleString('en-US');
+  return `${toPersianDigits(formatted)} تومان`;
 }
 
-const JALALI_BREAKS = [
-  -61, 9, 38, 199, 426, 686, 756, 818, 1111, 1181, 1210,
-  1635, 2060, 2097, 2192, 2262, 2324, 2394, 2456, 3178,
-];
-
-function jalCal(jy: number): { leap: number; gy: number; march: number } {
-  const bl = JALALI_BREAKS.length;
-  const gy = jy + 621;
-  let leapJ = -14;
-  let jp = JALALI_BREAKS[0];
-  let jump = 0;
-
-  if (jy < jp || jy >= JALALI_BREAKS[bl - 1]) {
-    throw new Error(`Invalid Jalali year: ${jy}`);
+export function gregorianToJalali(
+  gy: number,
+  gm: number,
+  gd: number,
+): { jy: number; jm: number; jd: number } {
+  const gdm = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+  const gy2 = gm > 2 ? gy + 1 : gy;
+  let days =
+    355666 +
+    365 * gy +
+    Math.floor((gy2 + 3) / 4) -
+    Math.floor((gy2 + 99) / 100) +
+    Math.floor((gy2 + 399) / 400) +
+    gd +
+    gdm[gm - 1];
+  let jy = -1595 + 33 * Math.floor(days / 12053);
+  days %= 12053;
+  jy += 4 * Math.floor(days / 1461);
+  days %= 1461;
+  if (days > 365) {
+    jy += Math.floor((days - 1) / 365);
+    days = (days - 1) % 365;
   }
-
-  for (let i = 1; i < bl; i += 1) {
-    const jm = JALALI_BREAKS[i];
-    jump = jm - jp;
-    if (jy < jm) break;
-    leapJ = leapJ + div(jump, 33) * 8 + div(mod(jump, 33), 4);
-    jp = jm;
-  }
-
-  let n = jy - jp;
-  leapJ = leapJ + div(n, 33) * 8 + div(mod(n, 33) + 3, 4);
-  if (mod(jump, 33) === 4 && jump - n === 4) {
-    leapJ += 1;
-  }
-
-  const leapG = div(gy, 4) - div((div(gy, 100) + 1) * 3, 4) - 150;
-  const march = 20 + leapJ - leapG;
-
-  if (jump - n < 6) {
-    n = n - jump + div(jump + 4, 33) * 33;
-  }
-  let leap = mod(mod(n + 1, 33) - 1, 4);
-  if (leap === -1) {
-    leap = 4;
-  }
-
-  return { leap, gy, march };
-}
-
-function g2d(gy: number, gm: number, gd: number): number {
-  let d =
-    div((gy + div(gm - 8, 6) + 100100) * 1461, 4) +
-    div(153 * mod(gm + 9, 12) + 2, 5) +
-    gd -
-    34840408;
-  d = d - div(div(gy + 100100 + div(gm - 8, 6), 100) * 3, 4) + 752;
-  return d;
-}
-
-function d2g(jdn: number): GregorianDate {
-  let j = 4 * jdn + 139361631;
-  j = j + div(div(4 * jdn + 183187720, 146097) * 3, 4) * 4 - 3908;
-  const i = div(mod(j, 1461), 4) * 5 + 308;
-  const gd = div(mod(i, 153), 5) + 1;
-  const gm = mod(div(i, 153), 12) + 1;
-  const gy = div(j, 1461) - 100100 + div(8 - gm, 6);
-  return { gy, gm, gd };
-}
-
-function j2d(jy: number, jm: number, jd: number): number {
-  const r = jalCal(jy);
-  return g2d(r.gy, 3, r.march) + (jm - 1) * 31 - div(jm, 7) * (jm - 7) + jd - 1;
-}
-
-function d2j(jdn: number): JalaliDate {
-  const g = d2g(jdn);
-  let jy = g.gy - 621;
-  const r = jalCal(jy);
-  const jdn1f = g2d(g.gy, 3, r.march);
-  let k = jdn - jdn1f;
-  let jm = 0;
-  let jd = 0;
-
-  if (k >= 0) {
-    if (k <= 185) {
-      jm = 1 + div(k, 31);
-      jd = mod(k, 31) + 1;
-      return { jy, jm, jd };
-    }
-    k -= 186;
-  } else {
-    jy -= 1;
-    k += 179;
-    if (r.leap === 1) k += 1;
-  }
-  jm = 7 + div(k, 30);
-  jd = mod(k, 30) + 1;
+  const jm = days < 186 ? 1 + Math.floor(days / 31) : 7 + Math.floor((days - 186) / 30);
+  const jd = 1 + (days < 186 ? days % 31 : (days - 186) % 30);
   return { jy, jm, jd };
 }
 
-export function gregorianToJalali(gy: number, gm: number, gd: number): JalaliDate {
-  return d2j(g2d(gy, gm, gd));
-}
-
-export function jalaliToGregorian(jy: number, jm: number, jd: number): GregorianDate {
-  return d2g(j2d(jy, jm, jd));
+export function jalaliToGregorian(
+  jy: number,
+  jm: number,
+  jd: number,
+): { gy: number; gm: number; gd: number } {
+  const jy2 = jy + 1595;
+  let days =
+    -355668 +
+    365 * jy2 +
+    Math.floor(jy2 / 33) * 8 +
+    Math.floor(((jy2 % 33) + 3) / 4) +
+    jd +
+    (jm < 7 ? (jm - 1) * 31 : (jm - 7) * 30 + 186);
+  let gy = 400 * Math.floor(days / 146097);
+  days %= 146097;
+  if (days > 36524) {
+    gy += 100 * Math.floor(--days / 36524);
+    days %= 36524;
+    if (days >= 365) days++;
+  }
+  gy += 4 * Math.floor(days / 1461);
+  days %= 1461;
+  if (days > 365) {
+    gy += Math.floor((days - 1) / 365);
+    days = (days - 1) % 365;
+  }
+  let gd = days + 1;
+  const salA = [
+    0,
+    31,
+    (gy % 4 === 0 && gy % 100 !== 0) || gy % 400 === 0 ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ];
+  let gm = 0;
+  for (gm = 1; gm <= 12 && gd > salA[gm]; gm++) {
+    gd -= salA[gm];
+  }
+  return { gy, gm, gd };
 }
 
 export function isJalaliLeapYear(jy: number): boolean {
-  return jalCal(jy).leap === 0;
+  const remainder = ((jy - 474) % 2820 + 2820) % 2820;
+  return (((remainder + 474 + 38) * 682) % 2816) < 682;
 }
 
-export function getJalaliMonthLength(jy: number, jm: number): number {
+export function jalaliMonthLength(jy: number, jm: number): number {
   if (jm <= 6) return 31;
   if (jm <= 11) return 30;
   return isJalaliLeapYear(jy) ? 30 : 29;
 }
 
-// Returns 0 = Saturday ... 6 = Friday
-export function getJalaliWeekdayIndex(jy: number, jm: number, jd: number): number {
-  const g = jalaliToGregorian(jy, jm, jd);
-  const date = new Date(Date.UTC(g.gy, g.gm - 1, g.gd));
-  const jsDay = date.getUTCDay(); // 0=Sun..6=Sat
-  return (jsDay + 1) % 7;
+export function getJalaliMonthStartWeekday(jy: number, jm: number): number {
+  const { gy, gm, gd } = jalaliToGregorian(jy, jm, 1);
+  const jsDay = new Date(gy, gm - 1, gd).getDay();
+  return (jsDay + 1) % 7; // Saturday = 0
 }
 
-const PERSIAN_DIGITS = ['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '۹'];
-
-export function toPersianDigits(input: string | number): string {
-  return String(input).replace(/\d/g, (d) => PERSIAN_DIGITS[Number(d)] ?? d);
+export function formatJalaliYmd(jy: number, jm: number, jd: number): string {
+  return `${jy}/${String(jm).padStart(2, '0')}/${String(jd).padStart(2, '0')}`;
 }
 
-export function formatJalaliYmd(jy: number, jm: number, jd: number, persian = false): string {
-  const str = `${jy}/${String(jm).padStart(2, '0')}/${String(jd).padStart(2, '0')}`;
-  return persian ? toPersianDigits(str) : str;
+export function jalaliYmdToIso(jalaliStr: string): string | null {
+  const m = /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/.exec(jalaliStr.trim());
+  if (!m) return null;
+  const { gy, gm, gd } = jalaliToGregorian(Number(m[1]), Number(m[2]), Number(m[3]));
+  return `${gy}-${String(gm).padStart(2, '0')}-${String(gd).padStart(2, '0')}`;
 }
 
-export function formatDateToJalali(dateInput: Date | string, persian = true): string {
-  const d = typeof dateInput === 'string' ? new Date(dateInput) : dateInput;
-  if (Number.isNaN(d.getTime())) return '—';
+export function isoToJalaliYmd(isoDate: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(isoDate.trim());
+  if (!m) return '';
+  const j = gregorianToJalali(Number(m[1]), Number(m[2]), Number(m[3]));
+  return formatJalaliYmd(j.jy, j.jm, j.jd);
+}
+
+export function formatIsoToJalaliDisplay(isoOrDate: string | Date | null | undefined): string {
+  if (!isoOrDate) return '—';
+  const d = isoOrDate instanceof Date ? isoOrDate : new Date(isoOrDate);
+  if (Number.isNaN(d.getTime())) return String(isoOrDate);
   const j = gregorianToJalali(d.getFullYear(), d.getMonth() + 1, d.getDate());
-  return formatJalaliYmd(j.jy, j.jm, j.jd, persian);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return toPersianDigits(`${j.jy}/${String(j.jm).padStart(2, '0')}/${String(j.jd).padStart(2, '0')} - ${hh}:${mm}`);
 }
 
-export function formatDateTimeToJalali(dateInput: Date | string, persian = true): string {
-  const d = typeof dateInput === 'string' ? new Date(dateInput) : dateInput;
-  if (Number.isNaN(d.getTime())) return '—';
-  const j = gregorianToJalali(d.getFullYear(), d.getMonth() + 1, d.getDate());
-  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-  const out = `${formatJalaliYmd(j.jy, j.jm, j.jd, false)} - ${hm}`;
-  return persian ? toPersianDigits(out) : out;
-}
-
-export function formatToman(amount: number, withUnit = true): string {
-  const formatted = Math.round(amount).toLocaleString('en-US');
-  const fa = toPersianDigits(formatted);
-  return withUnit ? `${fa} تومان` : fa;
-}
-
-export function getTodayJalali(): JalaliDate {
+export function getTodayJalali(): { jy: number; jm: number; jd: number } {
   const now = new Date();
   return gregorianToJalali(now.getFullYear(), now.getMonth() + 1, now.getDate());
 }
 
-export function jalaliYmdToIso(jalaliYmd: string): string | null {
-  const match = /^(\d{4})\/(\d{1,2})\/(\d{1,2})$/.exec(jalaliYmd.trim());
-  if (!match) return null;
-  const jy = Number(match[1]);
-  const jm = Number(match[2]);
-  const jd = Number(match[3]);
-  if (jm < 1 || jm > 12 || jd < 1 || jd > 31) return null;
-  const g = jalaliToGregorian(jy, jm, jd);
-  return `${g.gy}-${String(g.gm).padStart(2, '0')}-${String(g.gd).padStart(2, '0')}`;
-}
-
-export function isoToJalaliYmd(isoInput: string, persian = false): string {
-  const clean = isoInput.trim().slice(0, 10);
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(clean);
-  if (!match) return '—';
-  const j = gregorianToJalali(Number(match[1]), Number(match[2]), Number(match[3]));
-  return formatJalaliYmd(j.jy, j.jm, j.jd, persian);
+export function getTodayIsoDate(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 }

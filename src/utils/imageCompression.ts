@@ -1,5 +1,5 @@
 // Client-side HTML5 Canvas image compression (max 1280px, JPEG 70%)
-// Prevents large raw mobile gallery photos from exhausting local server storage/bandwidth.
+// Produces ~150-250KB JPEG Blobs suitable for IndexedDB caching and intranet upload.
 
 export interface CompressedImageResult {
   blob: Blob;

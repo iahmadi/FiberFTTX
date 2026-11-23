@@ -1,23 +1,17 @@
-// Centralized AJAX client holding session Bearer & CSRF tokens strictly in JS memory
+// Centralized API fetch helper holding active auth token strictly in JS memory
+// Supports both live Firebase ID token retrieval and intranet HMAC session tokens.
 
-interface SessionAuthState {
-  token: string;
-  csrfToken: string;
-}
+import { auth } from '../lib/firebase';
 
-let sessionAuth: SessionAuthState | null = null;
+let memoryToken: string | null = null;
 let onUnauthorizedCallback: (() => void) | null = null;
 
-export function setMemorySession(token: string, csrfToken: string): void {
-  sessionAuth = { token, csrfToken };
+export function setMemoryAuthToken(token: string | null): void {
+  memoryToken = token;
 }
 
-export function clearMemorySession(): void {
-  sessionAuth = null;
-}
-
-export function getMemorySession(): SessionAuthState | null {
-  return sessionAuth;
+export function getMemoryAuthToken(): string | null {
+  return memoryToken;
 }
 
 export function setUnauthorizedHandler(cb: () => void): void {
@@ -32,6 +26,30 @@ export class ApiError extends Error {
   }
 }
 
+async function resolveActiveToken(): Promise<string | null> {
+  if (memoryToken) {
+    if (!memoryToken.startsWith('local.') && auth.currentUser) {
+      try {
+        const fresh = await auth.currentUser.getIdToken();
+        memoryToken = fresh;
+      } catch {
+        // Offline or token refresh unavailable: keep cached memory token
+      }
+    }
+    return memoryToken;
+  }
+  if (auth.currentUser) {
+    try {
+      const tok = await auth.currentUser.getIdToken();
+      memoryToken = tok;
+      return tok;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 export async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers || {});
   if (!(options.body instanceof FormData) && !headers.has('Content-Type')) {
@@ -39,28 +57,23 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
   }
   headers.set('X-Requested-With', 'XMLHttpRequest');
 
-  if (sessionAuth) {
-    headers.set('Authorization', `Bearer ${sessionAuth.token}`);
-    headers.set('X-CSRF-Token', sessionAuth.csrfToken);
+  const token = await resolveActiveToken();
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
   }
 
-  const res = await fetch(url, {
-    ...options,
-    headers,
-  });
-
+  const res = await fetch(url, { ...options, headers });
   const data = await res.json().catch(() => ({}));
 
-  if (res.status === 401 && sessionAuth && !url.includes('/api/auth/login')) {
-    clearMemorySession();
+  if (res.status === 401 && token && !url.includes('/api/auth/')) {
+    setMemoryAuthToken(null);
     if (onUnauthorizedCallback) onUnauthorizedCallback();
   }
 
   if (!res.ok) {
-    const msg = typeof data?.error === 'string' ? data.error : 'خطا در ارتباط با سرور محلی';
+    const msg = typeof data?.error === 'string' ? data.error : 'خطا در ارتباط با سرور';
     throw new ApiError(msg, res.status);
   }
-
   return data as T;
 }
 

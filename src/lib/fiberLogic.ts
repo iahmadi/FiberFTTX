@@ -1,151 +1,107 @@
-// Pure Fiber Optic ERP domain logic: F-FAT codes, modem regex validation,
-// tariff snapshot calculations, spool deduction rules, and double-entry ledger totals.
+// Pure AvaNetwork Fiber ERP domain logic:
+// 1. 5-type ticketing metadata & dynamic field visibility
+// 2. Hardware connection source validation (FAT vs FFAT)
+// 3. Spool & Van Stock atomic deduction validation + low-spool alerts
+// 4. Modem brand regex/prefix validation
+// 5. Dynamic tariff templates, promotions/campaigns (weekly/monthly/carry_over), and ledger balance
 
 import { JALALI_MONTH_NAMES, gregorianToJalali, toPersianDigits } from './jalali.ts';
+import type {
+  ServicePriceSnapshot,
+  TariffCalcMode,
+  TariffTemplateRulesJson,
+  TariffTypeRule,
+  TicketTypeKey,
+} from '../db/schema.ts';
 
-export type ServiceType = 'install' | 'fault';
-export type TariffCalcType = 'fixed' | 'per_meter' | 'hybrid';
+export type {
+  ServicePriceSnapshot,
+  TariffCalcMode,
+  TariffTemplateRulesJson,
+  TariffTypeRule,
+  TicketTypeKey,
+};
 export type ModemSource = 'company' | 'customer';
+export type ServiceSourceType = 'FAT' | 'FFAT';
+export type TicketStatus = 'pending' | 'in_progress' | 'completed' | 'failed';
+
+export const TICKET_TYPES: TicketTypeKey[] = [
+  'internet_install',
+  'internet_fault',
+  'ffat_install',
+  'ffat_fault',
+  'voip_install',
+];
+
+export const TICKET_TYPE_LABELS: Record<TicketTypeKey, string> = {
+  internet_install: 'نصب اینترنت FTTH',
+  internet_fault: 'رفع خرابی اینترنت',
+  ffat_install: 'نصب F-FAT جدید',
+  ffat_fault: 'رفع خرابی F-FAT',
+  voip_install: 'راه‌اندازی تلفن VoIP',
+};
+
+export interface TicketFieldVisibility {
+  showPppoeVlan: boolean;
+  showVoip: boolean;
+  requiresModem: boolean;
+  label: string;
+}
+
+export function getTicketTypeFieldVisibility(type: TicketTypeKey): TicketFieldVisibility {
+  switch (type) {
+    case 'internet_install':
+      return {
+        showPppoeVlan: true,
+        showVoip: true,
+        requiresModem: true,
+        label: TICKET_TYPE_LABELS.internet_install,
+      };
+    case 'internet_fault':
+      return {
+        showPppoeVlan: true,
+        showVoip: false,
+        requiresModem: false,
+        label: TICKET_TYPE_LABELS.internet_fault,
+      };
+    case 'voip_install':
+      return {
+        showPppoeVlan: false,
+        showVoip: true,
+        requiresModem: true,
+        label: TICKET_TYPE_LABELS.voip_install,
+      };
+    case 'ffat_install':
+      return {
+        showPppoeVlan: false,
+        showVoip: false,
+        requiresModem: false,
+        label: TICKET_TYPE_LABELS.ffat_install,
+      };
+    case 'ffat_fault':
+      return {
+        showPppoeVlan: false,
+        showVoip: false,
+        requiresModem: false,
+        label: TICKET_TYPE_LABELS.ffat_fault,
+      };
+  }
+}
 
 export interface ModemBrandRule {
   id: number;
   name: string;
-  serial_pattern: string;
   serial_prefix: string;
+  serial_pattern: string;
 }
 
-export interface VanStockRecord {
-  id: number;
-  user_id: number;
-  item_id: number;
-  item_type: 'unit' | 'spool' | 'modem';
-  serial_number: string | null;
-  quantity: number;
-}
-
-export interface TicketProvisioningConfigLike {
-  config_pppoe_user?: string | null;
-  config_pppoe_pass?: string | null;
-  config_vlan?: number | null;
-  has_voip?: number | boolean | null;
-  config_voip_data?: string | null;
-}
-
-export function hasTicketProvisioningConfig(ticket: TicketProvisioningConfigLike | null | undefined): boolean {
-  if (!ticket) return false;
-  return Boolean(
-    (ticket.config_pppoe_user && ticket.config_pppoe_user.trim()) ||
-      (ticket.config_pppoe_pass && ticket.config_pppoe_pass.trim()) ||
-      (ticket.config_vlan !== null && ticket.config_vlan !== undefined && Number(ticket.config_vlan) > 0) ||
-      Boolean(ticket.has_voip) ||
-      (ticket.config_voip_data && ticket.config_voip_data.trim()),
-  );
-}
-
-/**
- * Validates whether an installer can consume a modem from Van Stock or skip deduction for customer's own modem.
- */
-export function validateVanModemConsumption(
-  vanStock: VanStockRecord | undefined,
-  modemSource: ModemSource,
-  modemSerial: string,
-  installerId: number,
-  canCrossUseInventory: boolean,
-): { ok: boolean; error?: string } {
-  if (modemSource === 'customer') {
-    return { ok: true };
-  }
-  if (!vanStock) {
-    return { ok: false, error: 'برای مودم شرکت، انتخاب ردیف موجودی از انبار خودرو (Van Stock) الزامی است.' };
-  }
-  if (vanStock.item_type !== 'modem') {
-    return { ok: false, error: 'کالای انتخاب‌شده از نوع مودم نیست.' };
-  }
-  if (vanStock.quantity < 1) {
-    return { ok: false, error: 'موجودی این مودم در انبار خودرو به اتمام رسیده است.' };
-  }
-  if (vanStock.user_id !== installerId && !canCrossUseInventory) {
-    return { ok: false, error: 'این مودم متعلق به انبار خودروی نصاب دیگری است.' };
-  }
-  if (
-    vanStock.serial_number &&
-    vanStock.serial_number.trim() &&
-    vanStock.serial_number.trim().toUpperCase() !== modemSerial.trim().toUpperCase()
-  ) {
-    return {
-      ok: false,
-      error: `سریال واردشده باید با سریال ثبت‌شده در انبار خودرو (${vanStock.serial_number}) مطابقت داشته باشد.`,
-    };
-  }
-  return { ok: true };
-}
-
-export interface TariffRule {
-  id: number;
-  installer_id: number;
-  calc_type: TariffCalcType;
-  base_price: number;
-  meter_limit: number;
-  extra_meter_price: number;
-  bonus_target_count?: number;
-  bonus_amount?: number;
-}
-
-export interface PriceSnapshot {
-  calc_type: TariffCalcType;
-  service_type: ServiceType;
-  base_price: number;
-  meter_limit: number;
-  extra_meter_price: number;
-  out_meter: number;
-  in_meter: number;
-  total_meter: number;
-  billable_extra_meter: number;
-  extra_meter_fee: number;
-  bonus_applied: number;
-  total_earned: number;
-  computed_at: string;
-}
-
-export interface SpoolRecord {
-  id: number;
-  spool_code: string;
-  cable_type: 'indoor' | 'outdoor';
-  initial_length: number;
-  current_length: number;
-  assigned_installer_id: number | null;
-}
-
-export interface LedgerEntryLike {
-  amount: number;
-  type: 'credit' | 'debit';
-}
-
-/**
- * Dynamically generates F-FAT code from parent FAT number and user suffix input.
- * Example: fatNumber = 14, suffix = "A2" -> "FAT14-A2"
- */
-export function generateFFatCode(fatNumber: number, suffixInput: string): string {
-  const cleanSuffix = suffixInput.trim().toUpperCase().replace(/\s+/g, '');
-  if (!Number.isInteger(fatNumber) || fatNumber <= 0) {
-    throw new Error('شماره FAT نامعتبر است.');
-  }
-  if (!cleanSuffix || !/^[A-Z0-9_-]{1,20}$/.test(cleanSuffix)) {
-    throw new Error('پسوند F-FAT باید شامل حروف انگلیسی یا عدد باشد (حداکثر ۲۰ کاراکتر).');
-  }
-  return `FAT${fatNumber}-${cleanSuffix}`;
-}
-
-/**
- * Validates a modem serial against brand prefix and regex pattern.
- */
 export function validateModemSerial(
   serial: string,
   brand: Pick<ModemBrandRule, 'name' | 'serial_prefix' | 'serial_pattern'>,
 ): { valid: boolean; reason?: string } {
   const trimmed = serial.trim();
   if (!trimmed) {
-    return { valid: false, reason: 'سریال مودم الزامی است.' };
+    return { valid: false, reason: 'شماره سریال مودم الزامی است.' };
   }
   if (trimmed.length > 100) {
     return { valid: false, reason: 'طول سریال مودم بیش از حد مجاز است.' };
@@ -161,118 +117,305 @@ export function validateModemSerial(
     if (!regex.test(trimmed)) {
       return {
         valid: false,
-        reason: `فرمت سریال مودم با الگوی برند ${brand.name} (${brand.serial_pattern}) مطابقت ندارد.`,
+        reason: `فرمت سریال با الگوی کارخانه ${brand.name} (${brand.serial_pattern}) مطابقت ندارد.`,
       };
     }
   } catch {
-    return { valid: false, reason: 'الگوی Regex تعریف‌شده برای این برند نامعتبر است.' };
+    return { valid: false, reason: 'الگوی Regex تعریف‌شده برای برند نامعتبر است.' };
   }
   return { valid: true };
 }
 
-/**
- * Validates whether an installer can deduct meters from a specific cable spool.
- */
+export interface SpoolRecord {
+  id: number;
+  spool_code: string;
+  cable_type: 'indoor' | 'outdoor';
+  initial_length: number;
+  current_length: number;
+  assigned_installer_id: number | null;
+}
+
 export function validateSpoolConsumption(
   spool: SpoolRecord | undefined,
   expectedCableType: 'indoor' | 'outdoor',
   requestedMeters: number,
   installerId: number,
-  canCrossUseCables: boolean,
+  canCrossUseCable: boolean,
 ): { ok: boolean; error?: string } {
   if (requestedMeters === 0) {
     return { ok: true };
   }
   if (!Number.isInteger(requestedMeters) || requestedMeters < 0) {
-    return { ok: false, error: 'متراژ مصرفی باید یک عدد صحیح نامنفی باشد.' };
+    return { ok: false, error: 'متراژ مصرفی باید عدد صحیح نامنفی باشد.' };
   }
   if (!spool) {
-    return { ok: false, error: `قرقره ${expectedCableType === 'outdoor' ? 'فضای باز' : 'داخلی'} انتخاب نشده است.` };
+    return {
+      ok: false,
+      error: `قرقره ${expectedCableType === 'outdoor' ? 'فضای باز' : 'داخلی'} انتخاب نشده است.`,
+    };
   }
   if (spool.cable_type !== expectedCableType) {
     return {
       ok: false,
-      error: `نوع کابل قرقره ${spool.spool_code} با بخش انتخابی مطابقت ندارد.`,
+      error: `نوع کابل قرقره ${spool.spool_code} با بخش انتخاب‌شده همخوانی ندارد.`,
     };
   }
   if (spool.assigned_installer_id === null) {
     return {
       ok: false,
-      error: `قرقره ${spool.spool_code} هنوز به انبار خودروی هیچ نصابی تحویل داده نشده است.`,
+      error: `قرقره ${spool.spool_code} هنوز به انبار خودروی هیچ نصابی تخصیص نیافته است.`,
     };
   }
-  if (spool.assigned_installer_id !== installerId && !canCrossUseCables) {
+  if (spool.assigned_installer_id !== installerId && !canCrossUseCable) {
     return {
       ok: false,
-      error: `قرقره ${spool.spool_code} متعلق به موجودی نصاب دیگری است و مجوز استفاده مشترک ندارید.`,
+      error: `قرقره ${spool.spool_code} متعلق به نصاب دیگری است (مجوز can_cross_use_cable ندارید).`,
     };
   }
   if (spool.current_length < requestedMeters) {
     return {
       ok: false,
-      error: `موجودی قرقره ${spool.spool_code} (${spool.current_length} متر) برای متراژ درخواستی (${requestedMeters} متر) کافی نیست.`,
+      error: `متراژ باقی‌مانده قرقره ${spool.spool_code} (${spool.current_length} متر) کمتر از میزان درخواستی (${requestedMeters} متر) است.`,
     };
   }
   return { ok: true };
 }
 
-/**
- * Calculates immutable tariff price snapshot for a completed service record.
- * - fixed: base_price flat regardless of meters
- * - per_meter: total_meter * extra_meter_price (+ optional base_price)
- * - hybrid: base_price covers up to meter_limit meters; excess meters * extra_meter_price
- * Bonus target: if completedInstallCountThisCycle hits/exceeds bonus_target_count, bonus_amount applies.
- */
-export function calculateTariffSnapshot(
-  tariff: TariffRule,
-  outMeter: number,
-  inMeter: number,
-  serviceType: ServiceType,
-  completedCountAfterThis = 0,
-  computedAt = new Date().toISOString(),
-): PriceSnapshot {
-  const safeOut = Math.max(0, Math.round(outMeter));
-  const safeIn = Math.max(0, Math.round(inMeter));
+export interface VanStockRecord {
+  id: number;
+  user_id: number;
+  item_id: number;
+  item_type: 'unit' | 'spool' | 'modem';
+  serial_number: string | null;
+  quantity: number;
+}
+
+export function validateVanModemConsumption(
+  vanStock: VanStockRecord | undefined,
+  modemSource: ModemSource,
+  modemSerial: string,
+  installerId: number,
+  canCrossUseInventory: boolean,
+): { ok: boolean; error?: string } {
+  if (modemSource === 'customer') {
+    return { ok: true };
+  }
+  if (!vanStock) {
+    return {
+      ok: false,
+      error: 'برای مودم شرکت، انتخاب مودم از موجودی خودروی نصاب (Van Stock) الزامی است.',
+    };
+  }
+  if (vanStock.item_type !== 'modem') {
+    return { ok: false, error: 'ردیف انتخاب‌شده از نوع مودم نیست.' };
+  }
+  if (vanStock.quantity < 1) {
+    return { ok: false, error: 'موجودی این مودم در انبار خودرو به اتمام رسیده است.' };
+  }
+  if (vanStock.user_id !== installerId && !canCrossUseInventory) {
+    return { ok: false, error: 'این مودم متعلق به خودروی نصاب دیگری است.' };
+  }
+  if (
+    vanStock.serial_number &&
+    vanStock.serial_number.trim() &&
+    vanStock.serial_number.trim().toUpperCase() !== modemSerial.trim().toUpperCase()
+  ) {
+    return {
+      ok: false,
+      error: `سریال واردشده باید با سریال انبار خودرو (${vanStock.serial_number}) یکسان باشد.`,
+    };
+  }
+  return { ok: true };
+}
+
+export function generateFFatCode(fatNumber: number, suffixInput: string): string {
+  const cleanSuffix = suffixInput.trim().toUpperCase().replace(/\s+/g, '');
+  if (!Number.isInteger(fatNumber) || fatNumber <= 0) {
+    throw new Error('شماره FAT نامعتبر است.');
+  }
+  if (!cleanSuffix || !/^[A-Z0-9_-]{1,20}$/.test(cleanSuffix)) {
+    throw new Error('پسوند F-FAT باید حروف انگلیسی یا عدد باشد (حداکثر ۲۰ کاراکتر).');
+  }
+  return `FAT${fatNumber}-${cleanSuffix}`;
+}
+
+export interface PromotionRule {
+  id: number;
+  name: string;
+  target_type: string; // 'all' | 'installs' | TicketTypeKey
+  target_value: number;
+  reward_amount: number;
+  reset_cycle: 'weekly' | 'monthly' | 'campaign';
+  start_date: string; // YYYY-MM-DD
+  end_date: string; // YYYY-MM-DD
+  carry_over: boolean;
+}
+
+export interface CompletedTicketEvent {
+  ticket_id: number;
+  type: TicketTypeKey;
+  completed_at: string; // ISO date or timestamp
+}
+
+export interface PromotionEvaluation {
+  eligible: boolean;
+  cycleCountAfterThis: number;
+  targetValue: number;
+  bonusEarned: number;
+  progressPercent: number;
+  carriedOverCount: number;
+}
+
+function getCycleStartIso(refDate: Date, cycle: PromotionRule['reset_cycle'], campaignStart: string): string {
+  if (cycle === 'campaign') return campaignStart;
+  if (cycle === 'weekly') {
+    const d = new Date(refDate);
+    const jalaliDayOffset = (d.getDay() + 1) % 7; // Saturday start of week
+    d.setDate(d.getDate() - jalaliDayOffset);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+  // monthly (Jalali month start mapped to Gregorian ISO)
+  const j = gregorianToJalali(refDate.getFullYear(), refDate.getMonth() + 1, refDate.getDate());
+  // Approximate/exact scan back up to 31 days to find day 1 of the current Jalali month
+  const d = new Date(refDate);
+  d.setDate(d.getDate() - (j.jd - 1));
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+export function doesTicketMatchPromotionTarget(
+  ticketType: TicketTypeKey,
+  targetType: string,
+): boolean {
+  if (targetType === 'all') return true;
+  if (targetType === 'installs') {
+    return ticketType === 'internet_install' || ticketType === 'ffat_install' || ticketType === 'voip_install';
+  }
+  return ticketType === targetType;
+}
+
+export function evaluatePromotionForTicket(
+  promo: PromotionRule | null | undefined,
+  priorCompletedEvents: CompletedTicketEvent[],
+  currentTicketType: TicketTypeKey,
+  referenceTimestampIso: string,
+): PromotionEvaluation {
+  if (!promo || promo.target_value <= 0 || promo.reward_amount <= 0) {
+    return {
+      eligible: false,
+      cycleCountAfterThis: 0,
+      targetValue: 0,
+      bonusEarned: 0,
+      progressPercent: 0,
+      carriedOverCount: 0,
+    };
+  }
+
+  const refIsoDate = referenceTimestampIso.slice(0, 10);
+  const inDateRange = refIsoDate >= promo.start_date && refIsoDate <= promo.end_date;
+  if (!inDateRange || !doesTicketMatchPromotionTarget(currentTicketType, promo.target_type)) {
+    return {
+      eligible: false,
+      cycleCountAfterThis: 0,
+      targetValue: promo.target_value,
+      bonusEarned: 0,
+      progressPercent: 0,
+      carriedOverCount: 0,
+    };
+  }
+
+  const refDate = new Date(referenceTimestampIso);
+  const cycleStart = getCycleStartIso(refDate, promo.reset_cycle, promo.start_date);
+  const effectiveCycleStart = cycleStart > promo.start_date ? cycleStart : promo.start_date;
+
+  const matchingInCampaign = priorCompletedEvents.filter((ev) => {
+    const d = ev.completed_at.slice(0, 10);
+    return (
+      d >= promo.start_date &&
+      d <= refIsoDate &&
+      doesTicketMatchPromotionTarget(ev.type, promo.target_type)
+    );
+  });
+
+  const matchingInCurrentCycle = matchingInCampaign.filter(
+    (ev) => ev.completed_at.slice(0, 10) >= effectiveCycleStart,
+  );
+
+  let carriedOverCount = 0;
+  if (promo.carry_over && effectiveCycleStart > promo.start_date) {
+    const priorBeforeCycle = matchingInCampaign.filter(
+      (ev) => ev.completed_at.slice(0, 10) < effectiveCycleStart,
+    ).length;
+    carriedOverCount = priorBeforeCycle % promo.target_value;
+  }
+
+  const effectiveTotalBeforeThis = matchingInCurrentCycle.length + carriedOverCount;
+  const cycleCountAfterThis = effectiveTotalBeforeThis + 1;
+
+  // Reward unlocks every time the target threshold is hit within the active cycle
+  const hitTargetNow = cycleCountAfterThis > 0 && cycleCountAfterThis % promo.target_value === 0;
+  const currentModulo = cycleCountAfterThis % promo.target_value;
+  const progressPercent = hitTargetNow
+    ? 100
+    : Math.min(99, Math.round((currentModulo / promo.target_value) * 100));
+
+  return {
+    eligible: true,
+    cycleCountAfterThis,
+    targetValue: promo.target_value,
+    bonusEarned: hitTargetNow ? Number(promo.reward_amount) : 0,
+    progressPercent,
+    carriedOverCount,
+  };
+}
+
+export function calculateTemplatePriceSnapshot(params: {
+  templateName: string;
+  rulesJson: TariffTemplateRulesJson;
+  ticketType: TicketTypeKey;
+  outMeter: number;
+  inMeter: number;
+  promotionName?: string | null;
+  promotionBonus?: number;
+  computedAt?: string;
+}): ServicePriceSnapshot {
+  const rule: TariffTypeRule = params.rulesJson[params.ticketType] || {
+    calc_type: 'fixed',
+    base_price: 500000,
+    meter_limit: 0,
+    extra_meter_price: 0,
+  };
+
+  const safeOut = Math.max(0, Math.round(params.outMeter));
+  const safeIn = Math.max(0, Math.round(params.inMeter));
   const totalMeter = safeOut + safeIn;
 
-  const basePrice = Number(tariff.base_price) || 0;
-  const meterLimit = Math.max(0, Math.round(Number(tariff.meter_limit) || 0));
-  const extraPrice = Number(tariff.extra_meter_price) || 0;
+  const basePrice = Number(rule.base_price) || 0;
+  const meterLimit = Math.max(0, Math.round(Number(rule.meter_limit) || 0));
+  const extraPrice = Number(rule.extra_meter_price) || 0;
 
   let billableExtraMeter = 0;
   let extraMeterFee = 0;
   let subtotal = 0;
 
-  if (tariff.calc_type === 'fixed') {
+  if (rule.calc_type === 'fixed') {
     subtotal = basePrice;
-  } else if (tariff.calc_type === 'per_meter') {
+  } else if (rule.calc_type === 'per_meter') {
     billableExtraMeter = totalMeter;
     extraMeterFee = billableExtraMeter * extraPrice;
     subtotal = basePrice + extraMeterFee;
   } else {
-    // hybrid
     billableExtraMeter = Math.max(0, totalMeter - meterLimit);
     extraMeterFee = billableExtraMeter * extraPrice;
     subtotal = basePrice + extraMeterFee;
   }
 
-  let bonusApplied = 0;
-  if (
-    tariff.bonus_target_count &&
-    tariff.bonus_target_count > 0 &&
-    tariff.bonus_amount &&
-    tariff.bonus_amount > 0 &&
-    completedCountAfterThis > 0 &&
-    completedCountAfterThis % tariff.bonus_target_count === 0
-  ) {
-    bonusApplied = Number(tariff.bonus_amount);
-  }
-
-  const totalEarned = Math.round((subtotal + bonusApplied) * 100) / 100;
+  const promoBonus = Math.max(0, Number(params.promotionBonus) || 0);
+  const totalEarned = Math.round((subtotal + promoBonus) * 100) / 100;
 
   return {
-    calc_type: tariff.calc_type,
-    service_type: serviceType,
+    template_name: params.templateName,
+    calc_type: rule.calc_type,
+    ticket_type: params.ticketType,
     base_price: basePrice,
     meter_limit: meterLimit,
     extra_meter_price: extraPrice,
@@ -281,15 +424,18 @@ export function calculateTariffSnapshot(
     total_meter: totalMeter,
     billable_extra_meter: billableExtraMeter,
     extra_meter_fee: extraMeterFee,
-    bonus_applied: bonusApplied,
+    promotion_name: params.promotionName || null,
+    promotion_bonus: promoBonus,
     total_earned: totalEarned,
-    computed_at: computedAt,
+    computed_at: params.computedAt || new Date().toISOString(),
   };
 }
 
-/**
- * Computes double-entry ledger balance (credit = earned, debit = company paid).
- */
+export interface LedgerEntryLike {
+  amount: number | string;
+  type: 'credit' | 'debit';
+}
+
 export function computeLedgerBalance(entries: LedgerEntryLike[]): {
   totalCredit: number;
   totalDebit: number;
@@ -299,11 +445,8 @@ export function computeLedgerBalance(entries: LedgerEntryLike[]): {
   let totalDebit = 0;
   for (const entry of entries) {
     const val = Number(entry.amount) || 0;
-    if (entry.type === 'credit') {
-      totalCredit += val;
-    } else if (entry.type === 'debit') {
-      totalDebit += val;
-    }
+    if (entry.type === 'credit') totalCredit += val;
+    else if (entry.type === 'debit') totalDebit += val;
   }
   return {
     totalCredit: Math.round(totalCredit * 100) / 100,
@@ -313,21 +456,6 @@ export function computeLedgerBalance(entries: LedgerEntryLike[]): {
 }
 
 export const LOW_SPOOL_THRESHOLD_PCT = 10;
-
-export interface SpoolWarningItem {
-  id: number;
-  spool_code: string;
-  current_length: number;
-  initial_length: number;
-  percentRemaining: number;
-}
-
-export interface SpoolDropEvent {
-  spool: SpoolRecord;
-  deductedMeters: number;
-  isLow: boolean;
-  percentRemaining: number;
-}
 
 export function getSpoolExactPercent(
   spool: Pick<SpoolRecord, 'initial_length' | 'current_length'>,
@@ -351,6 +479,14 @@ export function isSpoolLowStock(
   return getSpoolExactPercent(spool) < thresholdPct;
 }
 
+export interface SpoolWarningItem {
+  id: number;
+  spool_code: string;
+  current_length: number;
+  initial_length: number;
+  percentRemaining: number;
+}
+
 export function getLowSpoolWarnings(
   spools: SpoolRecord[],
   thresholdPct = LOW_SPOOL_THRESHOLD_PCT,
@@ -367,36 +503,6 @@ export function getLowSpoolWarnings(
     .sort((a, b) => a.percentRemaining - b.percentRemaining || a.current_length - b.current_length);
 }
 
-export function detectSpoolDrops(
-  prevSpools: SpoolRecord[],
-  nextSpools: SpoolRecord[],
-  thresholdPct = LOW_SPOOL_THRESHOLD_PCT,
-): SpoolDropEvent[] {
-  const prevMap = new Map<number, SpoolRecord>();
-  for (const s of prevSpools) {
-    prevMap.set(s.id, s);
-  }
-  const drops: SpoolDropEvent[] = [];
-  for (const next of nextSpools) {
-    const prev = prevMap.get(next.id);
-    if (prev && next.current_length < prev.current_length) {
-      drops.push({
-        spool: next,
-        deductedMeters: prev.current_length - next.current_length,
-        isLow: isSpoolLowStock(next, thresholdPct),
-        percentRemaining: getSpoolPercentRemaining(next),
-      });
-    }
-  }
-  return drops;
-}
-
-export interface LedgerDateEntryLike {
-  amount: number;
-  type: 'credit' | 'debit';
-  created_at: string;
-}
-
 export interface MonthlyContractorEarning {
   monthKey: string;
   monthLabel: string;
@@ -406,28 +512,16 @@ export interface MonthlyContractorEarning {
 
 export type EarningsRangePreset = 'all' | '3m' | '6m' | '12m' | 'custom';
 
-function parseEntryDate(raw: string): Date | null {
-  if (!raw) return null;
-  const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T');
-  const d = new Date(normalized);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
-/**
- * Aggregates contractor earnings ('credit' ledger entries) per Jalali month, sorted chronologically.
- */
 export function aggregateMonthlyContractorEarnings(
-  entries: LedgerDateEntryLike[],
+  entries: Array<{ amount: number | string; type: string; created_at: string }>,
 ): MonthlyContractorEarning[] {
   const buckets = new Map<string, MonthlyContractorEarning>();
-
   for (const entry of entries) {
     if (entry.type !== 'credit') continue;
     const amount = Number(entry.amount) || 0;
     if (amount <= 0) continue;
-
-    const d = parseEntryDate(entry.created_at);
-    if (!d) continue;
+    const d = new Date(entry.created_at);
+    if (Number.isNaN(d.getTime())) continue;
 
     const j = gregorianToJalali(d.getFullYear(), d.getMonth() + 1, d.getDate());
     const monthKey = `${j.jy}-${String(j.jm).padStart(2, '0')}`;
@@ -446,17 +540,12 @@ export function aggregateMonthlyContractorEarnings(
       });
     }
   }
-
   return Array.from(buckets.values()).sort((a, b) => a.monthKey.localeCompare(b.monthKey));
 }
 
 export function filterMonthlyEarningsByRange(
   months: MonthlyContractorEarning[],
-  options: {
-    preset: EarningsRangePreset;
-    fromMonth?: string;
-    toMonth?: string;
-  },
+  options: { preset: EarningsRangePreset; fromMonth?: string; toMonth?: string },
 ): MonthlyContractorEarning[] {
   const sorted = [...months].sort((a, b) => a.monthKey.localeCompare(b.monthKey));
   if (options.preset === '3m') return sorted.slice(-3);
@@ -474,119 +563,10 @@ export function filterMonthlyEarningsByRange(
   return sorted;
 }
 
-export type ActivityCategory = 'all' | 'ticket' | 'inventory' | 'financial' | 'rbac';
-
-export interface ActivityLogLike {
-  id: number;
-  username: string;
-  user_full_name: string;
-  action_type: string;
-  entity_type: string;
-  entity_id?: number | null;
-  summary: string;
-  details?: string | null;
-  created_at: string;
-}
-
-export function getActivityCategory(actionType: string): Exclude<ActivityCategory, 'all'> {
-  if (
-    actionType.startsWith('ticket_') ||
-    actionType.startsWith('service_')
-  ) {
-    return 'ticket';
-  }
-  if (
-    actionType.startsWith('spool_') ||
-    actionType.startsWith('inventory_') ||
-    actionType.startsWith('van_stock_')
-  ) {
-    return 'inventory';
-  }
-  if (
-    actionType.startsWith('tariff_') ||
-    actionType.startsWith('payout_') ||
-    actionType.startsWith('financial_')
-  ) {
-    return 'financial';
-  }
-  return 'rbac';
-}
-
-export const ACTIVITY_ACTION_LABELS: Record<string, string> = {
-  ticket_created: 'ثبت تیکت جدید',
-  ticket_config_updated: 'ویرایش کانفیگ فنی تیکت',
-  ticket_assigned: 'تایید و ارجاع تیکت',
-  service_completed: 'تایید و تکمیل عملیات نصب/خرابی',
-  spool_created: 'ثبت قرقره کابل جدید',
-  spool_transferred: 'انتقال قرقره کابل',
-  spool_consumed: 'کسر متراژ قرقره کابل',
-  inventory_item_created: 'افزودن کالا/مودم به انبار',
-  inventory_adjusted: 'تغییر موجودی انبار مرکزی',
-  van_stock_transferred: 'تحویل کالا به خودروی نصاب',
-  van_stock_returned: 'عودت کالا از خودرو به انبار',
-  tariff_updated: 'تنظیم تعرفه نصاب',
-  payout_recorded: 'ثبت سند پرداخت مالی',
-  user_created: 'ایجاد کاربر جدید',
-  user_updated: 'تغییر وضعیت/نقش کاربر',
-  role_created: 'ایجاد نقش دسترسی جدید',
-  role_updated: 'ویرایش مجوزهای نقش',
-  settings_updated: 'تغییر تنظیمات امنیتی نشست',
-};
-
-export function filterActivityLogs<T extends ActivityLogLike>(
-  logs: T[],
-  category: ActivityCategory,
-  rawQuery: string,
-): T[] {
-  const q = rawQuery.trim().toLowerCase();
-  return logs.filter((log) => {
-    if (category !== 'all' && getActivityCategory(log.action_type) !== category) {
-      return false;
-    }
-    if (!q) return true;
-    const actionLabel = ACTIVITY_ACTION_LABELS[log.action_type] || log.action_type;
-    const haystack = [
-      log.user_full_name,
-      log.username,
-      log.summary,
-      log.details || '',
-      actionLabel,
-    ]
-      .join(' ')
-      .toLowerCase();
-    return haystack.includes(q);
-  });
-}
-
-export interface ServiceRecordPrintSource {
-  id: number;
-  ticket_id: number;
-  ticket_type: ServiceType;
-  modem_source: ModemSource;
-  out_total_meter: number;
-  in_total_meter: number;
-}
-
-export function buildServiceRecordPrintMeta(record: ServiceRecordPrintSource): {
-  documentCode: string;
-  serviceTypeLabel: string;
-  modemSourceLabel: string;
-  totalCableMeters: number;
-} {
-  const outM = Math.max(0, Number(record.out_total_meter) || 0);
-  const inM = Math.max(0, Number(record.in_total_meter) || 0);
-  return {
-    documentCode: `FOB-${String(record.ticket_id).padStart(4, '0')}-${String(record.id).padStart(3, '0')}`,
-    serviceTypeLabel: record.ticket_type === 'install' ? 'نصب و راه‌اندازی سرویس جدید (Install)' : 'رفع خرابی و پشتیبانی فنی (Fault)',
-    modemSourceLabel: record.modem_source === 'customer' ? 'مودم شخصی مشترک' : 'مودم تحویلی شرکت',
-    totalCableMeters: outM + inM,
-  };
-}
-
 export interface ScheduledTicketLike {
   id: number;
-  type: ServiceType;
-  status: 'pending' | 'assigned' | 'completed';
+  type: TicketTypeKey;
+  status: TicketStatus;
   scheduled_date?: string | null;
   scheduled_time?: string | null;
   created_at: string;
@@ -604,50 +584,32 @@ export function groupScheduledTicketsByJalaliDay<T extends ScheduledTicketLike>(
   tickets: T[],
   jy: number,
   jm: number,
-  onlyInstallations = false,
+  onlyInstalls = false,
 ): Record<number, T[]> {
   const grouped: Record<number, T[]> = {};
-  for (const ticket of tickets) {
-    if (ticket.status === 'completed') continue;
-    if (onlyInstallations && ticket.type !== 'install') continue;
-    const iso = getTicketScheduleIsoDate(ticket);
+  for (const t of tickets) {
+    if (t.status === 'completed' || t.status === 'failed') continue;
+    if (
+      onlyInstalls &&
+      t.type !== 'internet_install' &&
+      t.type !== 'ffat_install' &&
+      t.type !== 'voip_install'
+    ) {
+      continue;
+    }
+    const iso = getTicketScheduleIsoDate(t);
     if (!iso) continue;
     const [gy, gm, gd] = iso.split('-').map(Number);
     const j = gregorianToJalali(gy, gm, gd);
     if (j.jy !== jy || j.jm !== jm) continue;
     if (!grouped[j.jd]) grouped[j.jd] = [];
-    grouped[j.jd].push(ticket);
+    grouped[j.jd].push(t);
   }
-  for (const dayKey of Object.keys(grouped)) {
-    grouped[Number(dayKey)].sort((a, b) => {
-      const ta = (a.scheduled_time || '23:59').localeCompare(b.scheduled_time || '23:59');
-      return ta !== 0 ? ta : a.id - b.id;
+  for (const k of Object.keys(grouped)) {
+    grouped[Number(k)].sort((a, b) => {
+      const cmp = (a.scheduled_time || '23:59').localeCompare(b.scheduled_time || '23:59');
+      return cmp !== 0 ? cmp : a.id - b.id;
     });
   }
   return grouped;
 }
-
-export function getUpcomingScheduledTickets<T extends ScheduledTicketLike>(
-  tickets: T[],
-  fromIsoDate: string,
-  onlyInstallations = false,
-  limit = 6,
-): T[] {
-  return tickets
-    .filter((t) => {
-      if (t.status === 'completed') return false;
-      if (onlyInstallations && t.type !== 'install') return false;
-      const iso = getTicketScheduleIsoDate(t);
-      return Boolean(iso && iso >= fromIsoDate);
-    })
-    .sort((a, b) => {
-      const da = getTicketScheduleIsoDate(a) || '';
-      const db = getTicketScheduleIsoDate(b) || '';
-      if (da !== db) return da.localeCompare(db);
-      const ta = (a.scheduled_time || '23:59').localeCompare(b.scheduled_time || '23:59');
-      return ta !== 0 ? ta : a.id - b.id;
-    })
-    .slice(0, limit);
-}
-
-

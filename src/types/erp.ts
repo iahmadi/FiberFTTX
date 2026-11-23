@@ -1,40 +1,52 @@
-import type { ModemSource, PriceSnapshot, ServiceType, TariffCalcType } from '../lib/fiberLogic';
+import type {
+  ServicePriceSnapshot,
+  ServiceSourceType,
+  TariffTemplateRulesJson,
+  TicketStatus,
+  TicketTypeKey,
+} from '../lib/fiberLogic';
 
 export interface AuthUser {
   id: number;
+  uid: string | null;
   username: string;
-  first_name: string;
-  last_name: string;
+  email: string | null;
+  full_name: string;
   role_id: number;
   role_name: string;
-  is_active: number;
-  permissions: string[];
+  is_active: boolean;
   isSuperAdmin: boolean;
+  permissions: string[];
 }
 
 export interface TicketItem {
   id: number;
+  type: TicketTypeKey;
   customer_name: string;
   address: string;
-  type: ServiceType;
-  status: 'pending' | 'assigned' | 'completed';
+  pppoe_user: string | null;
+  pppoe_pass: string | null;
+  vlan_id: string | null;
+  voip_config: string | null;
+  operator_notes: string | null;
+  status: TicketStatus;
   assigned_installer: number | null;
   installer_name: string | null;
-  config_pppoe_user?: string | null;
-  config_pppoe_pass?: string | null;
-  config_vlan?: number | null;
-  has_voip?: number;
-  config_voip_data?: string | null;
-  operator_notes?: string | null;
-  service_record_id?: number | null;
-  ffat_code?: string | null;
-  fat_number?: number | null;
-  olt_name?: string | null;
-  kaf_name?: string | null;
-  modem_serial?: string | null;
-  modem_source?: ModemSource | null;
-  scheduled_date?: string | null;
-  scheduled_time?: string | null;
+  scheduled_date: string | null;
+  scheduled_time: string | null;
+  assigned_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+}
+
+export interface TicketCommentItem {
+  id: number;
+  ticket_id: number;
+  user_id: number;
+  user_full_name: string;
+  user_role_name: string;
+  comment: string;
   created_at: string;
 }
 
@@ -46,31 +58,42 @@ export interface KafItem {
 export interface OltItem {
   id: number;
   kaf_id: number;
-  name: string;
   kaf_name?: string;
+  name: string;
 }
 
 export interface FatItem {
   id: number;
   olt_id: number;
-  fat_number: number;
   olt_name?: string;
   kaf_id?: number;
+  fat_number: number;
 }
 
 export interface FFatItem {
   id: number;
   fat_id: number;
-  ffat_code: string;
   fat_number?: number;
   olt_id?: number;
+  ffat_code: string;
 }
 
 export interface ModemBrandItem {
   id: number;
   name: string;
-  serial_pattern: string;
   serial_prefix: string;
+  serial_pattern: string;
+}
+
+export interface SpoolItem {
+  id: number;
+  item_id: number | null;
+  spool_code: string;
+  cable_type: 'indoor' | 'outdoor';
+  initial_length: number;
+  current_length: number;
+  assigned_installer_id: number | null;
+  installer_name: string | null;
 }
 
 export interface InventoryItemRecord {
@@ -78,99 +101,108 @@ export interface InventoryItemRecord {
   name: string;
   type: 'unit' | 'spool' | 'modem';
   modem_brand_id: number | null;
-  brand_name?: string | null;
+  brand_name: string | null;
   total_quantity: number;
-  van_allocated_quantity?: number;
+  van_allocated_quantity: number;
 }
 
 export interface VanStockItem {
   id: number;
   user_id: number;
-  installer_name?: string;
   item_id: number;
   item_name: string;
   item_type: 'unit' | 'spool' | 'modem';
-  modem_brand_id?: number | null;
-  brand_name?: string | null;
+  modem_brand_id: number | null;
+  brand_name: string | null;
+  serial_prefix: string | null;
+  serial_pattern: string | null;
   serial_number: string | null;
   quantity: number;
-  created_at?: string;
-}
-
-export interface SpoolItem {
-  id: number;
-  item_id?: number | null;
-  spool_code: string;
-  cable_type: 'indoor' | 'outdoor';
-  initial_length: number;
-  current_length: number;
-  assigned_installer_id: number | null;
-  installer_name?: string | null;
-}
-
-export interface TariffItem {
-  id: number;
-  installer_id: number;
   installer_name: string;
-  username: string;
-  calc_type: TariffCalcType;
-  base_price: number;
-  meter_limit: number;
-  extra_meter_price: number;
-  bonus_target_count: number;
-  bonus_amount: number;
-}
-
-export interface LedgerItem {
-  id: number;
-  user_id: number;
-  user_name: string;
-  record_id: number | null;
-  ticket_id?: number | null;
-  amount: number;
-  type: 'credit' | 'debit';
-  description: string | null;
   created_at: string;
 }
 
-export interface BalanceSummary {
+export interface TariffTemplateItem {
+  id: number;
+  name: string;
+  rules_json: TariffTemplateRulesJson;
+}
+
+export interface PromotionItem {
+  id: number;
+  name: string;
+  target_type: string;
+  target_value: number;
+  reward_amount: number;
+  reset_cycle: 'weekly' | 'monthly' | 'campaign';
+  start_date: string;
+  end_date: string;
+  carry_over: boolean;
+}
+
+export interface UserTariffAssignment {
   user_id: number;
+  username: string;
   full_name: string;
-  role_name: string;
+  template_id: number;
+  template_name: string;
+  promotion_id: number | null;
+  promotion_name: string | null;
+}
+
+export interface LedgerEntryItem {
+  id: number;
+  user_id: number;
+  user_full_name: string;
+  ticket_id: number | null;
+  amount: number;
+  type: 'credit' | 'debit';
+  description: string;
+  created_at: string;
+}
+
+export interface ContractorBalanceSummary {
+  user_id: number;
+  username: string;
+  full_name: string;
   totalCredit: number;
   totalDebit: number;
   balance: number;
+  promotionProgress?: {
+    promotion_name: string;
+    cycle_count: number;
+    target_value: number;
+    progress_percent: number;
+    reward_amount: number;
+    carried_over: number;
+  } | null;
 }
 
-export interface MonthlyContractorEarning {
-  monthKey: string;
-  monthLabel: string;
-  totalEarnings: number;
-  entryCount: number;
-}
-
-export interface PermissionItem {
+export interface ServiceRecordDetail {
   id: number;
-  key_name: string;
-  descr: string;
-}
-
-export interface RoleItem {
-  id: number;
-  role_name: string;
-  perm_ids: number[];
-}
-
-export interface UserAdminItem {
-  id: number;
-  username: string;
-  first_name: string;
-  last_name: string;
-  role_id: number;
-  role_name: string;
-  is_active: number;
-  last_login: string | null;
-  has_password: number;
+  ticket_id: number;
+  installer_id: number;
+  installer_name: string;
+  customer_name: string;
+  address: string;
+  ticket_type: TicketTypeKey;
+  source_type: ServiceSourceType;
+  source_id: number;
+  source_label: string;
+  kaf_name: string;
+  olt_name: string;
+  out_spool_code: string | null;
+  out_total_meter: number;
+  in_spool_code: string | null;
+  in_total_meter: number;
+  modem_brand_name: string | null;
+  modem_serial: string | null;
+  modem_source: 'company' | 'customer';
+  price_snapshot: ServicePriceSnapshot;
+  service_date_jalali: string | null;
+  notes: string | null;
+  created_at: string;
+  images: Array<{ id: number; image_type: string; file_path: string }>;
 }
 
 export interface ActivityLogItem {
@@ -186,42 +218,25 @@ export interface ActivityLogItem {
   created_at: string;
 }
 
-export interface ServiceRecordDetail {
+export interface UserAccountRow {
   id: number;
-  ticket_id: number;
-  customer_name: string;
-  address: string;
-  ticket_type: ServiceType;
-  installer_name: string;
-  kaf_name: string;
-  olt_name: string;
-  fat_number: number;
-  ffat_code: string;
-  out_spool_code: string | null;
-  out_total_meter: number;
-  in_spool_code: string | null;
-  in_total_meter: number;
-  modem_source: ModemSource;
-  modem_brand_name?: string | null;
-  modem_serial: string;
-  config_pppoe_user?: string | null;
-  config_pppoe_pass?: string | null;
-  config_vlan?: number | null;
-  has_voip?: number;
-  config_voip_data?: string | null;
-  operator_notes?: string | null;
-  price_snapshot: PriceSnapshot;
-  service_date_jalali: string | null;
-  notes: string | null;
-  created_at: string;
-  images: Array<{ id: number; image_type: string; file_path: string }>;
+  uid: string | null;
+  username: string;
+  email: string | null;
+  full_name: string;
+  role_id: number;
+  role_name: string;
+  is_active: boolean;
 }
 
-export type PageKey =
-  | 'dashboard'
-  | 'tickets'
-  | 'service-form'
-  | 'hardware'
-  | 'inventory'
-  | 'financial'
-  | 'users';
+export interface RoleWithPerms {
+  id: number;
+  name: string;
+  permissionIds: number[];
+}
+
+export interface PermissionDef {
+  id: number;
+  key_name: string;
+  descr: string;
+}

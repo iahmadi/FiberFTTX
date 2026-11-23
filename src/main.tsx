@@ -1,9 +1,20 @@
-import '@fontsource/vazirmatn/400.css';
-import '@fontsource/vazirmatn/500.css';
-import '@fontsource/vazirmatn/600.css';
-import '@fontsource/vazirmatn/700.css';
+import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import App from './App.tsx';
+import { registerSW } from 'virtual:pwa-register';
+import App from './App';
 import './index.css';
 
-createRoot(document.getElementById('root')!).render(<App />);
+if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
+  registerSW({
+    immediate: true,
+    onOfflineReady() {
+      // Cached assets ready for offline intranet operation
+    },
+  });
+}
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
