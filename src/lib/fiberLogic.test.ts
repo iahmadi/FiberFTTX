@@ -2,8 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   calculateTemplatePriceSnapshot,
+  computeLast30DaysCompletionByType,
   computeLedgerBalance,
+  computeSpoolConsumptionForecasts,
   evaluatePromotionForTicket,
+  evaluateRbacPolicy,
+  evaluateTicketSla,
   generateFFatCode,
   getTicketTypeFieldVisibility,
   isSpoolLowStock,
@@ -133,3 +137,158 @@ test('Dynamic tariff template snapshot + promotion carry-over and ledger math', 
   ]);
   assert.equal(ledger.balance, 1250000);
 });
+
+test('Last 30 days completion rate calculates per ticket type and excludes older tickets', () => {
+  const ref = new Date('2026-11-23T12:00:00Z');
+  const summary = computeLast30DaysCompletionByType(
+    [
+      { type: 'internet_install', status: 'completed', created_at: '2026-11-10T10:00:00Z', completed_at: '2026-11-12T10:00:00Z' },
+      { type: 'internet_install', status: 'pending', created_at: '2026-11-20T10:00:00Z', completed_at: null },
+      { type: 'ffat_install', status: 'completed', created_at: '2026-11-18T10:00:00Z', completed_at: '2026-11-19T10:00:00Z' },
+      { type: 'internet_fault', status: 'completed', created_at: '2026-09-01T10:00:00Z', completed_at: '2026-09-02T10:00:00Z' },
+    ],
+    ref,
+  );
+
+  assert.equal(summary.overallTotal, 3);
+  assert.equal(summary.overallCompleted, 2);
+  assert.equal(summary.overallCompletionRatePct, 67);
+
+  const inetInstall = summary.byType.find((b) => b.type === 'internet_install')!;
+  assert.equal(inetInstall.completedCount, 1);
+  assert.equal(inetInstall.totalCount, 2);
+  assert.equal(inetInstall.completionRatePct, 50);
+  assert.equal(inetInstall.shareOfCompletedPct, 50);
+
+  const ffatInstall = summary.byType.find((b) => b.type === 'ffat_install')!;
+  assert.equal(ffatInstall.completionRatePct, 100);
+});
+
+test('Spool consumption forecast calculates depletion days and reorder urgency', () => {
+  const ref = new Date('2026-11-23T12:00:00Z');
+  const report = computeSpoolConsumptionForecasts(
+    [
+      {
+        id: 1,
+        spool_code: 'OUT-101',
+        cable_type: 'outdoor',
+        initial_length: 1000,
+        current_length: 300,
+        assigned_installer_id: 5,
+        installer_name: 'حسین کریمی',
+      },
+      {
+        id: 2,
+        spool_code: 'IN-12',
+        cable_type: 'indoor',
+        initial_length: 800,
+        current_length: 760,
+        assigned_installer_id: 5,
+        installer_name: 'حسین کریمی',
+      },
+    ],
+    [
+      {
+        installer_id: 5,
+        installer_name: 'حسین کریمی',
+        out_spool_id: 1,
+        out_total_meter: 600, // 20m/day -> 300m left = 15 days; safety=100m (10d) -> reorder in 10-7=3 days ('soon')
+        in_spool_id: 2,
+        in_total_meter: 150, // 5m/day -> 760m left = 152 days -> 'planned'
+        created_at: '2026-11-18T10:00:00Z',
+      },
+    ],
+    { lookbackDays: 30, leadTimeDays: 7, referenceDate: ref },
+  );
+
+  assert.equal(report.avgOutdoorMonthlyMeters, 600);
+  assert.equal(report.avgIndoorMonthlyMeters, 150);
+  assert.equal(report.soonReorderCount, 1);
+
+  const outForecast = report.spoolForecasts.find((s) => s.spoolCode === 'OUT-101')!;
+  assert.equal(outForecast.estimatedDaysRemaining, 15);
+  assert.equal(outForecast.reorderPointMeters, 240); // 100m safety + 7d*20m
+  assert.equal(outForecast.daysUntilReorder, 3);
+  assert.equal(outForecast.urgency, 'soon');
+
+  const inForecast = report.spoolForecasts.find((s) => s.spoolCode === 'IN-12')!;
+  assert.equal(inForecast.urgency, 'planned');
+  assert.equal(inForecast.estimatedDaysRemaining, 152);
+});
+
+test('RBAC policy middleware enforces SuperAdmin bypass and tbl_permissions by role_id', () => {
+  assert.equal(
+    evaluateRbacPolicy(
+      { id: 1, role_id: 1, role_name: 'SuperAdmin', is_active: true, permissions: [] },
+      ['can_manage_tariffs', 'can_view_financials'],
+    ).allowed,
+    true,
+  );
+  assert.equal(
+    evaluateRbacPolicy(
+      {
+        id: 2,
+        role_id: 3,
+        role_name: 'تکنسین نصاب',
+        is_active: true,
+        permissions: ['can_execute_service'],
+      },
+      ['can_manage_tariffs'],
+    ).allowed,
+    false,
+  );
+  assert.equal(
+    evaluateRbacPolicy(
+      {
+        id: 3,
+        role_id: 5,
+        role_name: 'سرپرست مالی',
+        is_active: true,
+        permissions: ['can_view_financials'],
+      },
+      ['can_view_financials', 'can_manage_tariffs'],
+    ).allowed,
+    true,
+  );
+  assert.equal(
+    evaluateRbacPolicy(
+      {
+        id: 3,
+        role_id: 5,
+        role_name: 'سرپرست مالی',
+        is_active: false,
+        permissions: ['can_view_financials'],
+      },
+      ['can_view_financials'],
+    ).allowed,
+    false,
+  );
+});
+
+test('Ticket SLA flags pending tickets assigned more than 4 hours ago and ignores others', () => {
+  const now = new Date('2026-11-23T12:00:00Z');
+  const breached = evaluateTicketSla(
+    { status: 'pending', assigned_at: '2026-11-23T07:30:00Z' }, // 4h 30m ago
+    4,
+    now,
+  );
+  assert.equal(breached.isBreached, true);
+  assert.equal(breached.elapsedHours, 4);
+  assert.equal(breached.elapsedMinutes, 30);
+
+  const withinSla = evaluateTicketSla(
+    { status: 'pending', assigned_at: '2026-11-23T09:00:00Z' }, // 3h ago
+    4,
+    now,
+  );
+  assert.equal(withinSla.isBreached, false);
+
+  const alreadyStarted = evaluateTicketSla(
+    { status: 'in_progress', assigned_at: '2026-11-22T09:00:00Z' },
+    4,
+    now,
+  );
+  assert.equal(alreadyStarted.isBreached, false);
+});
+
+

@@ -26,6 +26,28 @@ import {
 import { hashLocalPassword } from '../middleware/auth.ts';
 import { calculateTemplatePriceSnapshot } from '../lib/fiberLogic.ts';
 
+const DEFAULT_PERMISSIONS: Array<{ key_name: string; descr: string }> = [
+  { key_name: 'can_view_dashboard', descr: 'مشاهده داشبورد و تقویم عملیاتی' },
+  { key_name: 'can_create_tickets', descr: 'ثبت تیکت ۵گانه و تنظیمات شبکه' },
+  { key_name: 'can_assign_tickets', descr: 'ارجاع تیکت به نصابان و زمان‌بندی' },
+  { key_name: 'can_execute_service', descr: 'اجرای عملیات، مصرف قرقره و ثبت گزارش' },
+  { key_name: 'can_view_all_tickets', descr: 'مشاهده کل تیکت‌های شرکت' },
+  { key_name: 'can_manage_hardware', descr: 'مدیریت توپولوژی (KAF/OLT/FAT) و مودم‌ها' },
+  { key_name: 'can_add_fat', descr: 'ساخت FAT و کد پویای F-FAT' },
+  { key_name: 'can_manage_inventory', descr: 'مدیریت انبار قرقره‌ها و Van Stock' },
+  { key_name: 'can_cross_use_cable', descr: 'مصرف مشترک از قرقره سایر نصابان' },
+  { key_name: 'can_view_financials', descr: 'مشاهده دفتر کل و گزارش‌های مالی' },
+  { key_name: 'can_manage_tariffs', descr: 'تعریف الگوهای تعرفه، کمپین و پرداخت' },
+  { key_name: 'can_manage_users', descr: 'مدیریت کاربران و ماتریس دسترسی RBAC' },
+];
+
+async function ensureDefaultRbacIntegrity(): Promise<void> {
+  await db
+    .insert(tblPermissions)
+    .values(DEFAULT_PERMISSIONS)
+    .onConflictDoNothing();
+}
+
 let seedPromise: Promise<void> | null = null;
 
 export function ensureSeeded(): Promise<void> {
@@ -41,6 +63,7 @@ export function ensureSeeded(): Promise<void> {
 async function runIdempotentSeed(): Promise<void> {
   const existing = await db.select({ cnt: count() }).from(tblUsers);
   if ((existing[0]?.cnt ?? 0) > 0) {
+    await ensureDefaultRbacIntegrity();
     return;
   }
 
@@ -48,20 +71,7 @@ async function runIdempotentSeed(): Promise<void> {
     const doubleCheck = await tx.select({ cnt: count() }).from(tblUsers);
     if ((doubleCheck[0]?.cnt ?? 0) > 0) return;
 
-    const permsData: Array<{ key_name: string; descr: string }> = [
-      { key_name: 'can_view_dashboard', descr: 'مشاهده داشبورد و تقویم عملیاتی' },
-      { key_name: 'can_create_tickets', descr: 'ثبت تیکت ۵گانه و تنظیمات شبکه' },
-      { key_name: 'can_assign_tickets', descr: 'ارجاع تیکت به نصابان و زمان‌بندی' },
-      { key_name: 'can_execute_service', descr: 'اجرای عملیات، مصرف قرقره و ثبت گزارش' },
-      { key_name: 'can_view_all_tickets', descr: 'مشاهده کل تیکت‌های شرکت' },
-      { key_name: 'can_manage_hardware', descr: 'مدیریت توپولوژی (KAF/OLT/FAT) و مودم‌ها' },
-      { key_name: 'can_add_fat', descr: 'ساخت FAT و کد پویای F-FAT' },
-      { key_name: 'can_manage_inventory', descr: 'مدیریت انبار قرقره‌ها و Van Stock' },
-      { key_name: 'can_cross_use_cable', descr: 'مصرف مشترک از قرقره سایر نصابان' },
-      { key_name: 'can_view_financials', descr: 'مشاهده دفتر کل و گزارش‌های مالی' },
-      { key_name: 'can_manage_tariffs', descr: 'تعریف الگوهای تعرفه، کمپین و پرداخت' },
-      { key_name: 'can_manage_users', descr: 'مدیریت کاربران و ماتریس دسترسی RBAC' },
-    ];
+    const permsData = DEFAULT_PERMISSIONS;
 
     const insertedPerms = await tx
       .insert(tblPermissions)

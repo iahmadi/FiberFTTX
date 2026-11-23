@@ -613,3 +613,434 @@ export function groupScheduledTicketsByJalaliDay<T extends ScheduledTicketLike>(
   }
   return grouped;
 }
+
+export interface TicketCompletionStatItem {
+  type: TicketTypeKey;
+  label: string;
+  totalCount: number;
+  completedCount: number;
+  completionRatePct: number;
+  shareOfCompletedPct: number;
+}
+
+export interface Last30DaysCompletionSummary {
+  windowDays: number;
+  overallTotal: number;
+  overallCompleted: number;
+  overallCompletionRatePct: number;
+  byType: TicketCompletionStatItem[];
+}
+
+export function computeLast30DaysCompletionByType(
+  tickets: Array<{
+    type: TicketTypeKey;
+    status: TicketStatus;
+    created_at: string | Date;
+    completed_at?: string | Date | null;
+  }>,
+  referenceDate: Date = new Date(),
+): Last30DaysCompletionSummary {
+  const refMs = referenceDate.getTime();
+  const cutoffMs = refMs - 30 * 24 * 60 * 60 * 1000;
+
+  const statsMap = new Map<TicketTypeKey, { total: number; completed: number }>();
+  for (const tType of TICKET_TYPES) {
+    statsMap.set(tType, { total: 0, completed: 0 });
+  }
+
+  for (const ticket of tickets) {
+    const createdMs = new Date(ticket.created_at).getTime();
+    const completedMs = ticket.completed_at ? new Date(ticket.completed_at).getTime() : NaN;
+    const activeMs =
+      ticket.status === 'completed' && !Number.isNaN(completedMs) ? completedMs : createdMs;
+
+    if (Number.isNaN(activeMs) || activeMs < cutoffMs || activeMs > refMs + 24 * 60 * 60 * 1000) {
+      continue;
+    }
+
+    const bucket = statsMap.get(ticket.type);
+    if (!bucket) continue;
+    bucket.total += 1;
+    if (ticket.status === 'completed') {
+      bucket.completed += 1;
+    }
+  }
+
+  let overallTotal = 0;
+  let overallCompleted = 0;
+  for (const b of statsMap.values()) {
+    overallTotal += b.total;
+    overallCompleted += b.completed;
+  }
+
+  const byType: TicketCompletionStatItem[] = TICKET_TYPES.map((tType) => {
+    const b = statsMap.get(tType) ?? { total: 0, completed: 0 };
+    return {
+      type: tType,
+      label: TICKET_TYPE_LABELS[tType],
+      totalCount: b.total,
+      completedCount: b.completed,
+      completionRatePct: b.total > 0 ? Math.round((b.completed / b.total) * 100) : 0,
+      shareOfCompletedPct:
+        overallCompleted > 0 ? Math.round((b.completed / overallCompleted) * 100) : 0,
+    };
+  });
+
+  return {
+    windowDays: 30,
+    overallTotal,
+    overallCompleted,
+    overallCompletionRatePct:
+      overallTotal > 0 ? Math.round((overallCompleted / overallTotal) * 100) : 0,
+    byType,
+  };
+}
+
+export interface SpoolConsumptionEventLike {
+  installer_id: number;
+  installer_name?: string | null;
+  out_spool_id: number | null;
+  out_total_meter: number;
+  in_spool_id: number | null;
+  in_total_meter: number;
+  created_at: string | Date;
+}
+
+export type ReorderUrgency = 'immediate' | 'soon' | 'planned' | 'no_usage';
+
+export interface SpoolForecastItem {
+  spoolId: number;
+  spoolCode: string;
+  cableType: 'indoor' | 'outdoor';
+  installerName: string;
+  initialLength: number;
+  currentLength: number;
+  monthlyRateMeters: number;
+  dailyRateMeters: number;
+  rateSource: 'spool_history' | 'contractor_avg' | 'company_avg' | 'depletion_delta' | 'none';
+  estimatedDaysRemaining: number | null;
+  estimatedDepletionIsoDate: string | null;
+  reorderPointMeters: number;
+  daysUntilReorder: number | null;
+  recommendedReorderIsoDate: string | null;
+  urgency: ReorderUrgency;
+  recommendedActionText: string;
+}
+
+export interface ContractorMonthlyUsageItem {
+  installerId: number;
+  installerName: string;
+  outdoorMonthlyMeters: number;
+  indoorMonthlyMeters: number;
+  totalMonthlyMeters: number;
+}
+
+export interface InventoryForecastReport {
+  lookbackDays: number;
+  leadTimeDays: number;
+  avgOutdoorMonthlyMeters: number;
+  avgIndoorMonthlyMeters: number;
+  immediateReorderCount: number;
+  soonReorderCount: number;
+  contractorUsages: ContractorMonthlyUsageItem[];
+  spoolForecasts: SpoolForecastItem[];
+}
+
+function addDaysToIso(refDate: Date, days: number): string {
+  const d = new Date(refDate.getTime());
+  d.setDate(d.getDate() + days);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
+    d.getDate(),
+  ).padStart(2, '0')}`;
+}
+
+export function computeSpoolConsumptionForecasts(
+  spools: Array<SpoolRecord & { installer_name?: string | null }>,
+  events: SpoolConsumptionEventLike[],
+  options: {
+    lookbackDays?: number;
+    leadTimeDays?: number;
+    safetyStockPct?: number;
+    referenceDate?: Date;
+  } = {},
+): InventoryForecastReport {
+  const lookbackDays = Math.max(7, Math.round(options.lookbackDays ?? 30));
+  const leadTimeDays = Math.max(1, Math.round(options.leadTimeDays ?? 7));
+  const safetyStockPct = Math.max(0, Math.min(50, options.safetyStockPct ?? LOW_SPOOL_THRESHOLD_PCT));
+  const refDate = options.referenceDate ?? new Date();
+  const refMs = refDate.getTime();
+  const cutoffMs = refMs - lookbackDays * 24 * 60 * 60 * 1000;
+  const monthScale = 30 / lookbackDays;
+
+  const spoolDirectMeters = new Map<number, number>();
+  const contractorStats = new Map<
+    number,
+    { name: string; outdoorMeters: number; indoorMeters: number }
+  >();
+
+  let totalOutdoorWindow = 0;
+  let totalIndoorWindow = 0;
+
+  for (const ev of events) {
+    const evMs = new Date(ev.created_at).getTime();
+    if (Number.isNaN(evMs) || evMs < cutoffMs || evMs > refMs + 24 * 60 * 60 * 1000) continue;
+
+    if (ev.out_spool_id && ev.out_total_meter > 0) {
+      spoolDirectMeters.set(
+        ev.out_spool_id,
+        (spoolDirectMeters.get(ev.out_spool_id) ?? 0) + ev.out_total_meter,
+      );
+    }
+    if (ev.in_spool_id && ev.in_total_meter > 0) {
+      spoolDirectMeters.set(
+        ev.in_spool_id,
+        (spoolDirectMeters.get(ev.in_spool_id) ?? 0) + ev.in_total_meter,
+      );
+    }
+
+    totalOutdoorWindow += Math.max(0, ev.out_total_meter);
+    totalIndoorWindow += Math.max(0, ev.in_total_meter);
+
+    const existing = contractorStats.get(ev.installer_id) ?? {
+      name: ev.installer_name || `پیمانکار #${ev.installer_id}`,
+      outdoorMeters: 0,
+      indoorMeters: 0,
+    };
+    existing.outdoorMeters += Math.max(0, ev.out_total_meter);
+    existing.indoorMeters += Math.max(0, ev.in_total_meter);
+    contractorStats.set(ev.installer_id, existing);
+  }
+
+  const contractorUsages: ContractorMonthlyUsageItem[] = Array.from(contractorStats.entries())
+    .map(([installerId, st]) => {
+      const outdoorMonthlyMeters = Math.round(st.outdoorMeters * monthScale);
+      const indoorMonthlyMeters = Math.round(st.indoorMeters * monthScale);
+      return {
+        installerId,
+        installerName: st.name,
+        outdoorMonthlyMeters,
+        indoorMonthlyMeters,
+        totalMonthlyMeters: outdoorMonthlyMeters + indoorMonthlyMeters,
+      };
+    })
+    .filter((item) => item.totalMonthlyMeters > 0)
+    .sort((a, b) => b.totalMonthlyMeters - a.totalMonthlyMeters);
+
+  const activeContractorCount = Math.max(1, contractorUsages.length);
+  const avgOutdoorMonthlyMeters = Math.round((totalOutdoorWindow * monthScale) / activeContractorCount);
+  const avgIndoorMonthlyMeters = Math.round((totalIndoorWindow * monthScale) / activeContractorCount);
+
+  let immediateReorderCount = 0;
+  let soonReorderCount = 0;
+
+  const spoolForecasts: SpoolForecastItem[] = spools.map((sp) => {
+    const directMonthly = Math.round((spoolDirectMeters.get(sp.id) ?? 0) * monthScale);
+    const contractorUsage = sp.assigned_installer_id
+      ? contractorUsages.find((c) => c.installerId === sp.assigned_installer_id)
+      : undefined;
+    const contractorTypeMonthly = contractorUsage
+      ? sp.cable_type === 'outdoor'
+        ? contractorUsage.outdoorMonthlyMeters
+        : contractorUsage.indoorMonthlyMeters
+      : 0;
+    const companyTypeAvg =
+      sp.cable_type === 'outdoor' ? avgOutdoorMonthlyMeters : avgIndoorMonthlyMeters;
+    const observedDepletion = Math.max(0, sp.initial_length - sp.current_length);
+
+    let monthlyRateMeters = 0;
+    let rateSource: SpoolForecastItem['rateSource'] = 'none';
+
+    if (directMonthly > 0) {
+      monthlyRateMeters = directMonthly;
+      rateSource = 'spool_history';
+    } else if (contractorTypeMonthly > 0) {
+      monthlyRateMeters = contractorTypeMonthly;
+      rateSource = 'contractor_avg';
+    } else if (observedDepletion > 0) {
+      monthlyRateMeters = Math.max(1, Math.round(observedDepletion * monthScale));
+      rateSource = 'depletion_delta';
+    } else if (companyTypeAvg > 0) {
+      monthlyRateMeters = companyTypeAvg;
+      rateSource = 'company_avg';
+    }
+
+    const dailyRateMeters =
+      monthlyRateMeters > 0 ? Math.round((monthlyRateMeters / 30) * 10) / 10 : 0;
+
+    const safetyMeters = (sp.initial_length * safetyStockPct) / 100;
+
+    if (dailyRateMeters <= 0) {
+      const lowNow = isSpoolLowStock(sp, safetyStockPct);
+      if (lowNow) immediateReorderCount += 1;
+      return {
+        spoolId: sp.id,
+        spoolCode: sp.spool_code,
+        cableType: sp.cable_type,
+        installerName: sp.installer_name || 'انبار مرکزی',
+        initialLength: sp.initial_length,
+        currentLength: sp.current_length,
+        monthlyRateMeters: 0,
+        dailyRateMeters: 0,
+        rateSource: 'none',
+        estimatedDaysRemaining: null,
+        estimatedDepletionIsoDate: null,
+        reorderPointMeters: Math.round(safetyMeters),
+        daysUntilReorder: lowNow ? 0 : null,
+        recommendedReorderIsoDate: lowNow ? addDaysToIso(refDate, 0) : null,
+        urgency: lowNow ? 'immediate' : 'no_usage',
+        recommendedActionText: lowNow
+          ? 'موجودی زیر آستانه است — سفارش خرید فوری'
+          : 'مصرف اخیری برای این قرقره ثبت نشده است',
+      };
+    }
+
+    const estimatedDaysRemaining = Math.max(0, Math.round(sp.current_length / dailyRateMeters));
+    const estimatedDepletionIsoDate = addDaysToIso(refDate, estimatedDaysRemaining);
+
+    const reorderPointMeters = Math.min(
+      sp.initial_length,
+      Math.round(safetyMeters + dailyRateMeters * leadTimeDays),
+    );
+    const metersAboveSafety = Math.max(0, sp.current_length - safetyMeters);
+    const daysUntilSafety = Math.round(metersAboveSafety / dailyRateMeters);
+    const daysUntilReorder = Math.max(0, daysUntilSafety - leadTimeDays);
+    const recommendedReorderIsoDate = addDaysToIso(refDate, daysUntilReorder);
+
+    let urgency: ReorderUrgency = 'planned';
+    let recommendedActionText = `پیشنهاد ثبت سفارش تا ${toPersianDigits(daysUntilReorder)} روز آینده`;
+
+    if (sp.current_length <= safetyMeters || daysUntilReorder === 0) {
+      urgency = 'immediate';
+      immediateReorderCount += 1;
+      recommendedActionText = 'سفارش خرید فوری (امروز)';
+    } else if (daysUntilReorder <= 14) {
+      urgency = 'soon';
+      soonReorderCount += 1;
+      recommendedActionText = `نیاز به خرید مجدد طی ${toPersianDigits(daysUntilReorder)} روز آینده`;
+    }
+
+    return {
+      spoolId: sp.id,
+      spoolCode: sp.spool_code,
+      cableType: sp.cable_type,
+      installerName: sp.installer_name || 'انبار مرکزی',
+      initialLength: sp.initial_length,
+      currentLength: sp.current_length,
+      monthlyRateMeters,
+      dailyRateMeters,
+      rateSource,
+      estimatedDaysRemaining,
+      estimatedDepletionIsoDate,
+      reorderPointMeters,
+      daysUntilReorder,
+      recommendedReorderIsoDate,
+      urgency,
+      recommendedActionText,
+    };
+  });
+
+  spoolForecasts.sort((a, b) => {
+    const da = a.estimatedDaysRemaining ?? Number.MAX_SAFE_INTEGER;
+    const dbVal = b.estimatedDaysRemaining ?? Number.MAX_SAFE_INTEGER;
+    return da - dbVal;
+  });
+
+  return {
+    lookbackDays,
+    leadTimeDays,
+    avgOutdoorMonthlyMeters,
+    avgIndoorMonthlyMeters,
+    immediateReorderCount,
+    soonReorderCount,
+    contractorUsages,
+    spoolForecasts,
+  };
+}
+
+export interface RbacPolicySubject {
+  id: number;
+  role_id: number;
+  role_name: string;
+  is_active: boolean;
+  permissions: string[];
+}
+
+export interface RbacPolicyDecision {
+  allowed: boolean;
+  reason?: string;
+}
+
+export function evaluateRbacPolicy(
+  subject: RbacPolicySubject | null | undefined,
+  requiredPermissions: string[],
+  options: { requireAll?: boolean } = {},
+): RbacPolicyDecision {
+  if (!subject || !subject.is_active) {
+    return { allowed: false, reason: 'حساب کاربری غیرفعال یا فاقد نشست معتبر است.' };
+  }
+  if (!Number.isInteger(subject.role_id) || subject.role_id <= 0) {
+    return { allowed: false, reason: 'نقش کاربری معتبر برای این حساب تعریف نشده است.' };
+  }
+  if (subject.role_name === 'SuperAdmin') {
+    return { allowed: true };
+  }
+  if (requiredPermissions.length === 0) {
+    return { allowed: true };
+  }
+  const permSet = new Set(subject.permissions);
+  const hasMatch = options.requireAll
+    ? requiredPermissions.every((p) => permSet.has(p))
+    : requiredPermissions.some((p) => permSet.has(p));
+
+  if (!hasMatch) {
+    return { allowed: false, reason: 'سطح دسترسی (role_id) شما مجوز انجام این عملیات را ندارد.' };
+  }
+  return { allowed: true };
+}
+
+export interface TicketSlaStatus {
+  isBreached: boolean;
+  elapsedHours: number;
+  elapsedMinutes: number;
+  elapsedLabel: string;
+}
+
+export function evaluateTicketSla(
+  ticket: {
+    status: TicketStatus;
+    assigned_at?: string | Date | null;
+  },
+  thresholdHours = 4,
+  referenceDate: Date = new Date(),
+): TicketSlaStatus {
+  if (ticket.status !== 'pending' || !ticket.assigned_at) {
+    return { isBreached: false, elapsedHours: 0, elapsedMinutes: 0, elapsedLabel: '' };
+  }
+  const assignedMs = new Date(ticket.assigned_at).getTime();
+  if (Number.isNaN(assignedMs)) {
+    return { isBreached: false, elapsedHours: 0, elapsedMinutes: 0, elapsedLabel: '' };
+  }
+  const diffMs = Math.max(0, referenceDate.getTime() - assignedMs);
+  const totalMinutes = Math.floor(diffMs / 60000);
+  const elapsedHours = Math.floor(totalMinutes / 60);
+  const elapsedMinutes = totalMinutes % 60;
+  const isBreached = diffMs > thresholdHours * 60 * 60 * 1000;
+
+  const elapsedLabel =
+    elapsedHours >= 24
+      ? `${toPersianDigits(Math.floor(elapsedHours / 24))} روز و ${toPersianDigits(
+          elapsedHours % 24,
+        )} ساعت`
+      : elapsedMinutes > 0
+        ? `${toPersianDigits(elapsedHours)} ساعت و ${toPersianDigits(elapsedMinutes)} دقیقه`
+        : `${toPersianDigits(elapsedHours)} ساعت`;
+
+  return {
+    isBreached,
+    elapsedHours,
+    elapsedMinutes,
+    elapsedLabel,
+  };
+}
+
+

@@ -8,6 +8,7 @@ import {
   tblRoles,
   tblUsers,
 } from '../db/schema.ts';
+import { evaluateRbacPolicy } from '../lib/fiberLogic.ts';
 import { adminAuth } from '../lib/firebase-admin.ts';
 
 export interface AuthUserContext {
@@ -230,10 +231,7 @@ export function userHasPermission(
   user: AuthUserContext | undefined,
   ...requiredPerms: string[]
 ): boolean {
-  if (!user || !user.is_active) return false;
-  if (user.isSuperAdmin) return true;
-  if (requiredPerms.length === 0) return true;
-  return requiredPerms.some((perm) => user.permissions.includes(perm));
+  return evaluateRbacPolicy(user, requiredPerms).allowed;
 }
 
 export const requireAuth = async (
@@ -292,10 +290,24 @@ export const requireAuth = async (
 
 export function requirePermission(...perms: string[]) {
   return (req: AuthRequest, res: Response, next: NextFunction): void => {
-    if (!userHasPermission(req.authUser, ...perms)) {
-      res.status(403).json({ error: 'شما مجوز انجام این عملیات را ندارید.' });
+    const decision = evaluateRbacPolicy(req.authUser, perms);
+    if (!decision.allowed) {
+      res.status(403).json({ error: decision.reason || 'شما مجوز انجام این عملیات را ندارید.' });
       return;
     }
     next();
   };
 }
+
+export function requireSuperAdmin(
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): void {
+  if (!req.authUser || !req.authUser.is_active || !req.authUser.isSuperAdmin) {
+    res.status(403).json({ error: 'این عملیات فقط برای سطح دسترسی SuperAdmin مجاز است.' });
+    return;
+  }
+  next();
+}
+

@@ -1,9 +1,16 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { AlertTriangle, Cable, Package, Plus, Truck } from 'lucide-react';
+import { AlertTriangle, Cable, Package, Plus, TrendingDown, Truck } from 'lucide-react';
+import { InventoryForecastPanel } from '../components/InventoryForecastPanel';
 import { getLowSpoolWarnings, getSpoolPercentRemaining, isSpoolLowStock } from '../lib/fiberLogic';
 import { toPersianDigits } from '../lib/jalali';
 import { userHasPermission } from '../lib/permissions';
-import type { AuthUser, InventoryItemRecord, SpoolItem, VanStockItem } from '../types/erp';
+import type {
+  AuthUser,
+  InventoryItemRecord,
+  SpoolConsumptionHistoryItem,
+  SpoolItem,
+  VanStockItem,
+} from '../types/erp';
 import { apiFetch } from '../utils/api';
 
 interface InventoryPageProps {
@@ -12,6 +19,7 @@ interface InventoryPageProps {
   items: InventoryItemRecord[];
   vanStock: VanStockItem[];
   installers: Array<{ id: number; full_name: string }>;
+  consumptionHistory: SpoolConsumptionHistoryItem[];
   onRefresh: () => Promise<void>;
   onNotify: (type: 'success' | 'error' | 'warning' | 'info', title: string, desc?: string) => void;
 }
@@ -22,11 +30,13 @@ export function InventoryPage({
   items,
   vanStock,
   installers,
+  consumptionHistory,
   onRefresh,
   onNotify,
 }: InventoryPageProps) {
   const canManage = userHasPermission(user, 'can_manage_inventory');
   const alertedSpoolsRef = useRef<Set<string>>(new Set());
+  const [activeSubTab, setActiveSubTab] = useState<'stock' | 'forecast'>('stock');
 
   const [newSpoolCode, setNewSpoolCode] = useState('');
   const [newSpoolType, setNewSpoolType] = useState<'outdoor' | 'indoor'>('outdoor');
@@ -156,6 +166,47 @@ export function InventoryPage({
         </div>
       )}
 
+      <div
+        role="tablist"
+        aria-label="بخش‌های انبار و پیش‌بینی مصرف"
+        className="inline-flex flex-wrap gap-2 rounded-xl border border-slate-200 bg-white p-1.5 shadow-xs"
+      >
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeSubTab === 'stock'}
+          data-testid="tab-inventory-stock"
+          onClick={() => setActiveSubTab('stock')}
+          className={`flex min-h-[40px] items-center gap-2 rounded-lg px-4 text-xs font-bold transition-colors ${
+            activeSubTab === 'stock'
+              ? 'bg-teal-700 text-white'
+              : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+          }`}
+        >
+          <Cable className="h-4 w-4" />
+          <span>موجودی قرقره‌ها و انبار خودرو</span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeSubTab === 'forecast'}
+          data-testid="tab-inventory-forecast"
+          onClick={() => setActiveSubTab('forecast')}
+          className={`flex min-h-[40px] items-center gap-2 rounded-lg px-4 text-xs font-bold transition-colors ${
+            activeSubTab === 'forecast'
+              ? 'bg-teal-700 text-white'
+              : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+          }`}
+        >
+          <TrendingDown className="h-4 w-4" />
+          <span>تحلیل مصرف قرقره و پیش‌بینی</span>
+        </button>
+      </div>
+
+      {activeSubTab === 'forecast' ? (
+        <InventoryForecastPanel spools={spools} consumptionHistory={consumptionHistory} />
+      ) : (
+        <>
       {/* Spools Table */}
       <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-xs">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
@@ -444,6 +495,8 @@ export function InventoryPage({
           </div>
         </div>
       </div>
+        </>
+      )}
     </div>
   );
 }

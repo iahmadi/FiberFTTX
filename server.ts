@@ -34,6 +34,7 @@ import { ensureSeeded } from './src/db/seed.ts';
 import {
   TICKET_TYPES,
   calculateTemplatePriceSnapshot,
+  computeLast30DaysCompletionByType,
   computeLedgerBalance,
   evaluatePromotionForTicket,
   generateFFatCode,
@@ -60,11 +61,15 @@ import {
 } from './src/middleware/auth.ts';
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const UPLOADS_ROOT = path.resolve(process.cwd(), 'uploads');
 fs.mkdirSync(UPLOADS_ROOT, { recursive: true });
 
 app.use(express.json({ limit: '4mb' }));
+
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.json({ status: 'ok' });
+});
 
 // Static local uploads
 app.use('/uploads', express.static(UPLOADS_ROOT, { index: false }));
@@ -365,7 +370,12 @@ app.get('/api/dashboard', requireAuth, async (req: AuthRequest, res: Response) =
       })
       .from(tblServiceRecords);
 
-    const ledgerFilter = canSeeAll ? undefined : eq(tblLedger.user_id, user.id);
+    const canViewAllFinancials = userHasPermission(
+      user,
+      'can_view_financials',
+      'can_manage_tariffs',
+    );
+    const ledgerFilter = canViewAllFinancials ? undefined : eq(tblLedger.user_id, user.id);
     const ledgerRows = await db.select().from(tblLedger).where(ledgerFilter);
     const balanceSummary = computeLedgerBalance(
       ledgerRows.map((l) => ({
@@ -435,6 +445,15 @@ app.get('/api/dashboard', requireAuth, async (req: AuthRequest, res: Response) =
       })),
     );
 
+    const completionLast30Days = computeLast30DaysCompletionByType(
+      visibleTickets.map((t) => ({
+        type: t.type as TicketTypeKey,
+        status: t.status as 'pending' | 'in_progress' | 'completed',
+        created_at: t.created_at,
+        completed_at: t.completed_at,
+      })),
+    );
+
     res.json({
       kpis: {
         pendingTickets: visibleTickets.filter((t) => t.status === 'pending').length,
@@ -446,6 +465,7 @@ app.get('/api/dashboard', requireAuth, async (req: AuthRequest, res: Response) =
       },
       lowSpools,
       monthlySeries,
+      completionLast30Days,
       scheduledTickets: visibleTickets,
     });
   } catch (err) {
@@ -663,9 +683,100 @@ app.post(
   },
 );
 
+app.post(
+  '/api/tickets/:id/sla-reminder',
+  requireAuth,
+  requirePermission('can_assign_tickets', 'can_create_tickets', 'can_view_all_tickets'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const ticketId = Number(req.params.id);
+      const customMessage = String(req.body?.message || '').trim();
+
+      const rows = await db
+        .select({
+          id: tblTickets.id,
+          status: tblTickets.status,
+          customer_name: tblTickets.customer_name,
+          assigned_installer: tblTickets.assigned_installer,
+          assigned_at: tblTickets.assigned_at,
+          installer_name: tblUsers.full_name,
+        })
+        .from(tblTickets)
+        .leftJoin(tblUsers, eq(tblUsers.id, tblTickets.assigned_installer))
+        .where(eq(tblTickets.id, ticketId))
+        .limit(1);
+
+      const ticket = rows[0];
+      if (!ticket) {
+        res.status(404).json({ error: 'تیکت یافت نشد.' });
+        return;
+      }
+      if (ticket.status !== 'pending') {
+        res.status(400).json({ error: 'ارسال یادآوری SLA فقط برای تیکت‌های در انتظار اجرا مجاز است.' });
+        return;
+      }
+      if (!ticket.assigned_installer) {
+        res.status(400).json({ error: 'این تیکت هنوز به پیمانکاری ارجاع داده نشده است.' });
+        return;
+      }
+
+      const targetInstaller = ticket.installer_name || `پیمانکار #${ticket.assigned_installer}`;
+      const bodyText =
+        customMessage ||
+        `یادآوری فوری SLA: بیش از ۴ ساعت از زمان ارجاع تیکت #${ticketId} (${ticket.customer_name}) گذشته است. لطفاً وضعیت اجرا را بررسی و عملیات را آغاز نمایید.`;
+      const commentContent = `[یادآوری فوری SLA به ${targetInstaller}]: ${bodyText}`;
+
+      const [created] = await db
+        .insert(tblTicketComments)
+        .values({
+          ticket_id: ticketId,
+          user_id: req.authUser!.id,
+          comment: commentContent,
+        })
+        .returning();
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'sla_reminder_sent',
+        entityType: 'ticket',
+        entityId: ticketId,
+        summary: `ارسال یادآوری فوری SLA برای تیکت #${ticketId} به ${targetInstaller}`,
+        details: bodyText.slice(0, 160),
+      });
+
+      res.status(201).json({
+        ok: true,
+        sentTo: targetInstaller,
+        comment: {
+          ...created,
+          user_full_name: req.authUser!.full_name,
+          user_role_name: req.authUser!.role_name,
+        },
+      });
+    } catch (err) {
+      handleRouteError(res, err, 'خطا در ارسال یادآوری فوری SLA');
+    }
+  },
+);
+
 app.get('/api/tickets/:id/comments', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const ticketId = Number(req.params.id);
+    const user = req.authUser!;
+    const [ticketRow] = await db
+      .select({ assigned_installer: tblTickets.assigned_installer })
+      .from(tblTickets)
+      .where(eq(tblTickets.id, ticketId))
+      .limit(1);
+    if (!ticketRow) {
+      res.status(404).json({ error: 'تیکت یافت نشد.' });
+      return;
+    }
+    if (!userHasPermission(user, 'can_view_all_tickets') && ticketRow.assigned_installer !== user.id) {
+      res.status(403).json({ error: 'شما مجوز مشاهده نظرات این تیکت را ندارید.' });
+      return;
+    }
+
     const comments = await db
       .select({
         id: tblTicketComments.id,
@@ -692,6 +803,7 @@ app.get('/api/tickets/:id/comments', requireAuth, async (req: AuthRequest, res: 
 app.post('/api/tickets/:id/comments', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const ticketId = Number(req.params.id);
+    const user = req.authUser!;
     const commentText = String(req.body?.comment || '').trim();
     if (!commentText) {
       res.status(400).json({ error: 'متن گزارش یا نظر نمی‌تواند خالی باشد.' });
@@ -699,12 +811,19 @@ app.post('/api/tickets/:id/comments', requireAuth, async (req: AuthRequest, res:
     }
 
     const ticketExists = await db
-      .select({ id: tblTickets.id })
+      .select({ id: tblTickets.id, assigned_installer: tblTickets.assigned_installer })
       .from(tblTickets)
       .where(eq(tblTickets.id, ticketId))
       .limit(1);
     if (!ticketExists[0]) {
       res.status(404).json({ error: 'تیکت یافت نشد.' });
+      return;
+    }
+    if (
+      !userHasPermission(user, 'can_view_all_tickets') &&
+      ticketExists[0].assigned_installer !== user.id
+    ) {
+      res.status(403).json({ error: 'شما مجوز ثبت نظر روی این تیکت را ندارید.' });
       return;
     }
 
@@ -745,6 +864,7 @@ app.post('/api/tickets/:id/comments', requireAuth, async (req: AuthRequest, res:
 app.get('/api/tickets/:id/service-record', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const ticketId = Number(req.params.id);
+    const user = req.authUser!;
     const rows = await db
       .select()
       .from(tblServiceRecords)
@@ -757,6 +877,14 @@ app.get('/api/tickets/:id/service-record', requireAuth, async (req: AuthRequest,
     }
 
     const [ticket] = await db.select().from(tblTickets).where(eq(tblTickets.id, ticketId)).limit(1);
+    if (
+      !userHasPermission(user, 'can_view_all_tickets', 'can_view_financials') &&
+      rec.installer_id !== user.id &&
+      ticket?.assigned_installer !== user.id
+    ) {
+      res.status(403).json({ error: 'شما مجوز مشاهده فاکتور و صورت‌جلسه این تیکت را ندارید.' });
+      return;
+    }
     const [installer] = await db
       .select({ full_name: tblUsers.full_name })
       .from(tblUsers)
@@ -1214,7 +1342,11 @@ app.post(
 // HARDWARE TOPOLOGY & MODEM BRANDS
 // ==========================================
 
-app.get('/api/hardware', requireAuth, async (_req: AuthRequest, res: Response) => {
+app.get(
+  '/api/hardware',
+  requireAuth,
+  requirePermission('can_manage_hardware', 'can_add_fat', 'can_execute_service'),
+  async (_req: AuthRequest, res: Response) => {
   try {
     await ensureSeeded();
     const kafs = await db.select().from(tblKafos).orderBy(tblKafos.id);
@@ -1357,7 +1489,11 @@ app.post(
 // INVENTORY, SPOOLS & VAN STOCK
 // ==========================================
 
-app.get('/api/inventory', requireAuth, async (_req: AuthRequest, res: Response) => {
+app.get(
+  '/api/inventory',
+  requireAuth,
+  requirePermission('can_manage_inventory', 'can_execute_service'),
+  async (_req: AuthRequest, res: Response) => {
   try {
     await ensureSeeded();
     const spools = await db
@@ -1425,7 +1561,61 @@ app.get('/api/inventory', requireAuth, async (_req: AuthRequest, res: Response) 
       .from(tblUsers)
       .where(eq(tblUsers.is_active, true));
 
-    res.json({ spools, items, vanStock, installers });
+    const serviceConsumption = await db
+      .select({
+        installer_id: tblServiceRecords.installer_id,
+        installer_name: tblUsers.full_name,
+        out_spool_id: tblServiceRecords.out_spool_id,
+        out_total_meter: tblServiceRecords.out_total_meter,
+        in_spool_id: tblServiceRecords.in_spool_id,
+        in_total_meter: tblServiceRecords.in_total_meter,
+        created_at: tblServiceRecords.created_at,
+      })
+      .from(tblServiceRecords)
+      .leftJoin(tblUsers, eq(tblUsers.id, tblServiceRecords.installer_id))
+      .orderBy(desc(tblServiceRecords.created_at));
+
+    const spoolAdjustLogs = await db
+      .select({
+        entity_id: tblActivityLogs.entity_id,
+        user_id: tblActivityLogs.user_id,
+        summary: tblActivityLogs.summary,
+        created_at: tblActivityLogs.created_at,
+      })
+      .from(tblActivityLogs)
+      .where(
+        and(
+          eq(tblActivityLogs.entity_type, 'spool'),
+          eq(tblActivityLogs.action_type, 'inventory_adjusted'),
+        ),
+      )
+      .orderBy(desc(tblActivityLogs.created_at));
+
+    const spoolById = new Map(spools.map((sp) => [sp.id, sp]));
+    const manualConsumption = spoolAdjustLogs.flatMap((log) => {
+      if (!log.entity_id) return [];
+      const sp = spoolById.get(log.entity_id);
+      if (!sp) return [];
+      const match = /کسر\s+(\d+)\s+متر/.exec(log.summary);
+      const meters = match ? Number(match[1]) : 0;
+      if (meters <= 0) return [];
+      const installerId = sp.assigned_installer_id ?? log.user_id ?? 0;
+      return [
+        {
+          installer_id: installerId,
+          installer_name: sp.installer_name ?? null,
+          out_spool_id: sp.cable_type === 'outdoor' ? sp.id : null,
+          out_total_meter: sp.cable_type === 'outdoor' ? meters : 0,
+          in_spool_id: sp.cable_type === 'indoor' ? sp.id : null,
+          in_total_meter: sp.cable_type === 'indoor' ? meters : 0,
+          created_at: log.created_at,
+        },
+      ];
+    });
+
+    const consumptionHistory = [...serviceConsumption, ...manualConsumption];
+
+    res.json({ spools, items, vanStock, installers, consumptionHistory });
   } catch (err) {
     handleRouteError(res, err, 'خطا در دریافت موجودی انبار');
   }
@@ -1610,35 +1800,44 @@ app.post(
 // FINANCIALS, TARIFF TEMPLATES, PROMOTIONS & PAYOUTS
 // ==========================================
 
-app.get('/api/financial', requireAuth, async (req: AuthRequest, res: Response) => {
-  try {
-    await ensureSeeded();
-    const user = req.authUser!;
-    const canSeeAll = userHasPermission(user, 'can_view_financials', 'can_manage_tariffs');
+app.get(
+  '/api/financial',
+  requireAuth,
+  requirePermission('can_view_financials', 'can_manage_tariffs', 'can_execute_service'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      await ensureSeeded();
+      const user = req.authUser!;
+      const canSeeAll = userHasPermission(user, 'can_view_financials', 'can_manage_tariffs');
 
-    const templates = await db.select().from(tblTariffTemplates).orderBy(tblTariffTemplates.id);
-    const rawPromos = await db.select().from(tblPromotions).orderBy(tblPromotions.id);
-    const promotions = rawPromos.map((p) => ({
-      ...p,
-      reward_amount: Number(p.reward_amount),
-      start_date: String(p.start_date),
-      end_date: String(p.end_date),
-    }));
+      const templates = canSeeAll
+        ? await db.select().from(tblTariffTemplates).orderBy(tblTariffTemplates.id)
+        : [];
+      const rawPromos = await db.select().from(tblPromotions).orderBy(tblPromotions.id);
+      const promotions = rawPromos.map((p) => ({
+        ...p,
+        reward_amount: Number(p.reward_amount),
+        start_date: String(p.start_date),
+        end_date: String(p.end_date),
+      }));
 
-    const userTariffs = await db
-      .select({
-        user_id: tblUserTariffs.user_id,
-        username: tblUsers.username,
-        full_name: tblUsers.full_name,
-        template_id: tblUserTariffs.template_id,
-        template_name: tblTariffTemplates.name,
-        promotion_id: tblUserTariffs.promotion_id,
-        promotion_name: tblPromotions.name,
-      })
-      .from(tblUserTariffs)
-      .innerJoin(tblUsers, eq(tblUsers.id, tblUserTariffs.user_id))
-      .innerJoin(tblTariffTemplates, eq(tblTariffTemplates.id, tblUserTariffs.template_id))
-      .leftJoin(tblPromotions, eq(tblPromotions.id, tblUserTariffs.promotion_id));
+      const allUserTariffs = await db
+        .select({
+          user_id: tblUserTariffs.user_id,
+          username: tblUsers.username,
+          full_name: tblUsers.full_name,
+          template_id: tblUserTariffs.template_id,
+          template_name: tblTariffTemplates.name,
+          promotion_id: tblUserTariffs.promotion_id,
+          promotion_name: tblPromotions.name,
+        })
+        .from(tblUserTariffs)
+        .innerJoin(tblUsers, eq(tblUsers.id, tblUserTariffs.user_id))
+        .innerJoin(tblTariffTemplates, eq(tblTariffTemplates.id, tblUserTariffs.template_id))
+        .leftJoin(tblPromotions, eq(tblPromotions.id, tblUserTariffs.promotion_id));
+      const userTariffs = canSeeAll
+        ? allUserTariffs
+        : allUserTariffs.filter((ut) => ut.user_id === user.id);
 
     const ledgerFilter = canSeeAll ? undefined : eq(tblLedger.user_id, user.id);
     const ledgerRows = await db
@@ -2023,6 +2222,161 @@ app.patch(
       res.json({ user: updated });
     } catch (err) {
       handleRouteError(res, err);
+    }
+  },
+);
+
+app.post(
+  '/api/roles',
+  requireAuth,
+  requirePermission('can_manage_users'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const name = String(req.body?.name || '').trim();
+      const permissionIds = Array.isArray(req.body?.permissionIds)
+        ? (req.body.permissionIds as number[]).map(Number).filter((n) => Number.isInteger(n) && n > 0)
+        : [];
+      if (name.length < 2 || name.length > 60) {
+        res.status(400).json({ error: 'نام سطح دسترسی باید بین ۲ تا ۶۰ کاراکتر باشد.' });
+        return;
+      }
+
+      const existing = await db.select().from(tblRoles).where(eq(tblRoles.name, name)).limit(1);
+      if (existing[0]) {
+        res.status(409).json({ error: 'سطح دسترسی با این نام قبلاً ثبت شده است.' });
+        return;
+      }
+
+      const created = await db.transaction(async (tx) => {
+        const [role] = await tx.insert(tblRoles).values({ name }).returning();
+        if (permissionIds.length > 0) {
+          await tx
+            .insert(tblRolePermissions)
+            .values(permissionIds.map((permission_id) => ({ role_id: role.id, permission_id })));
+        }
+        return role;
+      });
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'role_created',
+        entityType: 'role',
+        entityId: created.id,
+        summary: `ایجاد سطح دسترسی جدید «${name}» (${permissionIds.length} مجوز)`,
+      });
+
+      res.status(201).json({ role: { ...created, permissionIds } });
+    } catch (err) {
+      handleRouteError(res, err, 'خطا در ایجاد سطح دسترسی جدید');
+    }
+  },
+);
+
+app.patch(
+  '/api/roles/:id',
+  requireAuth,
+  requirePermission('can_manage_users'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const roleId = Number(req.params.id);
+      const [existing] = await db.select().from(tblRoles).where(eq(tblRoles.id, roleId)).limit(1);
+      if (!existing) {
+        res.status(404).json({ error: 'سطح دسترسی یافت نشد.' });
+        return;
+      }
+      if (existing.name === 'SuperAdmin') {
+        res.status(403).json({ error: 'نقش اصلی SuperAdmin قابل تغییر نام یا محدودسازی نیست.' });
+        return;
+      }
+
+      const nextName =
+        typeof req.body?.name === 'string' ? req.body.name.trim() : existing.name;
+      if (nextName.length < 2 || nextName.length > 60) {
+        res.status(400).json({ error: 'نام سطح دسترسی باید بین ۲ تا ۶۰ کاراکتر باشد.' });
+        return;
+      }
+      if (nextName !== existing.name) {
+        const dup = await db.select().from(tblRoles).where(eq(tblRoles.name, nextName)).limit(1);
+        if (dup[0] && dup[0].id !== roleId) {
+          res.status(409).json({ error: 'نام انتخاب‌شده برای سطح دسترسی تکراری است.' });
+          return;
+        }
+      }
+
+      const hasPermsPayload = Array.isArray(req.body?.permissionIds);
+      const permissionIds = hasPermsPayload
+        ? (req.body.permissionIds as number[]).map(Number).filter((n) => Number.isInteger(n) && n > 0)
+        : null;
+
+      const updated = await db.transaction(async (tx) => {
+        const [role] = await tx
+          .update(tblRoles)
+          .set({ name: nextName })
+          .where(eq(tblRoles.id, roleId))
+          .returning();
+        if (permissionIds !== null) {
+          await tx.delete(tblRolePermissions).where(eq(tblRolePermissions.role_id, roleId));
+          if (permissionIds.length > 0) {
+            await tx
+              .insert(tblRolePermissions)
+              .values(permissionIds.map((permission_id) => ({ role_id: roleId, permission_id })));
+          }
+        }
+        return role;
+      });
+
+      await logActivity({
+        user: req.authUser,
+        actionType: 'role_updated',
+        entityType: 'role',
+        entityId: roleId,
+        summary: `ویرایش سطح دسترسی «${existing.name}» به «${nextName}»`,
+      });
+
+      res.json({ role: updated });
+    } catch (err) {
+      handleRouteError(res, err, 'خطا در ویرایش سطح دسترسی');
+    }
+  },
+);
+
+app.delete(
+  '/api/roles/:id',
+  requireAuth,
+  requirePermission('can_manage_users'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const roleId = Number(req.params.id);
+      const [existing] = await db.select().from(tblRoles).where(eq(tblRoles.id, roleId)).limit(1);
+      if (!existing) {
+        res.status(404).json({ error: 'سطح دسترسی یافت نشد.' });
+        return;
+      }
+      if (existing.name === 'SuperAdmin') {
+        res.status(403).json({ error: 'نقش SuperAdmin قابل حذف نیست.' });
+        return;
+      }
+      const assigned = await db
+        .select({ id: tblUsers.id })
+        .from(tblUsers)
+        .where(eq(tblUsers.role_id, roleId))
+        .limit(1);
+      if (assigned[0]) {
+        res.status(400).json({ error: 'این سطح دسترسی به کاربرانی تخصیص یافته و قابل حذف نیست.' });
+        return;
+      }
+
+      await db.delete(tblRoles).where(eq(tblRoles.id, roleId));
+      await logActivity({
+        user: req.authUser,
+        actionType: 'role_deleted',
+        entityType: 'role',
+        entityId: roleId,
+        summary: `حذف سطح دسترسی «${existing.name}»`,
+      });
+      res.json({ ok: true });
+    } catch (err) {
+      handleRouteError(res, err, 'خطا در حذف سطح دسترسی');
     }
   },
 );

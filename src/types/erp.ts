@@ -240,3 +240,14 @@ export interface PermissionDef {
   key_name: string;
   descr: string;
 }
+
+export interface SpoolConsumptionHistoryItem {
+  installer_id: number;
+  installer_name: string | null;
+  out_spool_id: number | null;
+  out_total_meter: number;
+  in_spool_id: number | null;
+  in_total_meter: number;
+  created_at: string;
+}
+

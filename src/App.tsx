@@ -34,6 +34,7 @@ import type {
   PermissionDef,
   PromotionItem,
   RoleWithPerms,
+  SpoolConsumptionHistoryItem,
   SpoolItem,
   TariffTemplateItem,
   TicketItem,
@@ -81,6 +82,7 @@ export default function App() {
   const [inventoryInstallers, setInventoryInstallers] = useState<
     Array<{ id: number; full_name: string }>
   >([]);
+  const [consumptionHistory, setConsumptionHistory] = useState<SpoolConsumptionHistoryItem[]>([]);
 
   const [templates, setTemplates] = useState<TariffTemplateItem[]>([]);
   const [promotions, setPromotions] = useState<PromotionItem[]>([]);
@@ -113,133 +115,208 @@ export default function App() {
   }, []);
 
   const loadAllData = useCallback(async (currentUser: AuthUser) => {
-    try {
-      const [dashRes, tktRes, hwRes, invRes, finRes] = await Promise.all([
-        apiFetch<DashboardPayload>('/api/dashboard'),
-        apiFetch<{
-          tickets: TicketItem[];
-          installers: Array<{ id: number; full_name: string; username: string; role_name: string }>;
-        }>('/api/tickets'),
-        apiFetch<{
-          kafs: KafItem[];
-          olts: OltItem[];
-          fats: FatItem[];
-          ffats: FFatItem[];
-          modemBrands: ModemBrandItem[];
-        }>('/api/hardware'),
-        apiFetch<{
-          spools: SpoolItem[];
-          items: InventoryItemRecord[];
-          vanStock: VanStockItem[];
-          installers: Array<{ id: number; full_name: string }>;
-        }>('/api/inventory'),
-        apiFetch<{
-          templates: TariffTemplateItem[];
-          promotions: PromotionItem[];
-          userTariffs: UserTariffAssignment[];
-          ledger: LedgerEntryItem[];
-          contractorSummaries: ContractorBalanceSummary[];
-          users: Array<{ id: number; username: string; full_name: string }>;
-        }>('/api/financial'),
-      ]);
+    const canHardware = userHasPermission(
+      currentUser,
+      'can_manage_hardware',
+      'can_add_fat',
+      'can_execute_service',
+    );
+    const canInventory = userHasPermission(
+      currentUser,
+      'can_manage_inventory',
+      'can_execute_service',
+    );
+    const canFinancial = userHasPermission(
+      currentUser,
+      'can_view_financials',
+      'can_manage_tariffs',
+      'can_execute_service',
+    );
+    const canUsers = userHasPermission(currentUser, 'can_manage_users');
 
-      setDashboardData(dashRes);
-      setTickets(tktRes.tickets);
-      setTicketInstallers(tktRes.installers);
-      setKafs(hwRes.kafs);
-      setOlts(hwRes.olts);
-      setFats(hwRes.fats);
-      setFfats(hwRes.ffats);
-      setModemBrands(hwRes.modemBrands);
-      setSpools(invRes.spools);
-      setInventoryItems(invRes.items);
-      setVanStock(invRes.vanStock);
-      setInventoryInstallers(invRes.installers);
-      setTemplates(finRes.templates);
-      setPromotions(finRes.promotions);
-      setUserTariffs(finRes.userTariffs);
-      setLedger(finRes.ledger);
-      setContractorSummaries(finRes.contractorSummaries);
-      setFinancialUsers(finRes.users);
-
-      await Promise.all([
-        saveOfflineSnapshot('dashboard', dashRes),
-        saveOfflineSnapshot('tickets', tktRes),
-        saveOfflineSnapshot('hardware', hwRes),
-        saveOfflineSnapshot('inventory', invRes),
-        saveOfflineSnapshot('financial', finRes),
-      ]);
-
-      if (userHasPermission(currentUser, 'can_manage_users')) {
-        const [usersRes, logsRes] = await Promise.all([
-          apiFetch<{
+    const [dashRes, tktRes, hwRes, invRes, finRes, usersRes, logsRes] = await Promise.allSettled([
+      apiFetch<DashboardPayload>('/api/dashboard'),
+      apiFetch<{
+        tickets: TicketItem[];
+        installers: Array<{ id: number; full_name: string; username: string; role_name: string }>;
+      }>('/api/tickets'),
+      canHardware
+        ? apiFetch<{
+            kafs: KafItem[];
+            olts: OltItem[];
+            fats: FatItem[];
+            ffats: FFatItem[];
+            modemBrands: ModemBrandItem[];
+          }>('/api/hardware')
+        : Promise.resolve(null),
+      canInventory
+        ? apiFetch<{
+            spools: SpoolItem[];
+            items: InventoryItemRecord[];
+            vanStock: VanStockItem[];
+            installers: Array<{ id: number; full_name: string }>;
+            consumptionHistory?: SpoolConsumptionHistoryItem[];
+          }>('/api/inventory')
+        : Promise.resolve(null),
+      canFinancial
+        ? apiFetch<{
+            templates: TariffTemplateItem[];
+            promotions: PromotionItem[];
+            userTariffs: UserTariffAssignment[];
+            ledger: LedgerEntryItem[];
+            contractorSummaries: ContractorBalanceSummary[];
+            users: Array<{ id: number; username: string; full_name: string }>;
+          }>('/api/financial')
+        : Promise.resolve(null),
+      canUsers
+        ? apiFetch<{
             users: UserAccountRow[];
             roles: RoleWithPerms[];
             permissions: PermissionDef[];
-          }>('/api/users'),
-          apiFetch<{ logs: ActivityLogItem[] }>('/api/activity-logs'),
-        ]);
-        setAdminUsers(usersRes.users);
-        setRoles(usersRes.roles);
-        setPermissions(usersRes.permissions);
-        setActivityLogs(logsRes.logs);
-      }
-    } catch {
-      // Offline fallback: hydrate snapshots from IndexedDB
-      const [dashSnap, tktSnap, hwSnap, invSnap, finSnap] = await Promise.all([
-        loadOfflineSnapshot<DashboardPayload>('dashboard'),
-        loadOfflineSnapshot<{
-          tickets: TicketItem[];
-          installers: Array<{ id: number; full_name: string; username: string; role_name: string }>;
-        }>('tickets'),
-        loadOfflineSnapshot<{
-          kafs: KafItem[];
-          olts: OltItem[];
-          fats: FatItem[];
-          ffats: FFatItem[];
-          modemBrands: ModemBrandItem[];
-        }>('hardware'),
-        loadOfflineSnapshot<{
-          spools: SpoolItem[];
-          items: InventoryItemRecord[];
-          vanStock: VanStockItem[];
-          installers: Array<{ id: number; full_name: string }>;
-        }>('inventory'),
-        loadOfflineSnapshot<{
-          templates: TariffTemplateItem[];
-          promotions: PromotionItem[];
-          userTariffs: UserTariffAssignment[];
-          ledger: LedgerEntryItem[];
-          contractorSummaries: ContractorBalanceSummary[];
-          users: Array<{ id: number; username: string; full_name: string }>;
-        }>('financial'),
-      ]);
+          }>('/api/users')
+        : Promise.resolve(null),
+      canUsers
+        ? apiFetch<{ logs: ActivityLogItem[] }>('/api/activity-logs')
+        : Promise.resolve(null),
+    ]);
+
+    if (dashRes.status === 'fulfilled') {
+      setDashboardData(dashRes.value);
+      await saveOfflineSnapshot('dashboard', dashRes.value);
+    } else {
+      const dashSnap = await loadOfflineSnapshot<DashboardPayload>('dashboard');
       if (dashSnap) setDashboardData(dashSnap);
+    }
+
+    if (tktRes.status === 'fulfilled') {
+      setTickets(tktRes.value.tickets);
+      setTicketInstallers(tktRes.value.installers);
+      await saveOfflineSnapshot('tickets', tktRes.value);
+    } else {
+      const tktSnap = await loadOfflineSnapshot<{
+        tickets: TicketItem[];
+        installers: Array<{ id: number; full_name: string; username: string; role_name: string }>;
+      }>('tickets');
       if (tktSnap) {
         setTickets(tktSnap.tickets);
         setTicketInstallers(tktSnap.installers);
       }
-      if (hwSnap) {
-        setKafs(hwSnap.kafs);
-        setOlts(hwSnap.olts);
-        setFats(hwSnap.fats);
-        setFfats(hwSnap.ffats);
-        setModemBrands(hwSnap.modemBrands);
+    }
+
+    if (canHardware) {
+      if (hwRes.status === 'fulfilled' && hwRes.value) {
+        setKafs(hwRes.value.kafs);
+        setOlts(hwRes.value.olts);
+        setFats(hwRes.value.fats);
+        setFfats(hwRes.value.ffats);
+        setModemBrands(hwRes.value.modemBrands);
+        await saveOfflineSnapshot('hardware', hwRes.value);
+      } else {
+        const hwSnap = await loadOfflineSnapshot<{
+          kafs: KafItem[];
+          olts: OltItem[];
+          fats: FatItem[];
+          ffats: FFatItem[];
+          modemBrands: ModemBrandItem[];
+        }>('hardware');
+        if (hwSnap) {
+          setKafs(hwSnap.kafs);
+          setOlts(hwSnap.olts);
+          setFats(hwSnap.fats);
+          setFfats(hwSnap.ffats);
+          setModemBrands(hwSnap.modemBrands);
+        }
       }
-      if (invSnap) {
-        setSpools(invSnap.spools);
-        setInventoryItems(invSnap.items);
-        setVanStock(invSnap.vanStock);
-        setInventoryInstallers(invSnap.installers);
+    } else {
+      setKafs([]);
+      setOlts([]);
+      setFats([]);
+      setFfats([]);
+      setModemBrands([]);
+    }
+
+    if (canInventory) {
+      if (invRes.status === 'fulfilled' && invRes.value) {
+        setSpools(invRes.value.spools);
+        setInventoryItems(invRes.value.items);
+        setVanStock(invRes.value.vanStock);
+        setInventoryInstallers(invRes.value.installers);
+        setConsumptionHistory(invRes.value.consumptionHistory ?? []);
+        await saveOfflineSnapshot('inventory', invRes.value);
+      } else {
+        const invSnap = await loadOfflineSnapshot<{
+          spools: SpoolItem[];
+          items: InventoryItemRecord[];
+          vanStock: VanStockItem[];
+          installers: Array<{ id: number; full_name: string }>;
+          consumptionHistory?: SpoolConsumptionHistoryItem[];
+        }>('inventory');
+        if (invSnap) {
+          setSpools(invSnap.spools);
+          setInventoryItems(invSnap.items);
+          setVanStock(invSnap.vanStock);
+          setInventoryInstallers(invSnap.installers);
+          setConsumptionHistory(invSnap.consumptionHistory ?? []);
+        }
       }
-      if (finSnap) {
-        setTemplates(finSnap.templates);
-        setPromotions(finSnap.promotions);
-        setUserTariffs(finSnap.userTariffs);
-        setLedger(finSnap.ledger);
-        setContractorSummaries(finSnap.contractorSummaries);
-        setFinancialUsers(finSnap.users);
+    } else {
+      setSpools([]);
+      setInventoryItems([]);
+      setVanStock([]);
+      setInventoryInstallers([]);
+      setConsumptionHistory([]);
+    }
+
+    if (canFinancial) {
+      if (finRes.status === 'fulfilled' && finRes.value) {
+        setTemplates(finRes.value.templates);
+        setPromotions(finRes.value.promotions);
+        setUserTariffs(finRes.value.userTariffs);
+        setLedger(finRes.value.ledger);
+        setContractorSummaries(finRes.value.contractorSummaries);
+        setFinancialUsers(finRes.value.users);
+        await saveOfflineSnapshot('financial', finRes.value);
+      } else {
+        const finSnap = await loadOfflineSnapshot<{
+          templates: TariffTemplateItem[];
+          promotions: PromotionItem[];
+          userTariffs: UserTariffAssignment[];
+          ledger: LedgerEntryItem[];
+          contractorSummaries: ContractorBalanceSummary[];
+          users: Array<{ id: number; username: string; full_name: string }>;
+        }>('financial');
+        if (finSnap) {
+          setTemplates(finSnap.templates);
+          setPromotions(finSnap.promotions);
+          setUserTariffs(finSnap.userTariffs);
+          setLedger(finSnap.ledger);
+          setContractorSummaries(finSnap.contractorSummaries);
+          setFinancialUsers(finSnap.users);
+        }
       }
+    } else {
+      setTemplates([]);
+      setPromotions([]);
+      setUserTariffs([]);
+      setLedger([]);
+      setContractorSummaries([]);
+      setFinancialUsers([]);
+    }
+
+    if (canUsers && usersRes.status === 'fulfilled' && usersRes.value) {
+      setAdminUsers(usersRes.value.users);
+      setRoles(usersRes.value.roles);
+      setPermissions(usersRes.value.permissions);
+    } else if (!canUsers) {
+      setAdminUsers([]);
+      setRoles([]);
+      setPermissions([]);
+    }
+
+    if (canUsers && logsRes.status === 'fulfilled' && logsRes.value) {
+      setActivityLogs(logsRes.value.logs);
+    } else if (!canUsers) {
+      setActivityLogs([]);
     }
   }, []);
 
@@ -464,6 +541,7 @@ export default function App() {
             items={inventoryItems}
             vanStock={vanStock}
             installers={inventoryInstallers}
+            consumptionHistory={consumptionHistory}
             onRefresh={() => loadAllData(user)}
             onNotify={notify}
           />

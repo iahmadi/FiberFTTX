@@ -4,7 +4,12 @@ import {
   type MonthlyDashboardPoint,
 } from '../components/MonthlyStatsRecharts';
 import { ScheduledTicketsCalendarWidget } from '../components/ScheduledTicketsCalendarWidget';
-import type { SpoolWarningItem } from '../lib/fiberLogic';
+import { TicketCompletionPieWidget } from '../components/TicketCompletionPieWidget';
+import {
+  computeLast30DaysCompletionByType,
+  type Last30DaysCompletionSummary,
+  type SpoolWarningItem,
+} from '../lib/fiberLogic';
 import { formatCurrencyToman, toPersianDigits } from '../lib/jalali';
 import type { TicketItem } from '../types/erp';
 
@@ -19,6 +24,7 @@ export interface DashboardPayload {
   };
   lowSpools: SpoolWarningItem[];
   monthlySeries: MonthlyDashboardPoint[];
+  completionLast30Days?: Last30DaysCompletionSummary;
   scheduledTickets: TicketItem[];
 }
 
@@ -148,8 +154,14 @@ export function DashboardPage({
       </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-12">
-        <div className="xl:col-span-7">
+        <div className="space-y-6 xl:col-span-7">
           <MonthlyStatsRecharts data={data.monthlySeries} />
+          <TicketCompletionPieWidget
+            summary={
+              data.completionLast30Days ??
+              computeLast30DaysCompletionByType(data.scheduledTickets)
+            }
+          />
         </div>
         <div className="xl:col-span-5">
           <ScheduledTicketsCalendarWidget
