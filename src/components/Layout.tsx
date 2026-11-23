@@ -98,7 +98,10 @@ export function Layout({
       key: 'financial',
       label: 'مالی و تعرفه‌ها',
       icon: <Wallet className="h-4 w-4" />,
-      visible: () => hasPerm('can_view_financials') || hasPerm('can_manage_tariffs'),
+      visible: () =>
+        hasPerm('can_view_financials') ||
+        hasPerm('can_manage_tariffs') ||
+        hasPerm('can_execute_service'),
     },
     {
       key: 'users',

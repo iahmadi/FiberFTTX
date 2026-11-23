@@ -1,11 +1,22 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
-import { Eye, Plus, Search, UserPlus, Wrench, X } from 'lucide-react';
+import { Eye, FileText, Plus, Printer, Search, Settings2, UserPlus, Wrench, X } from 'lucide-react';
 import type { AuthUser, ServiceRecordDetail, TicketItem } from '../types/erp';
 import { apiFetch } from '../utils/api';
-import { formatDateTimeToJalali, formatToman, toPersianDigits } from '../lib/jalali';
+import {
+  formatDateTimeToJalali,
+  formatJalaliYmd,
+  formatToman,
+  getTodayJalali,
+  jalaliYmdToIso,
+  toPersianDigits,
+} from '../lib/jalali';
+import { hasTicketProvisioningConfig } from '../lib/fiberLogic';
 import { filterTicketsByQuery } from '../lib/searchFilter';
 import { Modal } from '../components/Modal';
+import { JalaliDatePicker } from '../components/JalaliDatePicker';
 import { SearchableSelect } from '../components/SearchableSelect';
+import { ProvisioningConfigBox } from '../components/ProvisioningConfigBox';
+import { ServiceRecordPdfReport } from '../components/ServiceRecordPdfReport';
 
 interface InstallerOption {
   id: number;
@@ -35,15 +46,37 @@ export function TicketsPage({ user, onStartTicketService }: TicketsPageProps) {
   const [address, setAddress] = useState('');
   const [ticketType, setTicketType] = useState<'install' | 'fault'>('install');
   const [createInstallerId, setCreateInstallerId] = useState('');
+  const [showCreateConfig, setShowCreateConfig] = useState(false);
+  const [pppoeUser, setPppoeUser] = useState('');
+  const [pppoePass, setPppoePass] = useState('');
+  const [vlanId, setVlanId] = useState('');
+  const [hasVoip, setHasVoip] = useState(false);
+  const [voipData, setVoipData] = useState('');
+  const [operatorNotes, setOperatorNotes] = useState('');
+  const [scheduledDateJalali, setScheduledDateJalali] = useState(() => {
+    const t = getTodayJalali();
+    return formatJalaliYmd(t.jy, t.jm, t.jd, false);
+  });
+  const [scheduledTime, setScheduledTime] = useState('10:00');
   const [submitting, setSubmitting] = useState(false);
+
+  // View / Edit Ticket Provisioning Config Modal
+  const [configTicket, setConfigTicket] = useState<TicketItem | null>(null);
+  const [editPppoeUser, setEditPppoeUser] = useState('');
+  const [editPppoePass, setEditPppoePass] = useState('');
+  const [editVlanId, setEditVlanId] = useState('');
+  const [editHasVoip, setEditHasVoip] = useState(false);
+  const [editVoipData, setEditVoipData] = useState('');
+  const [editOperatorNotes, setEditOperatorNotes] = useState('');
 
   // Assign Installer Modal
   const [assignTicket, setAssignTicket] = useState<TicketItem | null>(null);
   const [assignInstallerId, setAssignInstallerId] = useState('');
 
-  // View Completed Service Record Modal
+  // View Completed Service Record Modal & PDF report preview
   const [detailRecord, setDetailRecord] = useState<ServiceRecordDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [pdfRecord, setPdfRecord] = useState<ServiceRecordDetail | null>(null);
 
   const canCreate = user.isSuperAdmin || user.permissions.includes('can_create_tickets');
   const canAssign = user.isSuperAdmin || user.permissions.includes('can_assign_tickets');
@@ -97,15 +130,69 @@ export function TicketsPage({ user, onStartTicketService }: TicketsPageProps) {
           address,
           type: ticketType,
           assigned_installer: createInstallerId ? Number(createInstallerId) : null,
+          config_pppoe_user: pppoeUser.trim() || null,
+          config_pppoe_pass: pppoePass.trim() || null,
+          config_vlan: vlanId.trim() ? Number(vlanId) : null,
+          has_voip: hasVoip ? 1 : 0,
+          config_voip_data: hasVoip ? voipData.trim() || null : null,
+          operator_notes: operatorNotes.trim() || null,
+          scheduled_date: scheduledDateJalali ? jalaliYmdToIso(scheduledDateJalali) : null,
+          scheduled_time: scheduledDateJalali && scheduledTime ? scheduledTime : null,
         }),
       });
       setCustomerName('');
       setAddress('');
       setCreateInstallerId('');
+      setShowCreateConfig(false);
+      setPppoeUser('');
+      setPppoePass('');
+      setVlanId('');
+      setHasVoip(false);
+      setVoipData('');
+      setOperatorNotes('');
+      const todayJ = getTodayJalali();
+      setScheduledDateJalali(formatJalaliYmd(todayJ.jy, todayJ.jm, todayJ.jd, false));
+      setScheduledTime('10:00');
       setCreateOpen(false);
       await loadTickets();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'خطا در ثبت تیکت');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const openConfigModal = (ticket: TicketItem) => {
+    setConfigTicket(ticket);
+    setEditPppoeUser(ticket.config_pppoe_user || '');
+    setEditPppoePass(ticket.config_pppoe_pass || '');
+    setEditVlanId(ticket.config_vlan ? String(ticket.config_vlan) : '');
+    setEditHasVoip(Boolean(ticket.has_voip));
+    setEditVoipData(ticket.config_voip_data || '');
+    setEditOperatorNotes(ticket.operator_notes || '');
+  };
+
+  const handleSaveConfig = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!configTicket) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await apiFetch(`/api/tickets/${configTicket.id}/config`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          config_pppoe_user: editPppoeUser.trim() || null,
+          config_pppoe_pass: editPppoePass.trim() || null,
+          config_vlan: editVlanId.trim() ? Number(editVlanId) : null,
+          has_voip: editHasVoip ? 1 : 0,
+          config_voip_data: editHasVoip ? editVoipData.trim() || null : null,
+          operator_notes: editOperatorNotes.trim() || null,
+        }),
+      });
+      setConfigTicket(null);
+      await loadTickets();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'خطا در ذخیره تنظیمات کانفیگ تیکت');
     } finally {
       setSubmitting(false);
     }
@@ -131,12 +218,19 @@ export function TicketsPage({ user, onStartTicketService }: TicketsPageProps) {
     }
   };
 
-  const openRecordDetail = async (ticketId: number) => {
-    setDetailLoading(true);
-    setDetailRecord(null);
+  const openRecordDetail = async (ticketId: number, openPdfDirectly = false) => {
+    setError(null);
+    if (!openPdfDirectly) {
+      setDetailLoading(true);
+      setDetailRecord(null);
+    }
     try {
       const res = await apiFetch<{ record: ServiceRecordDetail }>(`/api/tickets/${ticketId}/record`);
-      setDetailRecord(res.record);
+      if (openPdfDirectly) {
+        setPdfRecord(res.record);
+      } else {
+        setDetailRecord(res.record);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'خطا در دریافت جزئیات پرونده');
     } finally {
@@ -249,7 +343,12 @@ export function TicketsPage({ user, onStartTicketService }: TicketsPageProps) {
                     </td>
                     <td className="px-4 py-3 font-medium text-slate-900">{t.customer_name}</td>
                     <td className="px-4 py-3 text-xs text-slate-600">
-                      <div>{t.type === 'install' ? 'نصب فیبر' : 'رفع خرابی'}</div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span>{t.type === 'install' ? 'نصب فیبر' : 'رفع خرابی'}</span>
+                        {hasTicketProvisioningConfig(t) && (
+                          <span className="font-medium text-teal-700">· دارای کانفیگ</span>
+                        )}
+                      </div>
                       {(t.ffat_code || t.modem_serial) && (
                         <div dir="ltr" className="mt-0.5 text-right font-mono text-[11px] text-slate-400">
                           {[t.ffat_code, t.modem_serial].filter(Boolean).join(' · ')}
@@ -275,7 +374,15 @@ export function TicketsPage({ user, onStartTicketService }: TicketsPageProps) {
                       )}
                     </td>
                     <td className="px-4 py-3">
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => openConfigModal(t)}
+                          className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 whitespace-nowrap"
+                        >
+                          <Settings2 className="h-3.5 w-3.5" />
+                          <span>کانفیگ</span>
+                        </button>
                         {t.status !== 'completed' && canAssign && (
                           <button
                             type="button"
@@ -300,14 +407,24 @@ export function TicketsPage({ user, onStartTicketService }: TicketsPageProps) {
                           </button>
                         )}
                         {t.status === 'completed' && (
-                          <button
-                            type="button"
-                            onClick={() => openRecordDetail(t.id)}
-                            className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 whitespace-nowrap"
-                          >
-                            <Eye className="h-3.5 w-3.5" />
-                            <span>پرونده اجرا</span>
-                          </button>
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => openRecordDetail(t.id, false)}
+                              className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 whitespace-nowrap"
+                            >
+                              <Eye className="h-3.5 w-3.5" />
+                              <span>پرونده اجرا</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => openRecordDetail(t.id, true)}
+                              className="inline-flex items-center gap-1 rounded-md border border-teal-200 bg-teal-50 px-2.5 py-1 text-xs font-medium text-teal-800 hover:bg-teal-100 whitespace-nowrap"
+                            >
+                              <FileText className="h-3.5 w-3.5" />
+                              <span>گزارش PDF</span>
+                            </button>
+                          </>
                         )}
                       </div>
                     </td>
@@ -320,36 +437,43 @@ export function TicketsPage({ user, onStartTicketService }: TicketsPageProps) {
       </div>
 
       {/* Create Ticket Modal */}
-      <Modal open={createOpen} onClose={() => setCreateOpen(false)} title="ثبت تیکت جدید">
+      <Modal
+        open={createOpen}
+        onClose={() => setCreateOpen(false)}
+        title="ثبت تیکت جدید"
+        maxWidthClass="max-w-xl"
+      >
         <form onSubmit={handleCreateTicket} className="space-y-4">
-          <div>
-            <label htmlFor="t-customer" className="mb-1.5 block text-xs font-medium text-slate-700">
-              نام مشترک / شرکت <span className="text-red-600">*</span>
-            </label>
-            <input
-              id="t-customer"
-              type="text"
-              required
-              value={customerName}
-              onChange={(e) => setCustomerName(e.target.value)}
-              placeholder="مثال: مهندس آرش کریمی"
-              className="h-10 w-full rounded-lg border border-slate-300 px-3 text-sm focus:border-teal-600 focus:outline-none"
-            />
-          </div>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div>
+              <label htmlFor="t-customer" className="mb-1.5 block text-xs font-medium text-slate-700">
+                نام مشترک / شرکت <span className="text-red-600">*</span>
+              </label>
+              <input
+                id="t-customer"
+                type="text"
+                required
+                value={customerName}
+                onChange={(e) => setCustomerName(e.target.value)}
+                placeholder="مثال: مهندس آرش کریمی"
+                className="h-10 w-full rounded-lg border border-slate-300 px-3 text-sm focus:border-teal-600 focus:outline-none"
+              />
+            </div>
 
-          <div>
-            <label htmlFor="t-type" className="mb-1.5 block text-xs font-medium text-slate-700">
-              نوع درخواست <span className="text-red-600">*</span>
-            </label>
-            <select
-              id="t-type"
-              value={ticketType}
-              onChange={(e) => setTicketType(e.target.value as 'install' | 'fault')}
-              className="h-10 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm focus:border-teal-600 focus:outline-none"
-            >
-              <option value="install">نصب جدید (FTTH Installation)</option>
-              <option value="fault">رفع خرابی (Fault / Maintenance)</option>
-            </select>
+            <div>
+              <label htmlFor="t-type" className="mb-1.5 block text-xs font-medium text-slate-700">
+                نوع درخواست <span className="text-red-600">*</span>
+              </label>
+              <select
+                id="t-type"
+                value={ticketType}
+                onChange={(e) => setTicketType(e.target.value as 'install' | 'fault')}
+                className="h-10 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm focus:border-teal-600 focus:outline-none"
+              >
+                <option value="install">نصب جدید (FTTH Installation)</option>
+                <option value="fault">رفع خرابی (Fault / Maintenance)</option>
+              </select>
+            </div>
           </div>
 
           <div>
@@ -359,7 +483,7 @@ export function TicketsPage({ user, onStartTicketService }: TicketsPageProps) {
             <textarea
               id="t-address"
               required
-              rows={3}
+              rows={2}
               value={address}
               onChange={(e) => setAddress(e.target.value)}
               placeholder="منطقه، خیابان، پلاک، طبقه و واحد..."
@@ -376,6 +500,128 @@ export function TicketsPage({ user, onStartTicketService }: TicketsPageProps) {
               placeholder="در انتظار ارجاع بماند یا نصاب انتخاب کنید..."
             />
           )}
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <JalaliDatePicker
+              label="تاریخ زمان‌بندی مراجعه (اختیاری)"
+              value={scheduledDateJalali}
+              onChange={setScheduledDateJalali}
+            />
+            <div>
+              <label htmlFor="t-sched-time" className="mb-1.5 block text-xs font-medium text-slate-700">
+                ساعت مراجعه (اختیاری)
+              </label>
+              <input
+                id="t-sched-time"
+                type="time"
+                value={scheduledTime}
+                onChange={(e) => setScheduledTime(e.target.value)}
+                className="h-10 w-full rounded-lg border border-slate-300 px-3 text-sm tabular-nums focus:border-teal-600 focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label htmlFor="t-op-notes" className="mb-1.5 block text-xs font-medium text-slate-700">
+              توضیحات و یادداشت اپراتور (اختیاری)
+            </label>
+            <textarea
+              id="t-op-notes"
+              rows={2}
+              value={operatorNotes}
+              onChange={(e) => setOperatorNotes(e.target.value)}
+              placeholder="نکات هماهنگی، زمان حضور مشترک یا جزئیات خطا..."
+              className="w-full rounded-lg border border-slate-300 p-2.5 text-xs focus:border-teal-600 focus:outline-none"
+            />
+          </div>
+
+          <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3">
+            <button
+              type="button"
+              onClick={() => setShowCreateConfig((v) => !v)}
+              className="flex w-full items-center justify-between text-xs font-semibold text-teal-800"
+            >
+              <span>تنظیمات کانفیگ مودم (PPPoE / VLAN / VoIP) — اختیاری</span>
+              <span>{showCreateConfig ? 'بستن' : 'افزودن کانفیگ'}</span>
+            </button>
+
+            {showCreateConfig && (
+              <div className="mt-3 space-y-3 border-t border-slate-200 pt-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                  <div>
+                    <label htmlFor="t-pppoe-user" className="mb-1 block text-[11px] font-medium text-slate-700">
+                      نام کاربری PPPoE
+                    </label>
+                    <input
+                      id="t-pppoe-user"
+                      type="text"
+                      dir="ltr"
+                      value={pppoeUser}
+                      onChange={(e) => setPppoeUser(e.target.value)}
+                      placeholder="user@ftth.local"
+                      className="h-9 w-full rounded-lg border border-slate-300 bg-white px-2.5 text-left font-mono text-xs focus:border-teal-600 focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="t-pppoe-pass" className="mb-1 block text-[11px] font-medium text-slate-700">
+                      رمز عبور PPPoE
+                    </label>
+                    <input
+                      id="t-pppoe-pass"
+                      type="text"
+                      dir="ltr"
+                      value={pppoePass}
+                      onChange={(e) => setPppoePass(e.target.value)}
+                      placeholder="Pass123"
+                      className="h-9 w-full rounded-lg border border-slate-300 bg-white px-2.5 text-left font-mono text-xs focus:border-teal-600 focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="t-vlan" className="mb-1 block text-[11px] font-medium text-slate-700">
+                      شناسه VLAN
+                    </label>
+                    <input
+                      id="t-vlan"
+                      type="number"
+                      min={1}
+                      max={4094}
+                      value={vlanId}
+                      onChange={(e) => setVlanId(e.target.value)}
+                      placeholder="1042"
+                      className="h-9 w-full rounded-lg border border-slate-300 bg-white px-2.5 text-xs tabular-nums focus:border-teal-600 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <label className="flex items-center gap-2 text-xs font-medium text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={hasVoip}
+                    onChange={(e) => setHasVoip(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-teal-600 focus:ring-teal-600"
+                  />
+                  <span>دارای سرویس تلفن ثابت (VoIP / SIP)</span>
+                </label>
+
+                {hasVoip && (
+                  <div>
+                    <label htmlFor="t-voip-data" className="mb-1 block text-[11px] font-medium text-slate-700">
+                      مشخصات کانفیگ VoIP
+                    </label>
+                    <input
+                      id="t-voip-data"
+                      type="text"
+                      dir="ltr"
+                      value={voipData}
+                      onChange={(e) => setVoipData(e.target.value)}
+                      placeholder="SIP: 02188991100 | Proxy: 10.20.30.5"
+                      className="h-9 w-full rounded-lg border border-slate-300 bg-white px-2.5 text-left font-mono text-xs focus:border-teal-600 focus:outline-none"
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
 
           <div className="flex justify-end gap-2 pt-2">
             <button
@@ -394,6 +640,138 @@ export function TicketsPage({ user, onStartTicketService }: TicketsPageProps) {
             </button>
           </div>
         </form>
+      </Modal>
+
+      {/* View / Edit Provisioning Config Modal */}
+      <Modal
+        open={Boolean(configTicket)}
+        onClose={() => setConfigTicket(null)}
+        title={
+          configTicket
+            ? `کانفیگ و یادداشت تیکت #${toPersianDigits(configTicket.id)} — ${configTicket.customer_name}`
+            : 'کانفیگ تیکت'
+        }
+        maxWidthClass="max-w-xl"
+      >
+        {configTicket && (
+          <div className="space-y-4">
+            <ProvisioningConfigBox
+              config_pppoe_user={configTicket.config_pppoe_user}
+              config_pppoe_pass={configTicket.config_pppoe_pass}
+              config_vlan={configTicket.config_vlan}
+              has_voip={configTicket.has_voip}
+              config_voip_data={configTicket.config_voip_data}
+              operator_notes={configTicket.operator_notes}
+              compact
+            />
+
+            {(canCreate || canAssign) && (
+              <form onSubmit={handleSaveConfig} className="space-y-3 border-t border-slate-200 pt-4">
+                <div className="text-xs font-semibold text-slate-800">
+                  ویرایش اطلاعات کانفیگ و یادداشت اپراتور
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                  <div>
+                    <label htmlFor="edit-pppoe-user" className="mb-1 block text-[11px] text-slate-600">
+                      نام کاربری PPPoE
+                    </label>
+                    <input
+                      id="edit-pppoe-user"
+                      type="text"
+                      dir="ltr"
+                      value={editPppoeUser}
+                      onChange={(e) => setEditPppoeUser(e.target.value)}
+                      className="h-9 w-full rounded-lg border border-slate-300 px-2.5 text-left font-mono text-xs focus:border-teal-600 focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="edit-pppoe-pass" className="mb-1 block text-[11px] text-slate-600">
+                      رمز عبور PPPoE
+                    </label>
+                    <input
+                      id="edit-pppoe-pass"
+                      type="text"
+                      dir="ltr"
+                      value={editPppoePass}
+                      onChange={(e) => setEditPppoePass(e.target.value)}
+                      className="h-9 w-full rounded-lg border border-slate-300 px-2.5 text-left font-mono text-xs focus:border-teal-600 focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="edit-vlan" className="mb-1 block text-[11px] text-slate-600">
+                      شناسه VLAN
+                    </label>
+                    <input
+                      id="edit-vlan"
+                      type="number"
+                      min={1}
+                      max={4094}
+                      value={editVlanId}
+                      onChange={(e) => setEditVlanId(e.target.value)}
+                      className="h-9 w-full rounded-lg border border-slate-300 px-2.5 text-xs tabular-nums focus:border-teal-600 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <label className="flex items-center gap-2 text-xs font-medium text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={editHasVoip}
+                    onChange={(e) => setEditHasVoip(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-teal-600"
+                  />
+                  <span>دارای سرویس VoIP</span>
+                </label>
+
+                {editHasVoip && (
+                  <div>
+                    <label htmlFor="edit-voip" className="mb-1 block text-[11px] text-slate-600">
+                      مشخصات VoIP
+                    </label>
+                    <input
+                      id="edit-voip"
+                      type="text"
+                      dir="ltr"
+                      value={editVoipData}
+                      onChange={(e) => setEditVoipData(e.target.value)}
+                      className="h-9 w-full rounded-lg border border-slate-300 px-2.5 text-left font-mono text-xs focus:border-teal-600 focus:outline-none"
+                    />
+                  </div>
+                )}
+
+                <div>
+                  <label htmlFor="edit-op-notes" className="mb-1 block text-[11px] text-slate-600">
+                    یادداشت اپراتور
+                  </label>
+                  <textarea
+                    id="edit-op-notes"
+                    rows={2}
+                    value={editOperatorNotes}
+                    onChange={(e) => setEditOperatorNotes(e.target.value)}
+                    className="w-full rounded-lg border border-slate-300 p-2.5 text-xs focus:border-teal-600 focus:outline-none"
+                  />
+                </div>
+
+                <div className="flex justify-end gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setConfigTicket(null)}
+                    className="rounded-lg border border-slate-200 px-4 py-2 text-xs text-slate-700"
+                  >
+                    بستن
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={submitting}
+                    className="rounded-lg bg-teal-600 px-4 py-2 text-xs font-medium text-white hover:bg-teal-700 disabled:opacity-60"
+                  >
+                    {submitting ? 'در حال ذخیره...' : 'به‌روزرسانی کانفیگ'}
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        )}
       </Modal>
 
       {/* Assign Installer Modal */}
@@ -473,10 +851,13 @@ export function TicketsPage({ user, onStartTicketService }: TicketsPageProps) {
                 </div>
               </div>
               <div>
-                <div className="text-slate-500">سریال مودم</div>
+                <div className="text-slate-500">سریال مودم ({detailRecord.modem_source === 'customer' ? 'مودم مشترک' : 'انبار شرکت'})</div>
                 <div dir="ltr" className="mt-1 text-right font-mono font-medium text-slate-900">
                   {detailRecord.modem_serial}
                 </div>
+                {detailRecord.modem_brand_name && (
+                  <div className="mt-0.5 text-[11px] text-slate-500">{detailRecord.modem_brand_name}</div>
+                )}
               </div>
               <div>
                 <div className="text-slate-500">مصرف کابل</div>
@@ -485,6 +866,16 @@ export function TicketsPage({ user, onStartTicketService }: TicketsPageProps) {
                 </div>
               </div>
             </div>
+
+            <ProvisioningConfigBox
+              config_pppoe_user={detailRecord.config_pppoe_user}
+              config_pppoe_pass={detailRecord.config_pppoe_pass}
+              config_vlan={detailRecord.config_vlan}
+              has_voip={detailRecord.has_voip}
+              config_voip_data={detailRecord.config_voip_data}
+              operator_notes={detailRecord.operator_notes}
+              compact
+            />
 
             <div className="rounded-lg border border-slate-200 p-4">
               <div className="mb-2 font-semibold text-slate-900">اسنپ‌شات محاسبه تعرفه (تغییرناپذیر)</div>
@@ -540,9 +931,26 @@ export function TicketsPage({ user, onStartTicketService }: TicketsPageProps) {
                 </div>
               )}
             </div>
+            <div className="flex flex-wrap items-center justify-end gap-2 border-t border-slate-200 pt-4">
+              <button
+                type="button"
+                onClick={() => {
+                  const rec = detailRecord;
+                  setDetailRecord(null);
+                  setPdfRecord(rec);
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-teal-600 px-4 py-2 text-xs font-semibold text-white hover:bg-teal-700"
+              >
+                <Printer className="h-4 w-4" />
+                <span>تولید و چاپ نسخه PDF تحویل مشتری</span>
+              </button>
+            </div>
           </div>
         ) : null}
       </Modal>
+
+      <ServiceRecordPdfReport record={pdfRecord} onClose={() => setPdfRecord(null)} />
     </div>
   );
 }
+

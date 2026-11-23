@@ -20,9 +20,22 @@ export function getDb(): DatabaseSync {
 
   initSchema(db);
   seedInitialData(db);
+  seedExtendedModules(db);
 
   dbInstance = db;
   return db;
+}
+
+function ensureColumn(
+  db: DatabaseSync,
+  tableName: string,
+  columnName: string,
+  columnDefinition: string,
+): void {
+  const cols = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDefinition};`);
+  }
 }
 
 function initSchema(db: DatabaseSync): void {
@@ -96,14 +109,36 @@ function initSchema(db: DatabaseSync): void {
       serial_prefix TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS tbl_inventory_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      type TEXT NOT NULL CHECK(type IN ('unit', 'spool', 'modem')),
+      modem_brand_id INTEGER NULL,
+      total_quantity INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY (modem_brand_id) REFERENCES tbl_modem_brands(id)
+    );
+
     CREATE TABLE IF NOT EXISTS tbl_spools (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      item_id INTEGER NULL,
       spool_code TEXT UNIQUE NOT NULL,
       cable_type TEXT NOT NULL CHECK(cable_type IN ('indoor', 'outdoor')),
       initial_length INTEGER NOT NULL,
       current_length INTEGER NOT NULL,
       assigned_installer_id INTEGER NULL,
+      FOREIGN KEY (item_id) REFERENCES tbl_inventory_items(id),
       FOREIGN KEY (assigned_installer_id) REFERENCES tbl_users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS tbl_van_stock (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      item_id INTEGER NOT NULL,
+      serial_number TEXT NULL,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES tbl_users(id),
+      FOREIGN KEY (item_id) REFERENCES tbl_inventory_items(id)
     );
 
     CREATE TABLE IF NOT EXISTS tbl_tickets (
@@ -111,6 +146,12 @@ function initSchema(db: DatabaseSync): void {
       customer_name TEXT NOT NULL,
       address TEXT NOT NULL,
       type TEXT NOT NULL CHECK(type IN ('install', 'fault')),
+      config_pppoe_user TEXT NULL,
+      config_pppoe_pass TEXT NULL,
+      config_vlan INTEGER NULL,
+      has_voip INTEGER NOT NULL DEFAULT 0,
+      config_voip_data TEXT NULL,
+      operator_notes TEXT NULL,
       status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'assigned', 'completed')),
       assigned_installer INTEGER NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -129,13 +170,17 @@ function initSchema(db: DatabaseSync): void {
       out_total_meter INTEGER NOT NULL DEFAULT 0,
       in_spool_id INTEGER NULL,
       in_total_meter INTEGER NOT NULL DEFAULT 0,
+      modem_source TEXT NOT NULL DEFAULT 'company' CHECK(modem_source IN ('company', 'customer')),
+      modem_brand_id INTEGER NULL,
+      van_stock_id INTEGER NULL,
       modem_serial TEXT NOT NULL,
       price_snapshot TEXT NOT NULL,
       service_date_jalali TEXT NULL,
       notes TEXT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (ticket_id) REFERENCES tbl_tickets(id),
-      FOREIGN KEY (installer_id) REFERENCES tbl_users(id)
+      FOREIGN KEY (installer_id) REFERENCES tbl_users(id),
+      FOREIGN KEY (modem_brand_id) REFERENCES tbl_modem_brands(id)
     );
 
     CREATE TABLE IF NOT EXISTS tbl_images (
@@ -168,7 +213,35 @@ function initSchema(db: DatabaseSync): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (user_id) REFERENCES tbl_users(id)
     );
+
+    CREATE TABLE IF NOT EXISTS tbl_activity_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NULL,
+      username TEXT NOT NULL,
+      user_full_name TEXT NOT NULL,
+      action_type TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      entity_id INTEGER NULL,
+      summary TEXT NOT NULL,
+      details TEXT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES tbl_users(id) ON DELETE SET NULL
+    );
   `);
+
+  // Idempotent column migrations for existing databases
+  ensureColumn(db, 'tbl_spools', 'item_id', 'INTEGER NULL');
+  ensureColumn(db, 'tbl_tickets', 'config_pppoe_user', 'TEXT NULL');
+  ensureColumn(db, 'tbl_tickets', 'config_pppoe_pass', 'TEXT NULL');
+  ensureColumn(db, 'tbl_tickets', 'config_vlan', 'INTEGER NULL');
+  ensureColumn(db, 'tbl_tickets', 'has_voip', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'tbl_tickets', 'config_voip_data', 'TEXT NULL');
+  ensureColumn(db, 'tbl_tickets', 'operator_notes', 'TEXT NULL');
+  ensureColumn(db, 'tbl_tickets', 'scheduled_date', 'TEXT NULL');
+  ensureColumn(db, 'tbl_tickets', 'scheduled_time', 'TEXT NULL');
+  ensureColumn(db, 'tbl_service_records', 'modem_source', "TEXT NOT NULL DEFAULT 'company'");
+  ensureColumn(db, 'tbl_service_records', 'modem_brand_id', 'INTEGER NULL');
+  ensureColumn(db, 'tbl_service_records', 'van_stock_id', 'INTEGER NULL');
 }
 
 function seedInitialData(db: DatabaseSync): void {
@@ -491,5 +564,317 @@ function seedInitialData(db: DatabaseSync): void {
   } catch (err) {
     db.exec('ROLLBACK;');
     throw err;
+  }
+}
+
+function seedExtendedModules(db: DatabaseSync): void {
+  const existingItems = db
+    .prepare('SELECT COUNT(*) as cnt FROM tbl_inventory_items')
+    .get() as { cnt: number };
+  if (existingItems.cnt === 0) {
+    db.exec('BEGIN IMMEDIATE;');
+    try {
+      const huawei = db
+        .prepare('SELECT id FROM tbl_modem_brands WHERE serial_prefix = ? LIMIT 1')
+        .get('48575443') as { id: number } | undefined;
+      const zte = db
+        .prepare('SELECT id FROM tbl_modem_brands WHERE serial_prefix = ? LIMIT 1')
+        .get('ZTEG') as { id: number } | undefined;
+      const inst1 = db
+        .prepare('SELECT id FROM tbl_users WHERE username = ?')
+        .get('installer1') as { id: number } | undefined;
+      const inst2 = db
+        .prepare('SELECT id FROM tbl_users WHERE username = ?')
+        .get('installer2') as { id: number } | undefined;
+
+      const insItem = db.prepare(
+        'INSERT INTO tbl_inventory_items (name, type, modem_brand_id, total_quantity) VALUES (?, ?, ?, ?)',
+      );
+      const outCableItemId = Number(
+        insItem.run('کابل دراپ فضای باز (Drop Outdoor)', 'spool', null, 3).lastInsertRowid,
+      );
+      const inCableItemId = Number(
+        insItem.run('کابل داخلی فلت (Indoor Flat)', 'spool', null, 3).lastInsertRowid,
+      );
+      const huaweiModemItemId = Number(
+        insItem.run('مودم فیبر نوری Huawei HG8245H5', 'modem', huawei?.id ?? null, 18)
+          .lastInsertRowid,
+      );
+      const zteModemItemId = Number(
+        insItem.run('مودم فیبر نوری ZTE F660 V8', 'modem', zte?.id ?? null, 12).lastInsertRowid,
+      );
+      const patchCordItemId = Number(
+        insItem.run('پچ‌کورد فیبر SC/APC 3 متری', 'unit', null, 45).lastInsertRowid,
+      );
+      const rosetteItemId = Number(
+        insItem.run('پریز فیبر نوری دیواری (Rosette 2-Port)', 'unit', null, 30).lastInsertRowid,
+      );
+
+      db.prepare("UPDATE tbl_spools SET item_id = ? WHERE cable_type = 'outdoor' AND item_id IS NULL").run(
+        outCableItemId,
+      );
+      db.prepare("UPDATE tbl_spools SET item_id = ? WHERE cable_type = 'indoor' AND item_id IS NULL").run(
+        inCableItemId,
+      );
+
+      const insVan = db.prepare(
+        'INSERT INTO tbl_van_stock (user_id, item_id, serial_number, quantity) VALUES (?, ?, ?, ?)',
+      );
+      if (inst1) {
+        // Pre-registered serial modem + bulk quantity modem + unit consumables
+        insVan.run(inst1.id, huaweiModemItemId, '48575443AABB1122', 1);
+        insVan.run(inst1.id, huaweiModemItemId, null, 3);
+        insVan.run(inst1.id, zteModemItemId, null, 2);
+        insVan.run(inst1.id, patchCordItemId, null, 8);
+        insVan.run(inst1.id, rosetteItemId, null, 6);
+      }
+      if (inst2) {
+        insVan.run(inst2.id, zteModemItemId, 'ZTEG77441122', 1);
+        insVan.run(inst2.id, zteModemItemId, null, 2);
+        insVan.run(inst2.id, patchCordItemId, null, 5);
+      }
+
+      // Populate realistic provisioning config on first ticket (#1) and operator notes on #2 if empty
+      const t1 = db
+        .prepare('SELECT id, config_pppoe_user, operator_notes FROM tbl_tickets WHERE id = 1')
+        .get() as { id: number; config_pppoe_user: string | null; operator_notes: string | null } | undefined;
+      if (t1 && !t1.config_pppoe_user && !t1.operator_notes) {
+        db.prepare(
+          `UPDATE tbl_tickets
+           SET config_pppoe_user = ?,
+               config_pppoe_pass = ?,
+               config_vlan = ?,
+               has_voip = ?,
+               config_voip_data = ?,
+               operator_notes = ?
+           WHERE id = 1`,
+        ).run(
+          'parsnoor@ftth.local',
+          'PN#884210',
+          1042,
+          1,
+          'شماره داخلی: 02188991100 | SIP Server: 10.20.30.5 | Auth: 88991100',
+          'ساختمان تجاری است؛ پس از کانفیگ مودم، خط تلفن VoIP روی پورت TEL1 تست شود.',
+        );
+      }
+
+      const t2 = db
+        .prepare('SELECT id, operator_notes FROM tbl_tickets WHERE id = 2')
+        .get() as { id: number; operator_notes: string | null } | undefined;
+      if (t2 && !t2.operator_notes) {
+        db.prepare('UPDATE tbl_tickets SET operator_notes = ? WHERE id = 2').run(
+          'مشترک قطعی لینک (چراغ LOS قرمز) گزارش کرده است. احتمال شکستگی پچ‌کورد داخل واحد.',
+        );
+      }
+
+      db.exec('COMMIT;');
+    } catch (err) {
+      db.exec('ROLLBACK;');
+      throw err;
+    }
+  }
+
+  const existingLogs = db
+    .prepare('SELECT COUNT(*) as cnt FROM tbl_activity_logs')
+    .get() as { cnt: number };
+  if (existingLogs.cnt === 0) {
+    const adminUser = db
+      .prepare('SELECT id, username, first_name, last_name FROM tbl_users WHERE username = ?')
+      .get('admin') as { id: number; username: string; first_name: string; last_name: string } | undefined;
+    const operatorUser = db
+      .prepare('SELECT id, username, first_name, last_name FROM tbl_users WHERE username = ?')
+      .get('operator') as { id: number; username: string; first_name: string; last_name: string } | undefined;
+    const inst1User = db
+      .prepare('SELECT id, username, first_name, last_name FROM tbl_users WHERE username = ?')
+      .get('installer1') as { id: number; username: string; first_name: string; last_name: string } | undefined;
+
+    const insLog = db.prepare(
+      `INSERT INTO tbl_activity_logs (user_id, username, user_full_name, action_type, entity_type, entity_id, summary, details, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+
+    if (operatorUser) {
+      const opName = `${operatorUser.first_name} ${operatorUser.last_name}`;
+      insLog.run(
+        operatorUser.id,
+        operatorUser.username,
+        opName,
+        'ticket_assigned',
+        'ticket',
+        1,
+        'تایید و ارجاع تیکت #1 به حسین کریمی',
+        'مشترک: شرکت مهندسی پارس نور — کانفیگ PPPoE و VLAN 1042 ثبت شد.',
+        '2026-11-22 09:20:00',
+      );
+      insLog.run(
+        operatorUser.id,
+        operatorUser.username,
+        opName,
+        'ticket_created',
+        'ticket',
+        8,
+        'ثبت تیکت جدید نصب #8 برای مجتمع مسکونی سرو',
+        'وضعیت: در انتظار ارجاع به نصاب',
+        '2026-11-22 10:05:00',
+      );
+    }
+
+    if (inst1User) {
+      const iName = `${inst1User.first_name} ${inst1User.last_name}`;
+      insLog.run(
+        inst1User.id,
+        inst1User.username,
+        iName,
+        'service_completed',
+        'ticket',
+        5,
+        'تایید و تکمیل عملیات نصب تیکت #5 (دفتر حقوقی آوا)',
+        'کد F-FAT: FAT301-D2 — متراژ کل: ۷۵ متر — مودم: 4857544399AA11BB',
+        '2026-11-22 13:40:00',
+      );
+    }
+
+    if (adminUser) {
+      const aName = `${adminUser.first_name} ${adminUser.last_name}`;
+      insLog.run(
+        adminUser.id,
+        adminUser.username,
+        aName,
+        'van_stock_transferred',
+        'inventory',
+        3,
+        'تحویل مودم Huawei HG8245H5 به موجودی خودروی حسین کریمی',
+        'تعداد: ۳ عدد مودم انبار شرکت',
+        '2026-11-22 14:15:00',
+      );
+      insLog.run(
+        adminUser.id,
+        adminUser.username,
+        aName,
+        'payout_recorded',
+        'financial',
+        null,
+        'ثبت سند پرداخت مالی ۱,۰۰۰,۰۰۰ تومان برای حسین کریمی',
+        'تسویه علی‌الحساب هفتگی - حواله شماره ۴۴۱۲',
+        '2026-11-22 15:00:00',
+      );
+    }
+  }
+
+  const existingHistoricalLedger = db
+    .prepare("SELECT COUNT(*) as cnt FROM tbl_ledger WHERE created_at < '2026-11-01'")
+    .get() as { cnt: number };
+  if (existingHistoricalLedger.cnt === 0) {
+    const inst1 = db
+      .prepare('SELECT id FROM tbl_users WHERE username = ?')
+      .get('installer1') as { id: number } | undefined;
+    const inst2 = db
+      .prepare('SELECT id FROM tbl_users WHERE username = ?')
+      .get('installer2') as { id: number } | undefined;
+
+    if (inst1 || inst2) {
+      const insHistLedger = db.prepare(
+        'INSERT INTO tbl_ledger (user_id, record_id, amount, type, description, created_at) VALUES (?, NULL, ?, ?, ?, ?)',
+      );
+      const historicalRows: Array<{
+        userId: number;
+        credit: number;
+        creditDesc: string;
+        debitDesc: string;
+        date: string;
+      }> = [];
+
+      if (inst1) {
+        historicalRows.push(
+          {
+            userId: inst1.id,
+            credit: 2150000,
+            creditDesc: 'کارکرد تجمیعی پروژه‌های نصب تیر ۱۴۰۵ (۳ فقره)',
+            debitDesc: 'تسویه نهایی کارکرد تیر ۱۴۰۵',
+            date: '2026-07-10 14:00:00', // تیر ۱۴۰۵
+          },
+          {
+            userId: inst1.id,
+            credit: 2680000,
+            creditDesc: 'کارکرد تجمیعی پروژه‌های نصب مرداد ۱۴۰۵ (۴ فقره)',
+            debitDesc: 'تسویه نهایی کارکرد مرداد ۱۴۰۵',
+            date: '2026-08-12 15:20:00', // مرداد ۱۴۰۵
+          },
+          {
+            userId: inst1.id,
+            credit: 3120000,
+            creditDesc: 'کارکرد تجمیعی نصب و رفع خرابی شهریور ۱۴۰۵ (۴ فقره)',
+            debitDesc: 'تسویه نهایی کارکرد شهریور ۱۴۰۵',
+            date: '2026-09-14 16:10:00', // شهریور ۱۴۰۵
+          },
+          {
+            userId: inst1.id,
+            credit: 2890000,
+            creditDesc: 'کارکرد تجمیعی پروژه‌های مهر ۱۴۰۵ (۳ فقره)',
+            debitDesc: 'تسویه نهایی کارکرد مهر ۱۴۰۵',
+            date: '2026-10-15 13:45:00', // مهر ۱۴۰۵
+          },
+        );
+      }
+      if (inst2) {
+        historicalRows.push(
+          {
+            userId: inst2.id,
+            credit: 1420000,
+            creditDesc: 'کارکرد پروژه‌های نصب مرداد ۱۴۰۵ (۲ فقره)',
+            debitDesc: 'تسویه نهایی کارکرد مرداد ۱۴۰۵',
+            date: '2026-08-15 11:30:00', // مرداد ۱۴۰۵
+          },
+          {
+            userId: inst2.id,
+            credit: 1950000,
+            creditDesc: 'کارکرد پروژه‌های نصب شهریور ۱۴۰۵ (۳ فقره)',
+            debitDesc: 'تسویه نهایی کارکرد شهریور ۱۴۰۵',
+            date: '2026-09-16 12:00:00', // شهریور ۱۴۰۵
+          },
+          {
+            userId: inst2.id,
+            credit: 1780000,
+            creditDesc: 'کارکرد پروژه‌های نصب مهر ۱۴۰۵ (۲ فقره)',
+            debitDesc: 'تسویه نهایی کارکرد مهر ۱۴۰۵',
+            date: '2026-10-17 17:00:00', // مهر ۱۴۰۵
+          },
+        );
+      }
+
+      db.exec('BEGIN IMMEDIATE;');
+      try {
+        for (const r of historicalRows) {
+          insHistLedger.run(r.userId, r.credit, 'credit', r.creditDesc, r.date);
+          insHistLedger.run(r.userId, r.credit, 'debit', r.debitDesc, r.date);
+        }
+        db.exec('COMMIT;');
+      } catch (err) {
+        db.exec('ROLLBACK;');
+        throw err;
+      }
+    }
+  }
+
+  // Assign upcoming daily schedule dates/times to open tickets that don't have one yet
+  const unscheduledOpen = db
+    .prepare(
+      "SELECT id, type FROM tbl_tickets WHERE status != 'completed' AND (scheduled_date IS NULL OR scheduled_date = '') ORDER BY id ASC",
+    )
+    .all() as Array<{ id: number; type: string }>;
+  if (unscheduledOpen.length > 0) {
+    const slotTimes = ['09:30', '11:30', '14:00', '16:00'];
+    const dayOffsets = [0, 1, 2, 3, 1, 4];
+    const updateSched = db.prepare(
+      'UPDATE tbl_tickets SET scheduled_date = ?, scheduled_time = ? WHERE id = ?',
+    );
+    const base = new Date();
+    unscheduledOpen.forEach((row, idx) => {
+      const target = new Date(base);
+      target.setDate(base.getDate() + (dayOffsets[idx % dayOffsets.length] ?? idx));
+      const iso = `${target.getFullYear()}-${String(target.getMonth() + 1).padStart(2, '0')}-${String(target.getDate()).padStart(2, '0')}`;
+      const time = slotTimes[idx % slotTimes.length] || '10:00';
+      updateSched.run(iso, time, row.id);
+    });
   }
 }

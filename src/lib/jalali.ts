@@ -204,3 +204,22 @@ export function getTodayJalali(): JalaliDate {
   const now = new Date();
   return gregorianToJalali(now.getFullYear(), now.getMonth() + 1, now.getDate());
 }
+
+export function jalaliYmdToIso(jalaliYmd: string): string | null {
+  const match = /^(\d{4})\/(\d{1,2})\/(\d{1,2})$/.exec(jalaliYmd.trim());
+  if (!match) return null;
+  const jy = Number(match[1]);
+  const jm = Number(match[2]);
+  const jd = Number(match[3]);
+  if (jm < 1 || jm > 12 || jd < 1 || jd > 31) return null;
+  const g = jalaliToGregorian(jy, jm, jd);
+  return `${g.gy}-${String(g.gm).padStart(2, '0')}-${String(g.gd).padStart(2, '0')}`;
+}
+
+export function isoToJalaliYmd(isoInput: string, persian = false): string {
+  const clean = isoInput.trim().slice(0, 10);
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(clean);
+  if (!match) return '—';
+  const j = gregorianToJalali(Number(match[1]), Number(match[2]), Number(match[3]));
+  return formatJalaliYmd(j.jy, j.jm, j.jd, persian);
+}

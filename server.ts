@@ -18,13 +18,17 @@ import {
   type AuthenticatedRequest,
 } from './server/auth.ts';
 import {
+  aggregateMonthlyContractorEarnings,
   calculateTariffSnapshot,
   computeLedgerBalance,
   generateFFatCode,
   validateModemSerial,
   validateSpoolConsumption,
+  validateVanModemConsumption,
+  type ModemSource,
   type SpoolRecord,
   type TariffRule,
+  type VanStockRecord,
 } from './src/lib/fiberLogic.ts';
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -35,6 +39,36 @@ if (!fs.existsSync(UPLOADS_BASE_DIR)) {
 
 // Initialize DB on startup
 getDb();
+
+function recordActivity(
+  actor: AuthenticatedRequest['authUser'] | undefined,
+  actionType: string,
+  entityType: string,
+  entityId: number | null,
+  summary: string,
+  details?: string | null,
+): void {
+  if (!actor) return;
+  try {
+    getDb()
+      .prepare(
+        `INSERT INTO tbl_activity_logs (user_id, username, user_full_name, action_type, entity_type, entity_id, summary, details)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        actor.id,
+        actor.username,
+        `${actor.first_name} ${actor.last_name}`.trim(),
+        actionType,
+        entityType,
+        entityId,
+        summary,
+        details ?? null,
+      );
+  } catch {
+    // Non-blocking audit trail write
+  }
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -329,6 +363,18 @@ app.get('/api/dashboard', requireAuth, (req: AuthenticatedRequest, res) => {
         : [currentMonthPrefix, user.id, user.id]),
     );
 
+  const scheduledTickets = db
+    .prepare(
+      `SELECT t.*, u.first_name || ' ' || u.last_name as installer_name
+       FROM tbl_tickets t
+       LEFT JOIN tbl_users u ON u.id = t.assigned_installer
+       WHERE t.status != 'completed' ${canViewAll ? '' : 'AND t.assigned_installer = ?'}
+       ORDER BY COALESCE(t.scheduled_date, substr(t.created_at, 1, 10)) ASC,
+                COALESCE(t.scheduled_time, '23:59') ASC,
+                t.id ASC`,
+    )
+    .all(...(canViewAll ? [] : [user.id]));
+
   res.json({
     stats: {
       totalTickets: ticketStats.total || 0,
@@ -342,6 +388,7 @@ app.get('/api/dashboard', requireAuth, (req: AuthenticatedRequest, res) => {
       myBalance,
     },
     inboxTickets,
+    scheduledTickets,
     dailyMetrics,
     monthlySpoolStats,
   });
@@ -412,6 +459,35 @@ app.post(
     const type = req.body?.type;
     const assignedRaw = req.body?.assigned_installer;
 
+    const configPppoeUser =
+      typeof req.body?.config_pppoe_user === 'string' && req.body.config_pppoe_user.trim()
+        ? req.body.config_pppoe_user.trim().slice(0, 100)
+        : null;
+    const configPppoePass =
+      typeof req.body?.config_pppoe_pass === 'string' && req.body.config_pppoe_pass.trim()
+        ? req.body.config_pppoe_pass.trim().slice(0, 100)
+        : null;
+    const configVlanRaw = req.body?.config_vlan;
+    const configVlan =
+      configVlanRaw !== null && configVlanRaw !== undefined && String(configVlanRaw).trim() !== ''
+        ? Math.round(Number(configVlanRaw))
+        : null;
+    const hasVoip = req.body?.has_voip ? 1 : 0;
+    const configVoipData =
+      hasVoip && typeof req.body?.config_voip_data === 'string' && req.body.config_voip_data.trim()
+        ? req.body.config_voip_data.trim().slice(0, 500)
+        : null;
+    const operatorNotes =
+      typeof req.body?.operator_notes === 'string' && req.body.operator_notes.trim()
+        ? req.body.operator_notes.trim().slice(0, 1000)
+        : null;
+    const scheduledDateRaw =
+      typeof req.body?.scheduled_date === 'string' ? req.body.scheduled_date.trim() : '';
+    const scheduledDate = /^\d{4}-\d{2}-\d{2}$/.test(scheduledDateRaw) ? scheduledDateRaw : null;
+    const scheduledTimeRaw =
+      typeof req.body?.scheduled_time === 'string' ? req.body.scheduled_time.trim() : '';
+    const scheduledTime = /^\d{2}:\d{2}$/.test(scheduledTimeRaw) ? scheduledTimeRaw : null;
+
     if (!customerName || customerName.length > 150) {
       res.status(400).json({ error: 'نام مشترک الزامی است.' });
       return;
@@ -422,6 +498,10 @@ app.post(
     }
     if (type !== 'install' && type !== 'fault') {
       res.status(400).json({ error: 'نوع تیکت باید نصب یا خرابی باشد.' });
+      return;
+    }
+    if (configVlan !== null && (!Number.isInteger(configVlan) || configVlan < 1 || configVlan > 4094)) {
+      res.status(400).json({ error: 'شناسه VLAN باید عددی بین ۱ تا ۴۰۹۴ باشد.' });
       return;
     }
 
@@ -448,10 +528,27 @@ app.post(
 
     const info = db
       .prepare(
-        'INSERT INTO tbl_tickets (customer_name, address, type, status, assigned_installer) VALUES (?, ?, ?, ?, ?)',
+        `INSERT INTO tbl_tickets
+         (customer_name, address, type, config_pppoe_user, config_pppoe_pass, config_vlan, has_voip, config_voip_data, operator_notes, scheduled_date, scheduled_time, status, assigned_installer)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(customerName, address, type, status, assignedInstaller);
+      .run(
+        customerName,
+        address,
+        type,
+        configPppoeUser,
+        configPppoePass,
+        configVlan,
+        hasVoip,
+        configVoipData,
+        operatorNotes,
+        scheduledDate,
+        scheduledTime,
+        status,
+        assignedInstaller,
+      );
 
+    const createdId = Number(info.lastInsertRowid);
     const created = db
       .prepare(
         `SELECT t.*, u.first_name || ' ' || u.last_name as installer_name
@@ -459,9 +556,108 @@ app.post(
          LEFT JOIN tbl_users u ON u.id = t.assigned_installer
          WHERE t.id = ?`,
       )
-      .get(Number(info.lastInsertRowid));
+      .get(createdId) as { installer_name?: string | null } | undefined;
+
+    recordActivity(
+      req.authUser,
+      'ticket_created',
+      'ticket',
+      createdId,
+      `ثبت تیکت جدید #${createdId} برای مشترک ${customerName}`,
+      assignedInstaller && created?.installer_name
+        ? `نوع: ${type === 'install' ? 'نصب' : 'خرابی'} — ارجاع همزمان به ${created.installer_name}${scheduledDate ? ` — زمان‌بندی: ${scheduledDate}` : ''}`
+        : `نوع: ${type === 'install' ? 'نصب' : 'خرابی'} — در انتظار ارجاع${scheduledDate ? ` — زمان‌بندی: ${scheduledDate}` : ''}`,
+    );
 
     res.status(201).json({ ticket: created });
+  },
+);
+
+app.patch(
+  '/api/tickets/:id/config',
+  requireAuth,
+  requirePermission('can_create_tickets', 'can_assign_tickets'),
+  (req: AuthenticatedRequest, res) => {
+    const ticketId = Number(req.params.id);
+    if (!Number.isInteger(ticketId) || ticketId <= 0) {
+      res.status(400).json({ error: 'شناسه تیکت نامعتبر است.' });
+      return;
+    }
+    const db = getDb();
+    const existing = db.prepare('SELECT id, status FROM tbl_tickets WHERE id = ?').get(ticketId) as
+      | { id: number; status: string }
+      | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'تیکت یافت نشد.' });
+      return;
+    }
+
+    const configPppoeUser =
+      typeof req.body?.config_pppoe_user === 'string' && req.body.config_pppoe_user.trim()
+        ? req.body.config_pppoe_user.trim().slice(0, 100)
+        : null;
+    const configPppoePass =
+      typeof req.body?.config_pppoe_pass === 'string' && req.body.config_pppoe_pass.trim()
+        ? req.body.config_pppoe_pass.trim().slice(0, 100)
+        : null;
+    const configVlanRaw = req.body?.config_vlan;
+    const configVlan =
+      configVlanRaw !== null && configVlanRaw !== undefined && String(configVlanRaw).trim() !== ''
+        ? Math.round(Number(configVlanRaw))
+        : null;
+    const hasVoip = req.body?.has_voip ? 1 : 0;
+    const configVoipData =
+      hasVoip && typeof req.body?.config_voip_data === 'string' && req.body.config_voip_data.trim()
+        ? req.body.config_voip_data.trim().slice(0, 500)
+        : null;
+    const operatorNotes =
+      typeof req.body?.operator_notes === 'string' && req.body.operator_notes.trim()
+        ? req.body.operator_notes.trim().slice(0, 1000)
+        : null;
+
+    if (configVlan !== null && (!Number.isInteger(configVlan) || configVlan < 1 || configVlan > 4094)) {
+      res.status(400).json({ error: 'شناسه VLAN باید عددی بین ۱ تا ۴۰۹۴ باشد.' });
+      return;
+    }
+
+    db.prepare(
+      `UPDATE tbl_tickets
+       SET config_pppoe_user = ?,
+           config_pppoe_pass = ?,
+           config_vlan = ?,
+           has_voip = ?,
+           config_voip_data = ?,
+           operator_notes = ?
+       WHERE id = ?`,
+    ).run(
+      configPppoeUser,
+      configPppoePass,
+      configVlan,
+      hasVoip,
+      configVoipData,
+      operatorNotes,
+      ticketId,
+    );
+
+    const updated = db
+      .prepare(
+        `SELECT t.*, u.first_name || ' ' || u.last_name as installer_name
+         FROM tbl_tickets t
+         LEFT JOIN tbl_users u ON u.id = t.assigned_installer
+         WHERE t.id = ?`,
+      )
+      .get(ticketId);
+
+    recordActivity(
+      req.authUser,
+      'ticket_config_updated',
+      'ticket',
+      ticketId,
+      `به‌روزرسانی کانفیگ فنی تیکت #${ticketId}`,
+      configPppoeUser ? `PPPoE: ${configPppoeUser}${configVlan ? ` — VLAN: ${configVlan}` : ''}` : null,
+    );
+
+    res.json({ ticket: updated });
   },
 );
 
@@ -511,7 +707,17 @@ app.patch(
          LEFT JOIN tbl_users u ON u.id = t.assigned_installer
          WHERE t.id = ?`,
       )
-      .get(ticketId);
+      .get(ticketId) as { customer_name?: string; installer_name?: string } | undefined;
+
+    recordActivity(
+      req.authUser,
+      'ticket_assigned',
+      'ticket',
+      ticketId,
+      `تایید و ارجاع تیکت #${ticketId} به ${updated?.installer_name || `#${installerId}`}`,
+      updated?.customer_name ? `مشترک: ${updated.customer_name}` : null,
+    );
+
     res.json({ ticket: updated });
   },
 );
@@ -528,13 +734,15 @@ app.get('/api/tickets/:id/record', requireAuth, (req: AuthenticatedRequest, res)
     .prepare(
       `SELECT sr.*,
               t.customer_name, t.address, t.type as ticket_type, t.status as ticket_status,
+              t.config_pppoe_user, t.config_pppoe_pass, t.config_vlan, t.has_voip, t.config_voip_data, t.operator_notes,
               u.first_name || ' ' || u.last_name as installer_name,
               k.name as kaf_name,
               o.name as olt_name,
               f.fat_number,
               ff.ffat_code,
               so.spool_code as out_spool_code,
-              si.spool_code as in_spool_code
+              si.spool_code as in_spool_code,
+              mb.name as modem_brand_name
        FROM tbl_service_records sr
        JOIN tbl_tickets t ON t.id = sr.ticket_id
        JOIN tbl_users u ON u.id = sr.installer_id
@@ -544,6 +752,7 @@ app.get('/api/tickets/:id/record', requireAuth, (req: AuthenticatedRequest, res)
        JOIN tbl_ffats ff ON ff.id = sr.ffat_id
        LEFT JOIN tbl_spools so ON so.id = sr.out_spool_id
        LEFT JOIN tbl_spools si ON si.id = sr.in_spool_id
+       LEFT JOIN tbl_modem_brands mb ON mb.id = sr.modem_brand_id
        WHERE sr.ticket_id = ?`,
     )
     .get(ticketId) as Record<string, unknown> | undefined;
@@ -645,6 +854,9 @@ app.post(
     const fatId = Number(req.body?.fat_id);
     const ffatId = Number(req.body?.ffat_id);
     const modemBrandId = Number(req.body?.modem_brand_id);
+    const modemSourceRaw = req.body?.modem_source;
+    const modemSource: ModemSource = modemSourceRaw === 'customer' ? 'customer' : 'company';
+    const vanStockId = req.body?.van_stock_id ? Number(req.body.van_stock_id) : null;
     const modemSerial =
       typeof req.body?.modem_serial === 'string' ? req.body.modem_serial.trim() : '';
 
@@ -747,6 +959,7 @@ app.post(
     }
 
     const canCrossUse = userHasPermission(user, 'can_cross_use_cables');
+    const canManageInventory = userHasPermission(user, 'can_manage_inventory');
 
     db.exec('BEGIN IMMEDIATE;');
     try {
@@ -784,6 +997,64 @@ app.post(
           canCrossUse,
         );
         if (!vIn.ok) throw new Error(vIn.error);
+      }
+
+      // Modem Van Stock validation & atomic deduction when modemSource === 'company'
+      let usedVanStockId: number | null = null;
+      if (modemSource === 'company') {
+        let vanRow: VanStockRecord | undefined;
+        if (vanStockId) {
+          vanRow = db
+            .prepare(
+              `SELECT vs.id, vs.user_id, vs.item_id, ii.type as item_type, vs.serial_number, vs.quantity
+               FROM tbl_van_stock vs
+               JOIN tbl_inventory_items ii ON ii.id = vs.item_id
+               WHERE vs.id = ?`,
+            )
+            .get(vanStockId) as VanStockRecord | undefined;
+        } else {
+          // Auto-match by serial first, then by installer's brand bulk stock if no van_stock_id was explicitly passed
+          vanRow = db
+            .prepare(
+              `SELECT vs.id, vs.user_id, vs.item_id, ii.type as item_type, vs.serial_number, vs.quantity
+               FROM tbl_van_stock vs
+               JOIN tbl_inventory_items ii ON ii.id = vs.item_id
+               WHERE vs.user_id = ? AND ii.type = 'modem' AND vs.quantity > 0
+                 AND (UPPER(vs.serial_number) = UPPER(?) OR (vs.serial_number IS NULL AND (ii.modem_brand_id IS NULL OR ii.modem_brand_id = ?)))
+               ORDER BY CASE WHEN vs.serial_number IS NOT NULL THEN 0 ELSE 1 END, vs.id ASC
+               LIMIT 1`,
+            )
+            .get(effectiveInstallerId, modemSerial, modemBrandId) as VanStockRecord | undefined;
+        }
+
+        const vModem = validateVanModemConsumption(
+          vanRow,
+          modemSource,
+          modemSerial,
+          effectiveInstallerId,
+          canCrossUse || canManageInventory,
+        );
+        if (!vModem.ok) {
+          throw new Error(vModem.error);
+        }
+
+        const targetVanId = vanRow!.id;
+        if (vanRow!.quantity <= 1) {
+          const delRes = db
+            .prepare('DELETE FROM tbl_van_stock WHERE id = ? AND quantity = 1')
+            .run(targetVanId);
+          if (delRes.changes !== 1) {
+            throw new Error('موجودی مودم در انبار خودرو تغییر کرده است.');
+          }
+        } else {
+          const updRes = db
+            .prepare('UPDATE tbl_van_stock SET quantity = quantity - 1 WHERE id = ? AND quantity >= 1')
+            .run(targetVanId);
+          if (updRes.changes !== 1) {
+            throw new Error('موجودی مودم در انبار خودرو کافی نیست.');
+          }
+        }
+        usedVanStockId = targetVanId;
       }
 
       // Deduct meters atomically
@@ -841,8 +1112,8 @@ app.post(
       const recRes = db
         .prepare(
           `INSERT INTO tbl_service_records
-           (ticket_id, installer_id, kaf_id, olt_id, fat_id, ffat_id, out_spool_id, out_total_meter, in_spool_id, in_total_meter, modem_serial, price_snapshot, service_date_jalali, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (ticket_id, installer_id, kaf_id, olt_id, fat_id, ffat_id, out_spool_id, out_total_meter, in_spool_id, in_total_meter, modem_source, modem_brand_id, van_stock_id, modem_serial, price_snapshot, service_date_jalali, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           ticketId,
@@ -855,6 +1126,9 @@ app.post(
           outMeter,
           inMeter > 0 ? inSpoolId : null,
           inMeter,
+          modemSource,
+          modemBrandId,
+          usedVanStockId,
           modemSerial,
           JSON.stringify(snapshot),
           serviceDateJalali,
@@ -884,9 +1158,20 @@ app.post(
       db.prepare('UPDATE tbl_tickets SET status = ? WHERE id = ?').run('completed', ticketId);
 
       db.exec('COMMIT;');
+
+      recordActivity(
+        req.authUser,
+        'service_completed',
+        'ticket',
+        ticketId,
+        `تایید و تکمیل عملیات تیکت #${ticketId}`,
+        `متراژ کل: ${snapshot.total_meter} متر — سریال مودم: ${modemSerial}`,
+      );
+
       res.status(201).json({
         record_id: recordId,
         price_snapshot: snapshot,
+        modem_source: modemSource,
       });
     } catch (err) {
       db.exec('ROLLBACK;');
@@ -1079,7 +1364,7 @@ app.post(
   '/api/spools',
   requireAuth,
   requirePermission('can_manage_inventory'),
-  (req, res) => {
+  (req: AuthenticatedRequest, res) => {
     const spoolCode =
       typeof req.body?.spool_code === 'string' ? req.body.spool_code.trim().toUpperCase() : '';
     const cableType = req.body?.cable_type;
@@ -1107,7 +1392,16 @@ app.post(
           'INSERT INTO tbl_spools (spool_code, cable_type, initial_length, current_length, assigned_installer_id) VALUES (?, ?, ?, ?, ?)',
         )
         .run(spoolCode, cableType, initialLength, initialLength, assignedInstallerId);
-      res.status(201).json({ id: Number(info.lastInsertRowid) });
+      const newId = Number(info.lastInsertRowid);
+      recordActivity(
+        req.authUser,
+        'spool_created',
+        'spool',
+        newId,
+        `ثبت قرقره کابل جدید ${spoolCode} (${initialLength} متر)`,
+        `نوع کابل: ${cableType === 'outdoor' ? 'فضای باز' : 'داخلی'}`,
+      );
+      res.status(201).json({ id: newId });
     } catch {
       res.status(400).json({ error: 'کد قرقره تکراری است.' });
     }
@@ -1118,7 +1412,7 @@ app.patch(
   '/api/spools/:id/transfer',
   requireAuth,
   requirePermission('can_manage_inventory'),
-  (req, res) => {
+  (req: AuthenticatedRequest, res) => {
     const spoolId = Number(req.params.id);
     const assignedId =
       req.body?.assigned_installer_id === null || req.body?.assigned_installer_id === ''
@@ -1126,12 +1420,16 @@ app.patch(
         : Number(req.body?.assigned_installer_id);
 
     const db = getDb();
+    let targetName = 'انبار مرکزی';
     if (assignedId !== null) {
-      const u = db.prepare('SELECT id FROM tbl_users WHERE id = ? AND is_active = 1').get(assignedId);
+      const u = db
+        .prepare('SELECT id, first_name, last_name FROM tbl_users WHERE id = ? AND is_active = 1')
+        .get(assignedId) as { id: number; first_name: string; last_name: string } | undefined;
       if (!u) {
         res.status(400).json({ error: 'نصاب مقصد معتبر نیست.' });
         return;
       }
+      targetName = `${u.first_name} ${u.last_name}`;
     }
     const upd = db
       .prepare('UPDATE tbl_spools SET assigned_installer_id = ? WHERE id = ?')
@@ -1140,7 +1438,357 @@ app.patch(
       res.status(404).json({ error: 'قرقره یافت نشد.' });
       return;
     }
+    const spoolRow = db.prepare('SELECT spool_code FROM tbl_spools WHERE id = ?').get(spoolId) as
+      | { spool_code: string }
+      | undefined;
+    recordActivity(
+      req.authUser,
+      'spool_transferred',
+      'spool',
+      spoolId,
+      `انتقال قرقره ${spoolRow?.spool_code || `#${spoolId}`} به ${targetName}`,
+      null,
+    );
     res.json({ ok: true });
+  },
+);
+
+app.patch(
+  '/api/spools/:id/consume',
+  requireAuth,
+  requirePermission('can_manage_inventory'),
+  (req: AuthenticatedRequest, res) => {
+    const spoolId = Number(req.params.id);
+    const meters = Math.round(Number(req.body?.meters) || 0);
+    if (!Number.isInteger(spoolId) || spoolId <= 0 || !Number.isInteger(meters) || meters <= 0) {
+      res.status(400).json({ error: 'متراژ مصرفی باید یک عدد صحیح مثبت باشد.' });
+      return;
+    }
+
+    const db = getDb();
+    const upd = db
+      .prepare(
+        'UPDATE tbl_spools SET current_length = current_length - ? WHERE id = ? AND current_length >= ?',
+      )
+      .run(meters, spoolId, meters);
+
+    if (upd.changes === 0) {
+      const exists = db.prepare('SELECT id, current_length FROM tbl_spools WHERE id = ?').get(spoolId) as
+        | { id: number; current_length: number }
+        | undefined;
+      if (!exists) {
+        res.status(404).json({ error: 'قرقره مورد نظر یافت نشد.' });
+      } else {
+        res.status(400).json({ error: 'موجودی باقیمانده قرقره برای این متراژ کافی نیست.' });
+      }
+      return;
+    }
+
+    const spool = db
+      .prepare(
+        `SELECT s.*, u.first_name || ' ' || u.last_name as installer_name
+         FROM tbl_spools s
+         LEFT JOIN tbl_users u ON u.id = s.assigned_installer_id
+         WHERE s.id = ?`,
+      )
+      .get(spoolId) as { spool_code: string; current_length: number };
+
+    recordActivity(
+      req.authUser,
+      'spool_consumed',
+      'spool',
+      spoolId,
+      `کسر متراژ ${meters} متر از قرقره ${spool.spool_code}`,
+      `موجودی باقیمانده فعلی: ${spool.current_length} متر`,
+    );
+
+    res.json({ ok: true, spool });
+  },
+);
+
+// General Inventory Items, Modems & Van Stock
+app.get('/api/inventory', requireAuth, (req: AuthenticatedRequest, res) => {
+  const user = req.authUser!;
+  const db = getDb();
+  const canSeeAll =
+    userHasPermission(user, 'can_manage_inventory') ||
+    userHasPermission(user, 'can_cross_use_cables') ||
+    userHasPermission(user, 'can_view_all_tickets');
+
+  const items = db
+    .prepare(
+      `SELECT ii.*,
+              mb.name as brand_name,
+              COALESCE((SELECT SUM(vs.quantity) FROM tbl_van_stock vs WHERE vs.item_id = ii.id), 0) as van_allocated_quantity
+       FROM tbl_inventory_items ii
+       LEFT JOIN tbl_modem_brands mb ON mb.id = ii.modem_brand_id
+       ORDER BY ii.id ASC`,
+    )
+    .all();
+
+  const vanStock = db
+    .prepare(
+      `SELECT vs.*,
+              u.first_name || ' ' || u.last_name as installer_name,
+              ii.name as item_name,
+              ii.type as item_type,
+              ii.modem_brand_id,
+              mb.name as brand_name
+       FROM tbl_van_stock vs
+       JOIN tbl_users u ON u.id = vs.user_id
+       JOIN tbl_inventory_items ii ON ii.id = vs.item_id
+       LEFT JOIN tbl_modem_brands mb ON mb.id = ii.modem_brand_id
+       ${canSeeAll ? '' : 'WHERE vs.user_id = ?'}
+       ORDER BY vs.id DESC`,
+    )
+    .all(...(canSeeAll ? [] : [user.id]));
+
+  const modemBrands = db.prepare('SELECT * FROM tbl_modem_brands ORDER BY id ASC').all();
+
+  res.json({ items, vanStock, modemBrands });
+});
+
+app.post(
+  '/api/inventory/items',
+  requireAuth,
+  requirePermission('can_manage_inventory'),
+  (req: AuthenticatedRequest, res) => {
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const type = req.body?.type;
+    const totalQuantity = Math.max(0, Math.round(Number(req.body?.total_quantity) || 0));
+    const modemBrandId =
+      type === 'modem' && req.body?.modem_brand_id ? Number(req.body.modem_brand_id) : null;
+
+    if (!name || name.length > 150) {
+      res.status(400).json({ error: 'نام کالا یا تجهیزات الزامی است.' });
+      return;
+    }
+    if (!['unit', 'spool', 'modem'].includes(type)) {
+      res.status(400).json({ error: 'نوع کالا باید unit، spool یا modem باشد.' });
+      return;
+    }
+
+    const db = getDb();
+    if (modemBrandId !== null) {
+      const b = db.prepare('SELECT id FROM tbl_modem_brands WHERE id = ?').get(modemBrandId);
+      if (!b) {
+        res.status(400).json({ error: 'برند مودم انتخاب‌شده معتبر نیست.' });
+        return;
+      }
+    }
+
+    const info = db
+      .prepare(
+        'INSERT INTO tbl_inventory_items (name, type, modem_brand_id, total_quantity) VALUES (?, ?, ?, ?)',
+      )
+      .run(name, type, modemBrandId, totalQuantity);
+    const itemId = Number(info.lastInsertRowid);
+
+    recordActivity(
+      req.authUser,
+      'inventory_item_created',
+      'inventory',
+      itemId,
+      `افزودن کالای جدید به انبار: ${name}`,
+      `موجودی اولیه: ${totalQuantity} عدد`,
+    );
+
+    res.status(201).json({ id: itemId });
+  },
+);
+
+app.patch(
+  '/api/inventory/items/:id/adjust',
+  requireAuth,
+  requirePermission('can_manage_inventory'),
+  (req: AuthenticatedRequest, res) => {
+    const itemId = Number(req.params.id);
+    const delta = Math.round(Number(req.body?.delta) || 0);
+    if (!Number.isInteger(itemId) || itemId <= 0 || delta === 0) {
+      res.status(400).json({ error: 'مقدار تغییر موجودی نامعتبر است.' });
+      return;
+    }
+    const db = getDb();
+    const upd = db
+      .prepare(
+        'UPDATE tbl_inventory_items SET total_quantity = total_quantity + ? WHERE id = ? AND total_quantity + ? >= 0',
+      )
+      .run(delta, itemId, delta);
+    if (upd.changes === 0) {
+      res.status(400).json({ error: 'کالا یافت نشد یا موجودی کافی نیست.' });
+      return;
+    }
+    const itemRow = db
+      .prepare('SELECT name, total_quantity FROM tbl_inventory_items WHERE id = ?')
+      .get(itemId) as { name: string; total_quantity: number } | undefined;
+    recordActivity(
+      req.authUser,
+      'inventory_adjusted',
+      'inventory',
+      itemId,
+      `تغییر موجودی انبار مرکزی (${itemRow?.name || `#${itemId}`}): ${delta > 0 ? `+${delta}` : delta} عدد`,
+      itemRow ? `موجودی فعلی: ${itemRow.total_quantity} عدد` : null,
+    );
+    res.json({ ok: true });
+  },
+);
+
+app.post(
+  '/api/inventory/van-stock/transfer',
+  requireAuth,
+  requirePermission('can_manage_inventory'),
+  (req: AuthenticatedRequest, res) => {
+    const userId = Number(req.body?.user_id);
+    const itemId = Number(req.body?.item_id);
+    const rawSerial =
+      typeof req.body?.serial_number === 'string' && req.body.serial_number.trim()
+        ? req.body.serial_number.trim().toUpperCase().slice(0, 100)
+        : null;
+    const requestedQty = rawSerial ? 1 : Math.max(1, Math.round(Number(req.body?.quantity) || 1));
+
+    if (!Number.isInteger(userId) || !Number.isInteger(itemId)) {
+      res.status(400).json({ error: 'نصاب مقصد و کالای انبار باید انتخاب شوند.' });
+      return;
+    }
+
+    const db = getDb();
+    const installer = db
+      .prepare('SELECT id, first_name, last_name FROM tbl_users WHERE id = ? AND is_active = 1')
+      .get(userId) as { id: number; first_name: string; last_name: string } | undefined;
+    if (!installer) {
+      res.status(400).json({ error: 'نصاب انتخاب‌شده معتبر یا فعال نیست.' });
+      return;
+    }
+
+    const item = db
+      .prepare('SELECT id, name, type, modem_brand_id, total_quantity FROM tbl_inventory_items WHERE id = ?')
+      .get(itemId) as
+      | { id: number; name: string; type: string; modem_brand_id: number | null; total_quantity: number }
+      | undefined;
+
+    if (!item) {
+      res.status(404).json({ error: 'کالای انبار یافت نشد.' });
+      return;
+    }
+
+    if (rawSerial && item.modem_brand_id) {
+      const brand = db
+        .prepare('SELECT name, serial_prefix, serial_pattern FROM tbl_modem_brands WHERE id = ?')
+        .get(item.modem_brand_id) as
+        | { name: string; serial_prefix: string; serial_pattern: string }
+        | undefined;
+      if (brand) {
+        const chk = validateModemSerial(rawSerial, brand);
+        if (!chk.valid) {
+          res.status(400).json({ error: chk.reason || 'سریال واردشده با الگوی برند مودم مطابقت ندارد.' });
+          return;
+        }
+      }
+    }
+
+    db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (rawSerial) {
+        const dup = db
+          .prepare('SELECT id FROM tbl_van_stock WHERE UPPER(serial_number) = UPPER(?)')
+          .get(rawSerial);
+        if (dup) {
+          throw new Error(`سریال ${rawSerial} قبلاً در موجودی خودروی یک نصاب ثبت شده است.`);
+        }
+      }
+
+      const deduct = db
+        .prepare(
+          'UPDATE tbl_inventory_items SET total_quantity = total_quantity - ? WHERE id = ? AND total_quantity >= ?',
+        )
+        .run(requestedQty, itemId, requestedQty);
+      if (deduct.changes !== 1) {
+        throw new Error('موجودی انبار مرکزی برای این تعداد کافی نیست.');
+      }
+
+      if (!rawSerial) {
+        const existingBulk = db
+          .prepare(
+            'SELECT id FROM tbl_van_stock WHERE user_id = ? AND item_id = ? AND serial_number IS NULL LIMIT 1',
+          )
+          .get(userId, itemId) as { id: number } | undefined;
+        if (existingBulk) {
+          db.prepare('UPDATE tbl_van_stock SET quantity = quantity + ? WHERE id = ?').run(
+            requestedQty,
+            existingBulk.id,
+          );
+        } else {
+          db.prepare(
+            'INSERT INTO tbl_van_stock (user_id, item_id, serial_number, quantity) VALUES (?, ?, NULL, ?)',
+          ).run(userId, itemId, requestedQty);
+        }
+      } else {
+        db.prepare(
+          'INSERT INTO tbl_van_stock (user_id, item_id, serial_number, quantity) VALUES (?, ?, ?, 1)',
+        ).run(userId, itemId, rawSerial);
+      }
+
+      db.exec('COMMIT;');
+      recordActivity(
+        req.authUser,
+        'van_stock_transferred',
+        'inventory',
+        itemId,
+        `تحویل ${item.name} به خودروی ${installer.first_name} ${installer.last_name}`,
+        rawSerial ? `شماره سریال: ${rawSerial}` : `تعداد: ${requestedQty} عدد`,
+      );
+      res.status(201).json({ ok: true });
+    } catch (err) {
+      db.exec('ROLLBACK;');
+      res.status(400).json({ error: err instanceof Error ? err.message : 'خطا در تحویل کالا به نصاب' });
+    }
+  },
+);
+
+app.post(
+  '/api/inventory/van-stock/:id/return',
+  requireAuth,
+  requirePermission('can_manage_inventory'),
+  (req: AuthenticatedRequest, res) => {
+    const vanStockId = Number(req.params.id);
+    if (!Number.isInteger(vanStockId) || vanStockId <= 0) {
+      res.status(400).json({ error: 'شناسه موجودی خودرو نامعتبر است.' });
+      return;
+    }
+
+    const db = getDb();
+    db.exec('BEGIN IMMEDIATE;');
+    try {
+      const row = db
+        .prepare(
+          `SELECT vs.id, vs.item_id, vs.quantity, ii.name as item_name
+           FROM tbl_van_stock vs
+           JOIN tbl_inventory_items ii ON ii.id = vs.item_id
+           WHERE vs.id = ?`,
+        )
+        .get(vanStockId) as { id: number; item_id: number; quantity: number; item_name: string } | undefined;
+      if (!row) {
+        throw new Error('ردیف موجودی خودرو یافت نشد.');
+      }
+      db.prepare('UPDATE tbl_inventory_items SET total_quantity = total_quantity + ? WHERE id = ?').run(
+        row.quantity,
+        row.item_id,
+      );
+      db.prepare('DELETE FROM tbl_van_stock WHERE id = ?').run(vanStockId);
+      db.exec('COMMIT;');
+      recordActivity(
+        req.authUser,
+        'van_stock_returned',
+        'inventory',
+        row.item_id,
+        `عودت ${row.item_name} (${row.quantity} عدد) از خودروی نصاب به انبار مرکزی`,
+        null,
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      db.exec('ROLLBACK;');
+      res.status(400).json({ error: err instanceof Error ? err.message : 'خطا در عودت کالا به انبار' });
+    }
   },
 );
 
@@ -1151,40 +1799,86 @@ app.patch(
 app.get(
   '/api/financial',
   requireAuth,
-  requirePermission('can_view_financials', 'can_manage_tariffs'),
-  (_req, res) => {
+  requirePermission('can_view_financials', 'can_manage_tariffs', 'can_execute_service'),
+  (req: AuthenticatedRequest, res) => {
+    const user = req.authUser!;
+    const canViewAllFinancials =
+      user.isSuperAdmin ||
+      userHasPermission(user, 'can_view_financials') ||
+      userHasPermission(user, 'can_manage_tariffs');
+
     const db = getDb();
-    const tariffs = db
-      .prepare(
-        `SELECT tf.*, u.first_name || ' ' || u.last_name as installer_name, u.username
-         FROM tbl_tariffs tf
-         JOIN tbl_users u ON u.id = tf.installer_id
-         ORDER BY tf.id ASC`,
-      )
-      .all();
+    const tariffs = (
+      canViewAllFinancials
+        ? db
+            .prepare(
+              `SELECT tf.*, u.first_name || ' ' || u.last_name as installer_name, u.username
+               FROM tbl_tariffs tf
+               JOIN tbl_users u ON u.id = tf.installer_id
+               ORDER BY tf.id ASC`,
+            )
+            .all()
+        : db
+            .prepare(
+              `SELECT tf.*, u.first_name || ' ' || u.last_name as installer_name, u.username
+               FROM tbl_tariffs tf
+               JOIN tbl_users u ON u.id = tf.installer_id
+               WHERE tf.installer_id = ?
+               ORDER BY tf.id ASC`,
+            )
+            .all(user.id)
+    );
 
-    const ledger = db
-      .prepare(
-        `SELECT l.*, u.first_name || ' ' || u.last_name as user_name, sr.ticket_id
-         FROM tbl_ledger l
-         JOIN tbl_users u ON u.id = l.user_id
-         LEFT JOIN tbl_service_records sr ON sr.id = l.record_id
-         ORDER BY l.id DESC
-         LIMIT 100`,
-      )
-      .all();
+    const ledger = (
+      canViewAllFinancials
+        ? db
+            .prepare(
+              `SELECT l.*, u.first_name || ' ' || u.last_name as user_name, sr.ticket_id
+               FROM tbl_ledger l
+               JOIN tbl_users u ON u.id = l.user_id
+               LEFT JOIN tbl_service_records sr ON sr.id = l.record_id
+               ORDER BY l.id DESC
+               LIMIT 250`,
+            )
+            .all()
+        : db
+            .prepare(
+              `SELECT l.*, u.first_name || ' ' || u.last_name as user_name, sr.ticket_id
+               FROM tbl_ledger l
+               JOIN tbl_users u ON u.id = l.user_id
+               LEFT JOIN tbl_service_records sr ON sr.id = l.record_id
+               WHERE l.user_id = ?
+               ORDER BY l.id DESC
+               LIMIT 250`,
+            )
+            .all(user.id)
+    );
 
-    const users = db
-      .prepare(
-        `SELECT u.id, u.first_name || ' ' || u.last_name as full_name, r.role_name
-         FROM tbl_users u JOIN tbl_roles r ON r.id = u.role_id
-         WHERE u.is_active = 1`,
-      )
-      .all() as Array<{ id: number; full_name: string; role_name: string }>;
+    const users = (
+      canViewAllFinancials
+        ? db
+            .prepare(
+              `SELECT u.id, u.first_name || ' ' || u.last_name as full_name, r.role_name
+               FROM tbl_users u JOIN tbl_roles r ON r.id = u.role_id
+               WHERE u.is_active = 1`,
+            )
+            .all()
+        : db
+            .prepare(
+              `SELECT u.id, u.first_name || ' ' || u.last_name as full_name, r.role_name
+               FROM tbl_users u JOIN tbl_roles r ON r.id = u.role_id
+               WHERE u.id = ?`,
+            )
+            .all(user.id)
+    ) as Array<{ id: number; full_name: string; role_name: string }>;
 
-    const allEntries = db
-      .prepare('SELECT user_id, amount, type FROM tbl_ledger')
-      .all() as Array<{ user_id: number; amount: number; type: 'credit' | 'debit' }>;
+    const allEntries = (
+      canViewAllFinancials
+        ? db.prepare('SELECT user_id, amount, type, created_at FROM tbl_ledger').all()
+        : db
+            .prepare('SELECT user_id, amount, type, created_at FROM tbl_ledger WHERE user_id = ?')
+            .all(user.id)
+    ) as Array<{ user_id: number; amount: number; type: 'credit' | 'debit'; created_at: string }>;
 
     const balances = users.map((u) => {
       const userEntries = allEntries.filter((e) => e.user_id === u.id);
@@ -1197,7 +1891,9 @@ app.get(
       };
     });
 
-    res.json({ tariffs, ledger, balances });
+    const monthlyEarnings = aggregateMonthlyContractorEarnings(allEntries);
+
+    res.json({ tariffs, ledger, balances, monthlyEarnings, isScopedToSelf: !canViewAllFinancials });
   },
 );
 
@@ -1205,7 +1901,7 @@ app.post(
   '/api/financial/tariffs',
   requireAuth,
   requirePermission('can_manage_tariffs'),
-  (req, res) => {
+  (req: AuthenticatedRequest, res) => {
     const installerId = Number(req.body?.installer_id);
     const calcType = req.body?.calc_type;
     const basePrice = Math.max(0, Number(req.body?.base_price) || 0);
@@ -1232,6 +1928,15 @@ app.post(
          bonus_amount = excluded.bonus_amount`,
     ).run(installerId, calcType, basePrice, meterLimit, extraMeterPrice, bonusTargetCount, bonusAmount);
 
+    recordActivity(
+      req.authUser,
+      'tariff_updated',
+      'financial',
+      installerId,
+      `به‌روزرسانی تعرفه دستمزد نصاب #${installerId}`,
+      `مدل محاسبه: ${calcType} — مبلغ پایه: ${basePrice.toLocaleString('en-US')} تومان`,
+    );
+
     res.json({ ok: true });
   },
 );
@@ -1240,7 +1945,7 @@ app.post(
   '/api/financial/payout',
   requireAuth,
   requirePermission('can_manage_tariffs'),
-  (req, res) => {
+  (req: AuthenticatedRequest, res) => {
     const userId = Number(req.body?.user_id);
     const amount = Number(req.body?.amount);
     const description =
@@ -1254,7 +1959,9 @@ app.post(
     }
 
     const db = getDb();
-    const u = db.prepare('SELECT id FROM tbl_users WHERE id = ?').get(userId);
+    const u = db.prepare('SELECT id, first_name, last_name FROM tbl_users WHERE id = ?').get(userId) as
+      | { id: number; first_name: string; last_name: string }
+      | undefined;
     if (!u) {
       res.status(404).json({ error: 'کاربر یافت نشد.' });
       return;
@@ -1263,6 +1970,15 @@ app.post(
     db.prepare(
       'INSERT INTO tbl_ledger (user_id, record_id, amount, type, description) VALUES (?, NULL, ?, ?, ?)',
     ).run(userId, amount, 'debit', description);
+
+    recordActivity(
+      req.authUser,
+      'payout_recorded',
+      'financial',
+      userId,
+      `ثبت سند پرداخت مالی ${Math.round(amount).toLocaleString('en-US')} تومان برای ${u.first_name} ${u.last_name}`,
+      description,
+    );
 
     res.status(201).json({ ok: true });
   },
@@ -1328,12 +2044,29 @@ app.get(
       )
       .all();
 
+    const activityLogs = db
+      .prepare('SELECT * FROM tbl_activity_logs ORDER BY id DESC LIMIT 120')
+      .all();
+
     res.json({
       permissions,
       roles: rolesWithPerms,
       users,
+      activityLogs,
       timeoutMinutes: getSessionTimeoutMinutes(),
     });
+  },
+);
+
+app.get(
+  '/api/rbac/activity-logs',
+  requireAuth,
+  requirePermission('can_manage_users'),
+  (_req, res) => {
+    const logs = getDb()
+      .prepare('SELECT * FROM tbl_activity_logs ORDER BY id DESC LIMIT 150')
+      .all();
+    res.json({ activityLogs: logs });
   },
 );
 
@@ -1363,6 +2096,14 @@ app.post('/api/rbac/roles', requireAuth, (req: AuthenticatedRequest, res) => {
       ins.run(roleId, pid);
     }
     db.exec('COMMIT;');
+    recordActivity(
+      req.authUser,
+      'role_created',
+      'role',
+      roleId,
+      `ایجاد نقش دسترسی جدید «${roleName}»`,
+      `تعداد مجوزها: ${permIds.length}`,
+    );
     res.status(201).json({ id: roleId, role_name: roleName, perm_ids: permIds });
   } catch {
     db.exec('ROLLBACK;');
@@ -1401,6 +2142,14 @@ app.put('/api/rbac/roles/:id', requireAuth, (req: AuthenticatedRequest, res) => 
       ins.run(roleId, pid);
     }
     db.exec('COMMIT;');
+    recordActivity(
+      req.authUser,
+      'role_updated',
+      'role',
+      roleId,
+      `به‌روزرسانی مجوزهای نقش «${role.role_name}»`,
+      `تعداد مجوزهای فعال: ${permIds.length}`,
+    );
     res.json({ ok: true });
   } catch {
     db.exec('ROLLBACK;');
@@ -1451,7 +2200,16 @@ app.post(
           'INSERT INTO tbl_users (username, password_hash, first_name, last_name, role_id, is_active) VALUES (?, ?, ?, ?, ?, 1)',
         )
         .run(username, hashPassword(password), firstName, lastName, roleId);
-      res.status(201).json({ id: Number(info.lastInsertRowid) });
+      const newUid = Number(info.lastInsertRowid);
+      recordActivity(
+        req.authUser,
+        'user_created',
+        'user',
+        newUid,
+        `ایجاد حساب کاربری جدید برای ${firstName} ${lastName} (${username})`,
+        `نقش سازمانی: ${role.role_name}`,
+      );
+      res.status(201).json({ id: newUid });
     } catch {
       res.status(400).json({ error: 'این نام کاربری قبلاً ثبت شده است.' });
     }
@@ -1466,8 +2224,10 @@ app.patch(
     const userId = Number(req.params.id);
     const db = getDb();
     const existing = db
-      .prepare('SELECT id, username, role_id, is_active FROM tbl_users WHERE id = ?')
-      .get(userId) as { id: number; username: string; role_id: number; is_active: number } | undefined;
+      .prepare('SELECT id, username, first_name, last_name, role_id, is_active FROM tbl_users WHERE id = ?')
+      .get(userId) as
+      | { id: number; username: string; first_name: string; last_name: string; role_id: number; is_active: number }
+      | undefined;
     if (!existing) {
       res.status(404).json({ error: 'کاربر یافت نشد.' });
       return;
@@ -1502,6 +2262,15 @@ app.patch(
       );
     }
 
+    recordActivity(
+      req.authUser,
+      'user_updated',
+      'user',
+      userId,
+      `به‌روزرسانی وضعیت حساب ${existing.first_name} ${existing.last_name} (${existing.username})`,
+      `وضعیت: ${isActive === 1 ? 'فعال' : 'غیرفعال'}`,
+    );
+
     res.json({ ok: true });
   },
 );
@@ -1521,6 +2290,14 @@ app.patch('/api/rbac/settings', requireAuth, (req: AuthenticatedRequest, res) =>
       'INSERT INTO tbl_settings (key_name, value) VALUES (?, ?) ON CONFLICT(key_name) DO UPDATE SET value = excluded.value',
     )
     .run('session_timeout_minutes', String(minutes));
+  recordActivity(
+    req.authUser,
+    'settings_updated',
+    'settings',
+    null,
+    `تغییر زمان خروج خودکار سامانه به ${minutes} دقیقه`,
+    null,
+  );
   res.json({ timeoutMinutes: minutes });
 });
 

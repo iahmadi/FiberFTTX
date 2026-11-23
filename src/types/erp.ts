@@ -1,4 +1,4 @@
-import type { PriceSnapshot, ServiceType, TariffCalcType } from '../lib/fiberLogic';
+import type { ModemSource, PriceSnapshot, ServiceType, TariffCalcType } from '../lib/fiberLogic';
 
 export interface AuthUser {
   id: number;
@@ -20,12 +20,21 @@ export interface TicketItem {
   status: 'pending' | 'assigned' | 'completed';
   assigned_installer: number | null;
   installer_name: string | null;
+  config_pppoe_user?: string | null;
+  config_pppoe_pass?: string | null;
+  config_vlan?: number | null;
+  has_voip?: number;
+  config_voip_data?: string | null;
+  operator_notes?: string | null;
   service_record_id?: number | null;
   ffat_code?: string | null;
   fat_number?: number | null;
   olt_name?: string | null;
   kaf_name?: string | null;
   modem_serial?: string | null;
+  modem_source?: ModemSource | null;
+  scheduled_date?: string | null;
+  scheduled_time?: string | null;
   created_at: string;
 }
 
@@ -64,8 +73,33 @@ export interface ModemBrandItem {
   serial_prefix: string;
 }
 
+export interface InventoryItemRecord {
+  id: number;
+  name: string;
+  type: 'unit' | 'spool' | 'modem';
+  modem_brand_id: number | null;
+  brand_name?: string | null;
+  total_quantity: number;
+  van_allocated_quantity?: number;
+}
+
+export interface VanStockItem {
+  id: number;
+  user_id: number;
+  installer_name?: string;
+  item_id: number;
+  item_name: string;
+  item_type: 'unit' | 'spool' | 'modem';
+  modem_brand_id?: number | null;
+  brand_name?: string | null;
+  serial_number: string | null;
+  quantity: number;
+  created_at?: string;
+}
+
 export interface SpoolItem {
   id: number;
+  item_id?: number | null;
   spool_code: string;
   cable_type: 'indoor' | 'outdoor';
   initial_length: number;
@@ -108,6 +142,13 @@ export interface BalanceSummary {
   balance: number;
 }
 
+export interface MonthlyContractorEarning {
+  monthKey: string;
+  monthLabel: string;
+  totalEarnings: number;
+  entryCount: number;
+}
+
 export interface PermissionItem {
   id: number;
   key_name: string;
@@ -132,6 +173,19 @@ export interface UserAdminItem {
   has_password: number;
 }
 
+export interface ActivityLogItem {
+  id: number;
+  user_id: number | null;
+  username: string;
+  user_full_name: string;
+  action_type: string;
+  entity_type: string;
+  entity_id: number | null;
+  summary: string;
+  details: string | null;
+  created_at: string;
+}
+
 export interface ServiceRecordDetail {
   id: number;
   ticket_id: number;
@@ -147,7 +201,15 @@ export interface ServiceRecordDetail {
   out_total_meter: number;
   in_spool_code: string | null;
   in_total_meter: number;
+  modem_source: ModemSource;
+  modem_brand_name?: string | null;
   modem_serial: string;
+  config_pppoe_user?: string | null;
+  config_pppoe_pass?: string | null;
+  config_vlan?: number | null;
+  has_voip?: number;
+  config_voip_data?: string | null;
+  operator_notes?: string | null;
   price_snapshot: PriceSnapshot;
   service_date_jalali: string | null;
   notes: string | null;

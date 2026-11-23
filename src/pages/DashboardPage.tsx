@@ -1,14 +1,18 @@
 import { useEffect, useState } from 'react';
-import { ArrowLeft, Cable, CheckCircle2, ClipboardList, Clock, Package, Wallet } from 'lucide-react';
+import { ArrowLeft, Cable, CheckCircle2, ClipboardList, Clock, Package, Settings2, Wallet } from 'lucide-react';
 import type { AuthUser, TicketItem } from '../types/erp';
 import { apiFetch } from '../utils/api';
 import { formatDateTimeToJalali, formatToman, toPersianDigits } from '../lib/jalali';
+import { hasTicketProvisioningConfig } from '../lib/fiberLogic';
 import { OfflineCableBreakdown } from '../components/OfflineCharts';
 import {
   MonthlyStatsRecharts,
   type MonthlyDailyMetric,
   type MonthlySpoolStat,
 } from '../components/MonthlyStatsRecharts';
+import { Modal } from '../components/Modal';
+import { ProvisioningConfigBox } from '../components/ProvisioningConfigBox';
+import { ScheduledTicketsCalendarWidget } from '../components/ScheduledTicketsCalendarWidget';
 
 interface DashboardResponse {
   stats: {
@@ -27,6 +31,7 @@ interface DashboardResponse {
     };
   };
   inboxTickets: TicketItem[];
+  scheduledTickets?: TicketItem[];
   dailyMetrics: MonthlyDailyMetric[];
   monthlySpoolStats: MonthlySpoolStat[];
 }
@@ -45,6 +50,7 @@ export function DashboardPage({
   const [data, setData] = useState<DashboardResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [previewTicket, setPreviewTicket] = useState<TicketItem | null>(null);
 
   const canExecute = user.isSuperAdmin || user.permissions.includes('can_execute_service');
 
@@ -87,7 +93,7 @@ export function DashboardPage({
     );
   }
 
-  const { stats, inboxTickets, dailyMetrics, monthlySpoolStats } = data;
+  const { stats, inboxTickets, scheduledTickets, dailyMetrics, monthlySpoolStats } = data;
 
   return (
     <div className="space-y-6">
@@ -145,6 +151,14 @@ export function DashboardPage({
           </div>
         </div>
       </div>
+
+      {/* Scheduled Installations Daily Calendar Widget */}
+      <ScheduledTicketsCalendarWidget
+        tickets={scheduledTickets || inboxTickets}
+        canExecute={canExecute}
+        onStartTicketService={onStartTicketService}
+        onPreviewTicket={(t) => setPreviewTicket(t)}
+      />
 
       {/* Recharts Row (Monthly Completed Tickets & Spool Consumption Side-by-Side) */}
       <MonthlyStatsRecharts
@@ -208,7 +222,10 @@ export function DashboardPage({
                     </td>
                     <td className="px-4 py-3 font-medium text-slate-900">{ticket.customer_name}</td>
                     <td className="px-4 py-3 text-xs text-slate-600">
-                      {ticket.type === 'install' ? 'نصب جدید' : 'رفع خرابی'}
+                      <span>{ticket.type === 'install' ? 'نصب جدید' : 'رفع خرابی'}</span>
+                      {hasTicketProvisioningConfig(ticket) && (
+                        <span className="mr-1.5 font-medium text-teal-700">· دارای کانفیگ</span>
+                      )}
                     </td>
                     <td className="max-w-xs truncate px-4 py-3 text-xs text-slate-600" title={ticket.address}>
                       {ticket.address}
@@ -232,13 +249,23 @@ export function DashboardPage({
                     </td>
                     {canExecute && (
                       <td className="px-4 py-3">
-                        <button
-                          type="button"
-                          onClick={() => onStartTicketService(ticket)}
-                          className="rounded-lg bg-teal-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-teal-700 whitespace-nowrap"
-                        >
-                          ثبت فرم اجرا
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setPreviewTicket(ticket)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 whitespace-nowrap"
+                          >
+                            <Settings2 className="h-3.5 w-3.5" />
+                            <span>جزئیات و کانفیگ</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onStartTicketService(ticket)}
+                            className="rounded-lg bg-teal-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-teal-700 whitespace-nowrap"
+                          >
+                            ثبت فرم اجرا
+                          </button>
+                        </div>
                       </td>
                     )}
                   </tr>
@@ -248,6 +275,68 @@ export function DashboardPage({
           </div>
         )}
       </div>
+
+      {/* Quick Ticket Provisioning Config & Notes Modal */}
+      <Modal
+        open={Boolean(previewTicket)}
+        onClose={() => setPreviewTicket(null)}
+        title={
+          previewTicket
+            ? `جزئیات و تنظیمات تیکت #${toPersianDigits(previewTicket.id)} — ${previewTicket.customer_name}`
+            : 'جزئیات تیکت'
+        }
+        maxWidthClass="max-w-xl"
+      >
+        {previewTicket && (
+          <div className="space-y-4">
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+              <div>
+                <span className="text-slate-500">آدرس: </span>
+                <span className="font-medium text-slate-900">{previewTicket.address}</span>
+              </div>
+              <div className="mt-1">
+                <span className="text-slate-500">نوع سرویس: </span>
+                <span className="font-medium text-slate-900">
+                  {previewTicket.type === 'install' ? 'نصب جدید' : 'رفع خرابی'}
+                </span>
+              </div>
+            </div>
+
+            <ProvisioningConfigBox
+              config_pppoe_user={previewTicket.config_pppoe_user}
+              config_pppoe_pass={previewTicket.config_pppoe_pass}
+              config_vlan={previewTicket.config_vlan}
+              has_voip={previewTicket.has_voip}
+              config_voip_data={previewTicket.config_voip_data}
+              operator_notes={previewTicket.operator_notes}
+              compact
+            />
+
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setPreviewTicket(null)}
+                className="rounded-lg border border-slate-200 px-4 py-2 text-xs text-slate-700"
+              >
+                بستن
+              </button>
+              {canExecute && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const target = previewTicket;
+                    setPreviewTicket(null);
+                    onStartTicketService(target);
+                  }}
+                  className="rounded-lg bg-teal-600 px-4 py-2 text-xs font-medium text-white hover:bg-teal-700"
+                >
+                  ورود به فرم ثبت عملیات
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+      </Modal>
     </div>
   );
 }

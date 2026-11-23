@@ -9,13 +9,15 @@ import type {
   OltItem,
   SpoolItem,
   TicketItem,
+  VanStockItem,
 } from '../types/erp';
 import { apiFetch, uploadCompressedImage } from '../utils/api';
 import { compressImageForUpload, formatBytesFa } from '../utils/imageCompression';
-import { generateFFatCode, validateModemSerial } from '../lib/fiberLogic';
+import { generateFFatCode, validateModemSerial, type ModemSource } from '../lib/fiberLogic';
 import { formatJalaliYmd, getTodayJalali, toPersianDigits } from '../lib/jalali';
 import { SearchableSelect } from '../components/SearchableSelect';
 import { JalaliDatePicker } from '../components/JalaliDatePicker';
+import { ProvisioningConfigBox } from '../components/ProvisioningConfigBox';
 
 interface ServiceFormPageProps {
   user: AuthUser;
@@ -47,6 +49,7 @@ export function ServiceFormPage({
   const [ffats, setFFats] = useState<FFatItem[]>([]);
   const [modemBrands, setModemBrands] = useState<ModemBrandItem[]>([]);
   const [spools, setSpools] = useState<SpoolItem[]>([]);
+  const [vanStock, setVanStock] = useState<VanStockItem[]>([]);
 
   const [selectedTicketId, setSelectedTicketId] = useState(
     initialTicket ? String(initialTicket.id) : '',
@@ -66,7 +69,9 @@ export function ServiceFormPage({
   const [inSpoolId, setInSpoolId] = useState('');
   const [inMeter, setInMeter] = useState('0');
 
-  // Modem
+  // Modem Source (Company Van Stock vs Customer Own)
+  const [modemSource, setModemSource] = useState<ModemSource>('company');
+  const [selectedVanStockId, setSelectedVanStockId] = useState('');
   const [modemBrandId, setModemBrandId] = useState('');
   const [modemSerial, setModemSerial] = useState('');
 
@@ -103,8 +108,9 @@ export function ServiceFormPage({
         modemBrands: ModemBrandItem[];
       }>('/api/hardware'),
       apiFetch<{ spools: SpoolItem[] }>('/api/spools'),
+      apiFetch<{ vanStock: VanStockItem[] }>('/api/inventory'),
     ])
-      .then(([tRes, hRes, sRes]) => {
+      .then(([tRes, hRes, sRes, invRes]) => {
         if (!active) return;
         const openTickets = tRes.tickets.filter((t) => t.status !== 'completed');
         setTickets(openTickets);
@@ -119,6 +125,7 @@ export function ServiceFormPage({
         setFFats(hRes.ffats);
         setModemBrands(hRes.modemBrands);
         setSpools(sRes.spools);
+        setVanStock(invRes.vanStock || []);
       })
       .catch((err) => {
         if (active) setError(err instanceof Error ? err.message : 'خطا در بارگذاری اطلاعات فرم');
@@ -179,6 +186,23 @@ export function ServiceFormPage({
             (canCrossUse && s.assigned_installer_id !== null)),
       ),
     [spools, targetInstallerId, canCrossUse],
+  );
+
+  // Available Van Stock modems for this installer
+  const availableVanModems = useMemo(
+    () =>
+      vanStock.filter(
+        (v) =>
+          v.item_type === 'modem' &&
+          v.quantity > 0 &&
+          (v.user_id === targetInstallerId || canCrossUse || user.isSuperAdmin),
+      ),
+    [vanStock, targetInstallerId, canCrossUse, user.isSuperAdmin],
+  );
+
+  const selectedVanModem = useMemo(
+    () => availableVanModems.find((v) => String(v.id) === selectedVanStockId) || null,
+    [availableVanModems, selectedVanStockId],
   );
 
   // Real-time Modem Serial validation
@@ -278,6 +302,10 @@ export function ServiceFormPage({
       setError(serialValidation?.reason || 'سریال مودم معتبر نیست.');
       return;
     }
+    if (modemSource === 'company' && !selectedVanStockId) {
+      setError('برای مودم شرکت، ردیف موجودی انبار خودرو (Van Stock) باید انتخاب شود.');
+      return;
+    }
     if (pendingImages.some((i) => i.uploading)) {
       setError('لطفاً تا پایان بارگذاری تصاویر فشرده‌شده صبر کنید.');
       return;
@@ -297,6 +325,8 @@ export function ServiceFormPage({
           out_total_meter: Number(outMeter) || 0,
           in_spool_id: inSpoolId ? Number(inSpoolId) : null,
           in_total_meter: Number(inMeter) || 0,
+          modem_source: modemSource,
+          van_stock_id: modemSource === 'company' && selectedVanStockId ? Number(selectedVanStockId) : null,
           modem_brand_id: Number(modemBrandId),
           modem_serial: modemSerial.trim(),
           service_date_jalali: serviceDate,
@@ -306,7 +336,7 @@ export function ServiceFormPage({
             .map((i) => ({ image_type: i.imageType, file_path: i.uploadedPath })),
         }),
       });
-      setSuccessMsg('عملیات با موفقیت ثبت شد، متراژ قرقره‌ها کسر و سند دستمزد در دفتر کل صادر گردید.');
+      setSuccessMsg('عملیات با موفقیت ثبت شد، متراژ قرقره‌ها و مودم کسر و سند دستمزد در دفتر کل صادر گردید.');
       setTimeout(() => onCompleted(), 900);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'خطا در ثبت فرم عملیات');
@@ -383,8 +413,20 @@ export function ServiceFormPage({
           />
         </div>
         {activeTicket && (
-          <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-xs text-slate-600">
-            آدرس محل سرویس: <span className="font-medium text-slate-900">{activeTicket.address}</span>
+          <div className="mt-4 space-y-3">
+            <div className="rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-xs text-slate-600">
+              مشترک: <span className="font-semibold text-slate-900">{activeTicket.customer_name}</span> · آدرس:{' '}
+              <span className="font-medium text-slate-900">{activeTicket.address}</span>
+            </div>
+
+            <ProvisioningConfigBox
+              config_pppoe_user={activeTicket.config_pppoe_user}
+              config_pppoe_pass={activeTicket.config_pppoe_pass}
+              config_vlan={activeTicket.config_vlan}
+              has_voip={activeTicket.has_voip}
+              config_voip_data={activeTicket.config_voip_data}
+              operator_notes={activeTicket.operator_notes}
+            />
           </div>
         )}
       </div>
@@ -536,9 +578,75 @@ export function ServiceFormPage({
         </div>
       </div>
 
-      {/* Section 4: Modem Brand & Regex Serial Validation */}
+      {/* Section 4: Modem Source (Company Van Stock vs Customer Own) & Regex Serial Validation */}
       <div className="rounded-xl border border-slate-200 bg-white p-5">
-        <h2 className="mb-4 text-sm font-semibold text-slate-900">۴. مشخصات مودم و اعتبارسنجی سریال</h2>
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-sm font-semibold text-slate-900">۴. مشخصات مودم، کسر از Van Stock و اعتبارسنجی سریال</h2>
+          <div className="flex items-center gap-1 rounded-lg bg-slate-100 p-1">
+            <button
+              type="button"
+              onClick={() => {
+                setModemSource('company');
+              }}
+              className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                modemSource === 'company' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
+              }`}
+            >
+              از موجودی شرکت (Van Stock)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setModemSource('customer');
+                setSelectedVanStockId('');
+              }}
+              className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                modemSource === 'customer' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
+              }`}
+            >
+              مودم شخصی مشترک (بدون کسر)
+            </button>
+          </div>
+        </div>
+
+        {modemSource === 'company' ? (
+          <div className="mb-4">
+            <SearchableSelect
+              label="انتخاب مودم از موجودی خودروی نصاب (Van Stock)"
+              required
+              options={availableVanModems.map((v) => ({
+                value: v.id,
+                label: v.serial_number
+                  ? `${v.item_name} — سریال: ${v.serial_number}`
+                  : `${v.item_name} — موجودی تعدادی: ${toPersianDigits(v.quantity)} عدد`,
+                sublabel: v.installer_name || undefined,
+              }))}
+              value={selectedVanStockId}
+              onChange={(val) => {
+                setSelectedVanStockId(val);
+                const chosen = availableVanModems.find((v) => String(v.id) === val);
+                if (chosen) {
+                  if (chosen.modem_brand_id) {
+                    setModemBrandId(String(chosen.modem_brand_id));
+                  }
+                  if (chosen.serial_number) {
+                    setModemSerial(chosen.serial_number);
+                  }
+                }
+              }}
+              placeholder={
+                availableVanModems.length === 0
+                  ? 'هیچ مودمی در انبار خودروی نصاب موجود نیست...'
+                  : 'انتخاب مودم از انبار خودرو...'
+              }
+            />
+          </div>
+        ) : (
+          <div className="mb-4 rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-xs text-slate-600">
+            مودم متعلق به مشترک است؛ هیچ کسر موجودی از انبار شرکت یا خودروی نصاب انجام نخواهد شد.
+          </div>
+        )}
+
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <SearchableSelect
             label="برند مودم"
@@ -560,10 +668,13 @@ export function ServiceFormPage({
               type="text"
               dir="ltr"
               required
+              readOnly={Boolean(modemSource === 'company' && selectedVanModem?.serial_number)}
               value={modemSerial}
               onChange={(e) => setModemSerial(e.target.value.toUpperCase())}
               placeholder={selectedBrand ? `${selectedBrand.serial_prefix}...` : 'S/N'}
-              className="h-10 w-full rounded-lg border border-slate-300 px-3 text-left font-mono text-sm focus:border-teal-600 focus:outline-none"
+              className={`h-10 w-full rounded-lg border border-slate-300 px-3 text-left font-mono text-sm focus:border-teal-600 focus:outline-none ${
+                modemSource === 'company' && selectedVanModem?.serial_number ? 'bg-slate-50 text-slate-700' : ''
+              }`}
             />
             {serialValidation && (
               <p

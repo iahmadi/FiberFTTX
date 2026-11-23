@@ -1,11 +1,18 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { Banknote, Settings2 } from 'lucide-react';
-import type { AuthUser, BalanceSummary, LedgerItem, TariffItem } from '../types/erp';
+import type {
+  AuthUser,
+  BalanceSummary,
+  LedgerItem,
+  MonthlyContractorEarning,
+  TariffItem,
+} from '../types/erp';
 import type { TariffCalcType } from '../lib/fiberLogic';
 import { apiFetch } from '../utils/api';
 import { formatDateTimeToJalali, formatToman, toPersianDigits } from '../lib/jalali';
 import { Modal } from '../components/Modal';
 import { SearchableSelect } from '../components/SearchableSelect';
+import { ContractorMonthlyEarningsReport } from '../components/ContractorMonthlyEarningsReport';
 
 interface InstallerOption {
   id: number;
@@ -18,6 +25,8 @@ export function FinancialPage({ user }: { user: AuthUser }) {
   const [tariffs, setTariffs] = useState<TariffItem[]>([]);
   const [ledger, setLedger] = useState<LedgerItem[]>([]);
   const [balances, setBalances] = useState<BalanceSummary[]>([]);
+  const [monthlyEarnings, setMonthlyEarnings] = useState<MonthlyContractorEarning[]>([]);
+  const [isScopedToSelf, setIsScopedToSelf] = useState(false);
   const [installers, setInstallers] = useState<InstallerOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -48,10 +57,14 @@ export function FinancialPage({ user }: { user: AuthUser }) {
         tariffs: TariffItem[];
         ledger: LedgerItem[];
         balances: BalanceSummary[];
+        monthlyEarnings?: MonthlyContractorEarning[];
+        isScopedToSelf?: boolean;
       }>('/api/financial');
       setTariffs(res.tariffs);
       setLedger(res.ledger);
       setBalances(res.balances);
+      setMonthlyEarnings(res.monthlyEarnings ?? []);
+      setIsScopedToSelf(Boolean(res.isScopedToSelf));
       if (canManageTariffs) {
         const uRes = await apiFetch<{ users: InstallerOption[] }>('/api/users/installers');
         setInstallers(uRes.users);
@@ -163,6 +176,15 @@ export function FinancialPage({ user }: { user: AuthUser }) {
           </button>
         </div>
       )}
+
+      {/* Monthly Contractor Earnings Bar Chart Report with Time-Range Filter & Excel Export */}
+      <ContractorMonthlyEarningsReport
+        monthlyEarnings={monthlyEarnings}
+        ledger={ledger}
+        contractorScopeLabel={
+          isScopedToSelf ? `${user.first_name} ${user.last_name}` : 'تمامی پیمانکاران'
+        }
+      />
 
       {/* Installer Balances Summary */}
       <div className="rounded-xl border border-slate-200 bg-white">

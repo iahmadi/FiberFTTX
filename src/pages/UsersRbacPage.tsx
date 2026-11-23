@@ -1,9 +1,16 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { Clock, Plus, Shield, UserPlus } from 'lucide-react';
-import type { AuthUser, PermissionItem, RoleItem, UserAdminItem } from '../types/erp';
+import type {
+  ActivityLogItem,
+  AuthUser,
+  PermissionItem,
+  RoleItem,
+  UserAdminItem,
+} from '../types/erp';
 import { apiFetch } from '../utils/api';
 import { toPersianDigits } from '../lib/jalali';
 import { Modal } from '../components/Modal';
+import { UserActivityLogTable } from '../components/UserActivityLogTable';
 
 interface UsersRbacPageProps {
   user: AuthUser;
@@ -14,6 +21,7 @@ export function UsersRbacPage({ user, onTimeoutUpdated }: UsersRbacPageProps) {
   const [permissions, setPermissions] = useState<PermissionItem[]>([]);
   const [roles, setRoles] = useState<RoleItem[]>([]);
   const [users, setUsers] = useState<UserAdminItem[]>([]);
+  const [activityLogs, setActivityLogs] = useState<ActivityLogItem[]>([]);
   const [timeoutMinutes, setTimeoutMinutes] = useState('30');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -40,11 +48,13 @@ export function UsersRbacPage({ user, onTimeoutUpdated }: UsersRbacPageProps) {
         permissions: PermissionItem[];
         roles: RoleItem[];
         users: UserAdminItem[];
+        activityLogs?: ActivityLogItem[];
         timeoutMinutes: number;
       }>('/api/rbac');
       setPermissions(res.permissions);
       setRoles(res.roles);
       setUsers(res.users);
+      setActivityLogs(res.activityLogs ?? []);
       setTimeoutMinutes(String(res.timeoutMinutes));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'خطا در دریافت اطلاعات کاربران و دسترسی‌ها');
@@ -295,6 +305,9 @@ export function UsersRbacPage({ user, onTimeoutUpdated }: UsersRbacPageProps) {
           </table>
         </div>
       </div>
+
+      {/* User Activity Log Component */}
+      <UserActivityLogTable logs={activityLogs} onRefresh={loadRbac} />
 
       {/* Security Session Timeout Setting (SuperAdmin Only) */}
       {user.isSuperAdmin && (

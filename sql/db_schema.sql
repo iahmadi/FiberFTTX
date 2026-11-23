@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS tbl_users (
     FOREIGN KEY (role_id) REFERENCES tbl_roles(id)
 );
 
--- Hardware
+-- Hardware & Modems
 CREATE TABLE IF NOT EXISTS tbl_kafos (
     id INT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(150) UNIQUE NOT NULL
@@ -70,15 +70,36 @@ CREATE TABLE IF NOT EXISTS tbl_modem_brands (
     serial_prefix VARCHAR(50) NOT NULL
 );
 
--- Inventory & Spools
+-- Inventory, Spools & Van Stock
+CREATE TABLE IF NOT EXISTS tbl_inventory_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(150) NOT NULL,
+    type ENUM('unit', 'spool', 'modem') NOT NULL,
+    modem_brand_id INT NULL,
+    total_quantity INT DEFAULT 0,
+    FOREIGN KEY (modem_brand_id) REFERENCES tbl_modem_brands(id)
+);
+
 CREATE TABLE IF NOT EXISTS tbl_spools (
     id INT AUTO_INCREMENT PRIMARY KEY,
+    item_id INT NULL,
     spool_code VARCHAR(100) UNIQUE NOT NULL,
     cable_type ENUM('indoor', 'outdoor') NOT NULL,
     initial_length INT NOT NULL,
     current_length INT NOT NULL,
     assigned_installer_id INT NULL,
+    FOREIGN KEY (item_id) REFERENCES tbl_inventory_items(id),
     FOREIGN KEY (assigned_installer_id) REFERENCES tbl_users(id)
+);
+
+CREATE TABLE IF NOT EXISTS tbl_van_stock (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    item_id INT NOT NULL,
+    serial_number VARCHAR(100) NULL,
+    quantity INT DEFAULT 1,
+    FOREIGN KEY (user_id) REFERENCES tbl_users(id),
+    FOREIGN KEY (item_id) REFERENCES tbl_inventory_items(id)
 );
 
 -- Workflow & Services
@@ -87,6 +108,12 @@ CREATE TABLE IF NOT EXISTS tbl_tickets (
     customer_name VARCHAR(150) NOT NULL,
     address TEXT NOT NULL,
     type ENUM('install', 'fault') NOT NULL,
+    config_pppoe_user VARCHAR(100) NULL,
+    config_pppoe_pass VARCHAR(100) NULL,
+    config_vlan INT NULL,
+    has_voip TINYINT(1) DEFAULT 0,
+    config_voip_data TEXT NULL,
+    operator_notes TEXT NULL,
     status ENUM('pending', 'assigned', 'completed') DEFAULT 'pending',
     assigned_installer INT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -105,11 +132,14 @@ CREATE TABLE IF NOT EXISTS tbl_service_records (
     out_total_meter INT DEFAULT 0,
     in_spool_id INT NULL,
     in_total_meter INT DEFAULT 0,
+    modem_source ENUM('company', 'customer') DEFAULT 'company',
+    modem_brand_id INT NULL,
     modem_serial VARCHAR(100) NOT NULL,
     price_snapshot JSON NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (ticket_id) REFERENCES tbl_tickets(id),
-    FOREIGN KEY (installer_id) REFERENCES tbl_users(id)
+    FOREIGN KEY (installer_id) REFERENCES tbl_users(id),
+    FOREIGN KEY (modem_brand_id) REFERENCES tbl_modem_brands(id)
 );
 
 CREATE TABLE IF NOT EXISTS tbl_images (
