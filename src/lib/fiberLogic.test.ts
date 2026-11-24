@@ -2,12 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   calculateTemplatePriceSnapshot,
+  computeContractorSlaAveragesLast30Days,
+  computeCurrentMonthSpoolConsumptionByContractor,
   computeLast30DaysCompletionByType,
   computeLedgerBalance,
   computeSpoolConsumptionForecasts,
+  detectCriticalSlaStatusTransitions,
   evaluatePromotionForTicket,
   evaluateRbacPolicy,
   evaluateTicketSla,
+  filterTicketsAdvanced,
+  findRecentCriticalSlaTransitions,
   generateFFatCode,
   getTicketTypeFieldVisibility,
   isSpoolLowStock,
@@ -289,6 +294,230 @@ test('Ticket SLA flags pending tickets assigned more than 4 hours ago and ignore
     now,
   );
   assert.equal(alreadyStarted.isBreached, false);
+});
+
+test('filterTicketsAdvanced filters by customer name, assigned date range, and SLA status', () => {
+  const now = new Date('2026-11-23T12:00:00Z');
+  const tickets = [
+    {
+      id: 1,
+      type: 'internet_install' as const,
+      customer_name: 'کلینیک تخصصی بهار',
+      address: 'تهران، گاندی',
+      status: 'pending' as const,
+      assigned_at: '2026-11-22T10:00:00Z', // local/UTC date 2026-11-22 -> breached (>4h)
+    },
+    {
+      id: 2,
+      type: 'voip_install' as const,
+      customer_name: 'شرکت پارس‌نور',
+      address: 'تهران، ونک',
+      status: 'pending' as const,
+      assigned_at: '2026-11-23T10:30:00Z', // 1.5h -> on_track
+    },
+    {
+      id: 3,
+      type: 'internet_fault' as const,
+      customer_name: 'امیرحسین رضایی',
+      address: 'تهران، جردن',
+      status: 'pending' as const,
+      assigned_at: null, // unassigned
+    },
+  ];
+
+  const byCustomer = filterTicketsAdvanced(tickets, { customerQuery: 'بهار' }, now);
+  assert.equal(byCustomer.length, 1);
+  assert.equal(byCustomer[0].id, 1);
+
+  const bySlaBreached = filterTicketsAdvanced(tickets, { slaStatusFilter: 'breached' }, now);
+  assert.deepEqual(
+    bySlaBreached.map((t) => t.id),
+    [1],
+  );
+
+  const bySlaOnTrack = filterTicketsAdvanced(tickets, { slaStatusFilter: 'on_track' }, now);
+  assert.deepEqual(
+    bySlaOnTrack.map((t) => t.id),
+    [2],
+  );
+
+  const bySlaUnassigned = filterTicketsAdvanced(tickets, { slaStatusFilter: 'unassigned' }, now);
+  assert.deepEqual(
+    bySlaUnassigned.map((t) => t.id),
+    [3],
+  );
+
+  const byDateRange = filterTicketsAdvanced(
+    tickets,
+    { assignedFromIso: '2026-11-23', assignedToIso: '2026-11-23' },
+    now,
+  );
+  assert.deepEqual(
+    byDateRange.map((t) => t.id),
+    [2],
+  );
+});
+
+test('computeContractorSlaAveragesLast30Days aggregates top contractors by ticket type', () => {
+  const ref = new Date('2026-11-23T12:00:00Z');
+  const summary = computeContractorSlaAveragesLast30Days(
+    [
+      {
+        id: 10,
+        type: 'internet_install',
+        status: 'completed',
+        assigned_installer: 5,
+        installer_name: 'حسین کریمی',
+        assigned_at: '2026-11-20T08:00:00Z',
+        completed_at: '2026-11-20T12:00:00Z', // 4h
+      },
+      {
+        id: 11,
+        type: 'internet_install',
+        status: 'completed',
+        assigned_installer: 5,
+        installer_name: 'حسین کریمی',
+        assigned_at: '2026-11-21T08:00:00Z',
+        completed_at: '2026-11-21T14:00:00Z', // 6h -> avg 5h
+      },
+      {
+        id: 12,
+        type: 'voip_install',
+        status: 'completed',
+        assigned_installer: 6,
+        installer_name: 'رضا قاسمی',
+        assigned_at: '2026-11-22T08:00:00Z',
+        completed_at: '2026-11-22T10:30:00Z', // 2.5h
+      },
+      {
+        id: 13,
+        type: 'internet_install',
+        status: 'completed',
+        assigned_installer: 6,
+        installer_name: 'رضا قاسمی',
+        assigned_at: '2026-09-01T08:00:00Z', // >30 days old -> excluded
+        completed_at: '2026-09-01T12:00:00Z',
+      },
+    ],
+    ref,
+  );
+
+  assert.equal(summary.totalCompletedAnalyzed, 3);
+  assert.equal(summary.contractors.length, 2);
+  assert.equal(summary.contractors[0].installerName, 'حسین کریمی');
+  assert.equal(summary.contractors[0].internet_install, 5);
+  assert.equal(summary.contractors[0].completedCount, 2);
+  assert.equal(summary.contractors[1].installerName, 'رضا قاسمی');
+  assert.equal(summary.contractors[1].voip_install, 2.5);
+});
+
+test('Critical SLA status transition detection alerts only on breached (>4h) transitions and recent server changes', () => {
+  const ref = new Date('2026-11-24T12:00:00Z');
+  const prev = [
+    {
+      id: 3,
+      type: 'internet_install' as const,
+      customer_name: 'برج مسکونی سروستان',
+      status: 'pending' as const,
+      installer_name: 'رضا قاسمی',
+      assigned_at: '2026-11-24T05:00:00Z', // 7h old -> Critical SLA
+      started_at: null,
+      completed_at: null,
+    },
+    {
+      id: 4,
+      type: 'internet_fault' as const,
+      customer_name: 'کافه کتاب راش',
+      status: 'pending' as const,
+      installer_name: 'حسین کریمی',
+      assigned_at: '2026-11-24T10:30:00Z', // 1.5h old -> normal SLA
+      started_at: null,
+      completed_at: null,
+    },
+  ];
+  const curr = [
+    {
+      ...prev[0],
+      status: 'in_progress' as const,
+      started_at: '2026-11-24T11:59:00Z',
+    },
+    {
+      ...prev[1],
+      status: 'in_progress' as const,
+      started_at: '2026-11-24T11:59:00Z',
+    },
+  ];
+
+  const diffAlerts = detectCriticalSlaStatusTransitions(prev, curr, 4, ref);
+  assert.equal(diffAlerts.length, 1);
+  assert.equal(diffAlerts[0].ticketId, 3);
+  assert.equal(diffAlerts[0].previousStatus, 'pending');
+  assert.equal(diffAlerts[0].newStatus, 'in_progress');
+  assert.equal(diffAlerts[0].elapsedHours, 6);
+
+  const recentAlerts = findRecentCriticalSlaTransitions(
+    [
+      ...curr,
+      {
+        id: 9,
+        type: 'voip_install' as const,
+        customer_name: 'آرشیو قدیمی',
+        status: 'completed' as const,
+        installer_name: 'حسین کریمی',
+        assigned_at: '2026-11-20T05:00:00Z',
+        started_at: '2026-11-20T12:00:00Z',
+        completed_at: '2026-11-20T14:00:00Z', // >3m ago -> excluded
+      },
+    ],
+    180_000,
+    4,
+    ref,
+  );
+  assert.equal(recentAlerts.length, 1);
+  assert.equal(recentAlerts[0].ticketId, 3);
+});
+
+test('Current-month contractor spool consumption filters strictly to active Jalali month and sums shares', () => {
+  // 2026-11-24 -> Jalali 1405/09/03 (آذر ۱۴۰۵)
+  const ref = new Date('2026-11-24T10:00:00Z');
+  const summary = computeCurrentMonthSpoolConsumptionByContractor(
+    [
+      {
+        installer_id: 4,
+        installer_name: 'رضا قاسمی',
+        out_total_meter: 850,
+        in_total_meter: 0,
+        created_at: '2026-11-23T11:28:40Z', // 1405/09/02 -> Azar
+      },
+      {
+        installer_id: 3,
+        installer_name: 'حسین کریمی',
+        out_total_meter: 120,
+        in_total_meter: 30,
+        created_at: '2026-11-24T08:00:00Z', // 1405/09/03 -> Azar
+      },
+      {
+        installer_id: 3,
+        installer_name: 'حسین کریمی',
+        out_total_meter: 500,
+        in_total_meter: 100,
+        created_at: '2026-11-18T11:45:00Z', // 1405/08/27 -> Aban (previous month, excluded)
+      },
+    ],
+    ref,
+  );
+
+  assert.equal(summary.monthKey, '1405-09');
+  assert.equal(summary.totalOutdoorMeters, 970);
+  assert.equal(summary.totalIndoorMeters, 30);
+  assert.equal(summary.totalMeters, 1000);
+  assert.equal(summary.contractors.length, 2);
+  assert.equal(summary.contractors[0].installerName, 'رضا قاسمی');
+  assert.equal(summary.contractors[0].totalMeters, 850);
+  assert.equal(summary.contractors[0].sharePct, 85);
+  assert.equal(summary.contractors[1].installerName, 'حسین کریمی');
+  assert.equal(summary.contractors[1].totalMeters, 150);
+  assert.equal(summary.contractors[1].sharePct, 15);
 });
 
 

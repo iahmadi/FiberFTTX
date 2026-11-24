@@ -34,9 +34,12 @@ import { ensureSeeded } from './src/db/seed.ts';
 import {
   TICKET_TYPES,
   calculateTemplatePriceSnapshot,
+  computeContractorSlaAveragesLast30Days,
+  computeCurrentMonthSpoolConsumptionByContractor,
   computeLast30DaysCompletionByType,
   computeLedgerBalance,
   evaluatePromotionForTicket,
+  findRecentCriticalSlaTransitions,
   generateFFatCode,
   getLowSpoolWarnings,
   getTicketTypeFieldVisibility,
@@ -46,6 +49,7 @@ import {
   type CompletedTicketEvent,
   type PromotionRule,
   type SpoolRecord,
+  type TicketStatus,
   type VanStockRecord,
 } from './src/lib/fiberLogic.ts';
 import { gregorianToJalali } from './src/lib/jalali.ts';
@@ -454,6 +458,91 @@ app.get('/api/dashboard', requireAuth, async (req: AuthRequest, res: Response) =
       })),
     );
 
+    const contractorSlaLast30Days = computeContractorSlaAveragesLast30Days(
+      visibleTickets.map((t) => ({
+        id: t.id,
+        type: t.type as TicketTypeKey,
+        status: t.status as TicketStatus,
+        assigned_installer: t.assigned_installer,
+        installer_name: t.installer_name,
+        assigned_at: t.assigned_at,
+        started_at: t.started_at,
+        completed_at: t.completed_at,
+      })),
+    );
+
+    const userRows = await db
+      .select({ id: tblUsers.id, full_name: tblUsers.full_name })
+      .from(tblUsers);
+    const userNameById = new Map(userRows.map((u) => [u.id, u.full_name]));
+
+    const spoolAdjustLogs = await db
+      .select({
+        entity_id: tblActivityLogs.entity_id,
+        user_id: tblActivityLogs.user_id,
+        summary: tblActivityLogs.summary,
+        created_at: tblActivityLogs.created_at,
+      })
+      .from(tblActivityLogs)
+      .where(
+        and(
+          eq(tblActivityLogs.entity_type, 'spool'),
+          eq(tblActivityLogs.action_type, 'inventory_adjusted'),
+        ),
+      );
+
+    const spoolById = new Map(spools.map((sp) => [sp.id, sp]));
+    const manualSpoolEvents = spoolAdjustLogs.flatMap((log) => {
+      if (!log.entity_id) return [];
+      const sp = spoolById.get(log.entity_id);
+      if (!sp) return [];
+      const match = /کسر\s+(\d+)\s+متر/.exec(log.summary);
+      const meters = match ? Number(match[1]) : 0;
+      if (meters <= 0) return [];
+      const installerId = sp.assigned_installer_id ?? log.user_id ?? 0;
+      if (!canSeeAll && installerId !== user.id) return [];
+      return [
+        {
+          installer_id: installerId,
+          installer_name: userNameById.get(installerId) ?? null,
+          out_total_meter: sp.cable_type === 'outdoor' ? meters : 0,
+          in_total_meter: sp.cable_type === 'indoor' ? meters : 0,
+          created_at: log.created_at,
+        },
+      ];
+    });
+
+    const serviceSpoolEvents = records
+      .filter((r) => canSeeAll || r.installer_id === user.id)
+      .map((r) => ({
+        installer_id: r.installer_id,
+        installer_name: userNameById.get(r.installer_id) ?? null,
+        out_total_meter: r.out_total_meter,
+        in_total_meter: r.in_total_meter,
+        created_at: r.created_at,
+      }));
+
+    const currentMonthSpoolConsumption = computeCurrentMonthSpoolConsumptionByContractor(
+      [...serviceSpoolEvents, ...manualSpoolEvents],
+      now,
+    );
+
+    const recentCriticalSlaTransitions = findRecentCriticalSlaTransitions(
+      visibleTickets.map((t) => ({
+        id: t.id,
+        type: t.type as TicketTypeKey,
+        customer_name: t.customer_name,
+        status: t.status as TicketStatus,
+        installer_name: t.installer_name,
+        assigned_at: t.assigned_at,
+        started_at: t.started_at,
+        completed_at: t.completed_at,
+      })),
+      180_000,
+      4,
+      now,
+    );
+
     res.json({
       kpis: {
         pendingTickets: visibleTickets.filter((t) => t.status === 'pending').length,
@@ -466,6 +555,9 @@ app.get('/api/dashboard', requireAuth, async (req: AuthRequest, res: Response) =
       lowSpools,
       monthlySeries,
       completionLast30Days,
+      contractorSlaLast30Days,
+      currentMonthSpoolConsumption,
+      recentCriticalSlaTransitions,
       scheduledTickets: visibleTickets,
     });
   } catch (err) {

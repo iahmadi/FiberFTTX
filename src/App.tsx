@@ -1,9 +1,14 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { Layout, type NavTab } from './components/Layout';
 import { ToastContainer, type ToastMessage } from './components/Toast';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { auth } from './lib/firebase';
+import {
+  detectCriticalSlaStatusTransitions,
+  type CriticalSlaComparableTicket,
+  type CriticalSlaTransitionAlert,
+} from './lib/fiberLogic';
 import { toPersianDigits } from './lib/jalali';
 import {
   listOutboxItems,
@@ -60,8 +65,25 @@ export default function App() {
   const [focusTicketId, setFocusTicketId] = useState<number | null>(null);
 
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const [criticalSlaAlerts, setCriticalSlaAlerts] = useState<CriticalSlaTransitionAlert[]>([]);
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
   const [isSyncing, setIsSyncing] = useState(false);
+
+  const lastComparableTicketsRef = useRef<CriticalSlaComparableTicket[]>([]);
+  const seenCriticalSlaKeysRef = useRef<Set<string>>(
+    (() => {
+      try {
+        const raw = sessionStorage.getItem('ava_seen_critical_sla_alerts');
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) return new Set<string>(parsed);
+        }
+      } catch {
+        // ignore storage restrictions
+      }
+      return new Set<string>();
+    })(),
+  );
 
   // Domain states
   const [dashboardData, setDashboardData] = useState<DashboardPayload | null>(null);
@@ -97,6 +119,32 @@ export default function App() {
   const [roles, setRoles] = useState<RoleWithPerms[]>([]);
   const [permissions, setPermissions] = useState<PermissionDef[]>([]);
   const [activityLogs, setActivityLogs] = useState<ActivityLogItem[]>([]);
+
+  const pushCriticalSlaAlerts = useCallback((incoming: CriticalSlaTransitionAlert[] | undefined) => {
+    if (!incoming || incoming.length === 0) return;
+    const unseen = incoming.filter((a) => !seenCriticalSlaKeysRef.current.has(a.eventKey));
+    if (unseen.length === 0) return;
+
+    for (const alert of unseen) {
+      seenCriticalSlaKeysRef.current.add(alert.eventKey);
+      setTimeout(() => {
+        setCriticalSlaAlerts((prev) => prev.filter((item) => item.eventKey !== alert.eventKey));
+      }, 18000);
+    }
+
+    try {
+      const latestKeys = Array.from(seenCriticalSlaKeysRef.current).slice(-50);
+      sessionStorage.setItem('ava_seen_critical_sla_alerts', JSON.stringify(latestKeys));
+    } catch {
+      // ignore storage restrictions
+    }
+
+    setCriticalSlaAlerts((prev) => [...prev, ...unseen].slice(-4));
+  }, []);
+
+  const dismissCriticalSlaAlert = useCallback((eventKey: string) => {
+    setCriticalSlaAlerts((prev) => prev.filter((item) => item.eventKey !== eventKey));
+  }, []);
 
   const notify = useCallback(
     (type: ToastMessage['type'], title: string, description?: string) => {
@@ -182,6 +230,16 @@ export default function App() {
 
     if (dashRes.status === 'fulfilled') {
       setDashboardData(dashRes.value);
+      pushCriticalSlaAlerts(dashRes.value.recentCriticalSlaTransitions);
+      if (lastComparableTicketsRef.current.length > 0) {
+        pushCriticalSlaAlerts(
+          detectCriticalSlaStatusTransitions(
+            lastComparableTicketsRef.current,
+            dashRes.value.scheduledTickets,
+          ),
+        );
+      }
+      lastComparableTicketsRef.current = dashRes.value.scheduledTickets;
       await saveOfflineSnapshot('dashboard', dashRes.value);
     } else {
       const dashSnap = await loadOfflineSnapshot<DashboardPayload>('dashboard');
@@ -189,6 +247,15 @@ export default function App() {
     }
 
     if (tktRes.status === 'fulfilled') {
+      if (lastComparableTicketsRef.current.length > 0) {
+        pushCriticalSlaAlerts(
+          detectCriticalSlaStatusTransitions(
+            lastComparableTicketsRef.current,
+            tktRes.value.tickets,
+          ),
+        );
+      }
+      lastComparableTicketsRef.current = tktRes.value.tickets;
       setTickets(tktRes.value.tickets);
       setTicketInstallers(tktRes.value.installers);
       await saveOfflineSnapshot('tickets', tktRes.value);
@@ -318,7 +385,7 @@ export default function App() {
     } else if (!canUsers) {
       setActivityLogs([]);
     }
-  }, []);
+  }, [pushCriticalSlaAlerts]);
 
   const refreshSessionAndData = useCallback(async () => {
     const res = await apiFetch<{ user: AuthUser }>('/api/auth/session');
@@ -428,6 +495,37 @@ export default function App() {
     }
   }, [isOnline, user, handleSyncNow]);
 
+  // Live poll dashboard every 5s while active so Critical SLA updates by technicians alert immediately
+  useEffect(() => {
+    if (activeTab !== 'dashboard' || !isOnline || !user) return;
+    let cancelled = false;
+
+    const timer = setInterval(async () => {
+      try {
+        const freshDash = await apiFetch<DashboardPayload>('/api/dashboard');
+        if (cancelled) return;
+        setDashboardData(freshDash);
+        pushCriticalSlaAlerts(freshDash.recentCriticalSlaTransitions);
+        if (lastComparableTicketsRef.current.length > 0) {
+          pushCriticalSlaAlerts(
+            detectCriticalSlaStatusTransitions(
+              lastComparableTicketsRef.current,
+              freshDash.scheduledTickets,
+            ),
+          );
+        }
+        lastComparableTicketsRef.current = freshDash.scheduledTickets;
+      } catch {
+        // Ignore transient offline/polling hiccups
+      }
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeTab, isOnline, user, pushCriticalSlaAlerts]);
+
   const handleLogout = async () => {
     setMemoryAuthToken(null);
     setUser(null);
@@ -475,6 +573,8 @@ export default function App() {
             data={dashboardData}
             loading={!dashboardData}
             pendingOutboxCount={pendingSyncCount}
+            criticalSlaAlerts={criticalSlaAlerts}
+            onDismissCriticalSlaAlert={dismissCriticalSlaAlert}
             onNavigateToTicket={(ticketId) => {
               setFocusTicketId(ticketId);
               setActiveTab('tickets');

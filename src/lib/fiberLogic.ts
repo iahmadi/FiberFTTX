@@ -1043,4 +1043,504 @@ export function evaluateTicketSla(
   };
 }
 
+export type TicketSlaFilterKey = 'all' | 'breached' | 'on_track' | 'unassigned';
+
+export interface TicketFilterCriteria {
+  customerQuery?: string;
+  typeFilter?: string;
+  statusFilter?: string;
+  assignedFromIso?: string;
+  assignedToIso?: string;
+  slaStatusFilter?: TicketSlaFilterKey;
+  slaThresholdHours?: number;
+}
+
+export interface FilterableTicket {
+  id: number;
+  type: TicketTypeKey;
+  customer_name: string;
+  address: string;
+  status: TicketStatus;
+  assigned_at?: string | Date | null;
+}
+
+function toLocalIsoDateYmd(value: string | Date | null | undefined): string | null {
+  if (!value) return null;
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+export function filterTicketsAdvanced<T extends FilterableTicket>(
+  tickets: T[],
+  criteria: TicketFilterCriteria,
+  referenceDate: Date = new Date(),
+): T[] {
+  const q = (criteria.customerQuery || '').trim().toLowerCase();
+  const typeFilter = criteria.typeFilter || 'all';
+  const statusFilter = criteria.statusFilter || 'all';
+  const assignedFrom = (criteria.assignedFromIso || '').trim();
+  const assignedTo = (criteria.assignedToIso || '').trim();
+  const slaStatus = criteria.slaStatusFilter || 'all';
+  const thresholdHours = criteria.slaThresholdHours ?? 4;
+
+  return tickets.filter((ticket) => {
+    if (typeFilter !== 'all' && ticket.type !== typeFilter) return false;
+    if (statusFilter !== 'all' && ticket.status !== statusFilter) return false;
+
+    if (q) {
+      const matchesQuery =
+        ticket.customer_name.toLowerCase().includes(q) ||
+        ticket.address.toLowerCase().includes(q) ||
+        String(ticket.id).includes(q);
+      if (!matchesQuery) return false;
+    }
+
+    const assignedYmd = toLocalIsoDateYmd(ticket.assigned_at);
+    if (assignedFrom) {
+      if (!assignedYmd || assignedYmd < assignedFrom) return false;
+    }
+    if (assignedTo) {
+      if (!assignedYmd || assignedYmd > assignedTo) return false;
+    }
+
+    if (slaStatus !== 'all') {
+      const sla = evaluateTicketSla(ticket, thresholdHours, referenceDate);
+      if (slaStatus === 'breached' && !sla.isBreached) return false;
+      if (slaStatus === 'unassigned' && ticket.assigned_at) return false;
+      if (slaStatus === 'on_track' && (!ticket.assigned_at || sla.isBreached)) return false;
+    }
+
+    return true;
+  });
+}
+
+export interface SlaDurationTicketInput {
+  id?: number;
+  type: TicketTypeKey;
+  status: TicketStatus;
+  assigned_installer?: number | null;
+  installer_name?: string | null;
+  assigned_at?: string | Date | null;
+  started_at?: string | Date | null;
+  completed_at?: string | Date | null;
+}
+
+export interface ContractorSlaRow {
+  installerId: number;
+  installerName: string;
+  completedCount: number;
+  overallAvgHours: number;
+  internet_install: number | null;
+  internet_fault: number | null;
+  ffat_install: number | null;
+  ffat_fault: number | null;
+  voip_install: number | null;
+  typeCounts: Record<TicketTypeKey, number>;
+}
+
+export interface ContractorSlaSummary {
+  windowDays: number;
+  totalCompletedAnalyzed: number;
+  activeTicketTypes: TicketTypeKey[];
+  contractors: ContractorSlaRow[];
+}
+
+export function computeContractorSlaAveragesLast30Days(
+  tickets: SlaDurationTicketInput[],
+  referenceDate: Date = new Date(),
+  maxContractors = 5,
+): ContractorSlaSummary {
+  const windowDays = 30;
+  const endMs = referenceDate.getTime();
+  const startMs = endMs - windowDays * 24 * 60 * 60 * 1000;
+
+  interface AccBucket {
+    installerId: number;
+    installerName: string;
+    totalCount: number;
+    totalHours: number;
+    byTypeHours: Record<TicketTypeKey, number>;
+    byTypeCount: Record<TicketTypeKey, number>;
+  }
+
+  const byInstaller = new Map<number, AccBucket>();
+  const activeTypesSet = new Set<TicketTypeKey>();
+  let totalCompletedAnalyzed = 0;
+
+  for (const t of tickets) {
+    if (t.status !== 'completed' || !t.completed_at || !t.assigned_installer) continue;
+    const completedMs = new Date(t.completed_at).getTime();
+    if (Number.isNaN(completedMs) || completedMs < startMs || completedMs > endMs) continue;
+
+    const anchorRaw = t.assigned_at || t.started_at;
+    if (!anchorRaw) continue;
+    const anchorMs = new Date(anchorRaw).getTime();
+    if (Number.isNaN(anchorMs) || completedMs < anchorMs) continue;
+
+    const durationHours = (completedMs - anchorMs) / (1000 * 60 * 60);
+    const installerId = t.assigned_installer;
+    const installerName = (t.installer_name || '').trim() || `پیمانکار #${toPersianDigits(installerId)}`;
+
+    let acc = byInstaller.get(installerId);
+    if (!acc) {
+      acc = {
+        installerId,
+        installerName,
+        totalCount: 0,
+        totalHours: 0,
+        byTypeHours: {
+          internet_install: 0,
+          internet_fault: 0,
+          ffat_install: 0,
+          ffat_fault: 0,
+          voip_install: 0,
+        },
+        byTypeCount: {
+          internet_install: 0,
+          internet_fault: 0,
+          ffat_install: 0,
+          ffat_fault: 0,
+          voip_install: 0,
+        },
+      };
+      byInstaller.set(installerId, acc);
+    }
+
+    acc.totalCount += 1;
+    acc.totalHours += durationHours;
+    acc.byTypeHours[t.type] += durationHours;
+    acc.byTypeCount[t.type] += 1;
+    activeTypesSet.add(t.type);
+    totalCompletedAnalyzed += 1;
+  }
+
+  const round1 = (val: number) => Math.round(val * 10) / 10;
+
+  const contractors: ContractorSlaRow[] = Array.from(byInstaller.values())
+    .sort((a, b) => {
+      if (b.totalCount !== a.totalCount) return b.totalCount - a.totalCount;
+      return a.totalHours / a.totalCount - b.totalHours / b.totalCount;
+    })
+    .slice(0, maxContractors)
+    .map((acc) => ({
+      installerId: acc.installerId,
+      installerName: acc.installerName,
+      completedCount: acc.totalCount,
+      overallAvgHours: round1(acc.totalHours / acc.totalCount),
+      internet_install:
+        acc.byTypeCount.internet_install > 0
+          ? round1(acc.byTypeHours.internet_install / acc.byTypeCount.internet_install)
+          : null,
+      internet_fault:
+        acc.byTypeCount.internet_fault > 0
+          ? round1(acc.byTypeHours.internet_fault / acc.byTypeCount.internet_fault)
+          : null,
+      ffat_install:
+        acc.byTypeCount.ffat_install > 0
+          ? round1(acc.byTypeHours.ffat_install / acc.byTypeCount.ffat_install)
+          : null,
+      ffat_fault:
+        acc.byTypeCount.ffat_fault > 0
+          ? round1(acc.byTypeHours.ffat_fault / acc.byTypeCount.ffat_fault)
+          : null,
+      voip_install:
+        acc.byTypeCount.voip_install > 0
+          ? round1(acc.byTypeHours.voip_install / acc.byTypeCount.voip_install)
+          : null,
+      typeCounts: acc.byTypeCount,
+    }));
+
+  const activeTicketTypes = TICKET_TYPES.filter((type) => activeTypesSet.has(type));
+
+  return {
+    windowDays,
+    totalCompletedAnalyzed,
+    activeTicketTypes,
+    contractors,
+  };
+}
+
+export const TICKET_STATUS_LABELS: Record<TicketStatus, string> = {
+  pending: 'در انتظار شروع',
+  in_progress: 'در حال اجرا',
+  completed: 'تکمیل‌شده',
+  failed: 'ناموفق / لغو',
+};
+
+export interface CriticalSlaComparableTicket {
+  id: number;
+  type: TicketTypeKey;
+  customer_name: string;
+  status: TicketStatus;
+  installer_name?: string | null;
+  assigned_at?: string | Date | null;
+  started_at?: string | Date | null;
+  completed_at?: string | Date | null;
+}
+
+export interface CriticalSlaTransitionAlert {
+  eventKey: string;
+  ticketId: number;
+  customerName: string;
+  ticketType: TicketTypeKey;
+  previousStatus: TicketStatus;
+  newStatus: TicketStatus;
+  previousStatusLabel: string;
+  newStatusLabel: string;
+  installerName: string;
+  elapsedHours: number;
+  elapsedLabel: string;
+  changedAt: string;
+}
+
+function formatSlaDurationLabel(diffMs: number): { elapsedHours: number; elapsedLabel: string } {
+  const totalMinutes = Math.max(0, Math.floor(diffMs / 60000));
+  const elapsedHours = Math.floor(totalMinutes / 60);
+  const elapsedMinutes = totalMinutes % 60;
+  const elapsedLabel =
+    elapsedHours >= 24
+      ? `${toPersianDigits(Math.floor(elapsedHours / 24))} روز و ${toPersianDigits(
+          elapsedHours % 24,
+        )} ساعت`
+      : elapsedMinutes > 0
+        ? `${toPersianDigits(elapsedHours)} ساعت و ${toPersianDigits(elapsedMinutes)} دقیقه`
+        : `${toPersianDigits(elapsedHours)} ساعت`;
+  return { elapsedHours, elapsedLabel };
+}
+
+export function detectCriticalSlaStatusTransitions(
+  previousTickets: CriticalSlaComparableTicket[],
+  currentTickets: CriticalSlaComparableTicket[],
+  thresholdHours = 4,
+  referenceDate: Date = new Date(),
+): CriticalSlaTransitionAlert[] {
+  const prevById = new Map(previousTickets.map((t) => [t.id, t]));
+  const alerts: CriticalSlaTransitionAlert[] = [];
+  const thresholdMs = thresholdHours * 60 * 60 * 1000;
+
+  for (const curr of currentTickets) {
+    const prev = prevById.get(curr.id);
+    if (!prev || prev.status === curr.status) continue;
+
+    const assignedRaw = prev.assigned_at ?? curr.assigned_at;
+    if (!assignedRaw) continue;
+    const assignedMs = new Date(assignedRaw).getTime();
+    if (Number.isNaN(assignedMs)) continue;
+
+    const actionRaw =
+      curr.status === 'completed' && curr.completed_at
+        ? curr.completed_at
+        : curr.status === 'in_progress' && curr.started_at
+          ? curr.started_at
+          : referenceDate;
+    const actionDate = actionRaw instanceof Date ? actionRaw : new Date(actionRaw);
+    const actionMs = Number.isNaN(actionDate.getTime())
+      ? referenceDate.getTime()
+      : actionDate.getTime();
+
+    const diffMs = Math.max(0, actionMs - assignedMs);
+    if (diffMs <= thresholdMs) continue;
+
+    // Critical SLA applies specifically when a breached pending ticket or overdue ticket advances
+    if (prev.status !== 'pending' && curr.status === 'pending') continue;
+
+    const { elapsedHours, elapsedLabel } = formatSlaDurationLabel(diffMs);
+    const changedAt = new Date(actionMs).toISOString();
+
+    alerts.push({
+      eventKey: `${curr.id}:${prev.status}->${curr.status}:${changedAt.slice(0, 16)}`,
+      ticketId: curr.id,
+      customerName: curr.customer_name,
+      ticketType: curr.type,
+      previousStatus: prev.status,
+      newStatus: curr.status,
+      previousStatusLabel: TICKET_STATUS_LABELS[prev.status],
+      newStatusLabel: TICKET_STATUS_LABELS[curr.status],
+      installerName:
+        (curr.installer_name || prev.installer_name || '').trim() || 'تیم فنی پیمانکار',
+      elapsedHours,
+      elapsedLabel,
+      changedAt,
+    });
+  }
+
+  return alerts;
+}
+
+export function findRecentCriticalSlaTransitions(
+  tickets: CriticalSlaComparableTicket[],
+  recentWindowMs = 180_000,
+  thresholdHours = 4,
+  referenceDate: Date = new Date(),
+): CriticalSlaTransitionAlert[] {
+  const refMs = referenceDate.getTime();
+  const thresholdMs = thresholdHours * 60 * 60 * 1000;
+  const alerts: CriticalSlaTransitionAlert[] = [];
+
+  for (const t of tickets) {
+    if (t.status === 'pending' || !t.assigned_at) continue;
+    const assignedMs = new Date(t.assigned_at).getTime();
+    if (Number.isNaN(assignedMs)) continue;
+
+    let previousStatus: TicketStatus | null = null;
+    let actionMs: number | null = null;
+
+    if (t.status === 'in_progress' && t.started_at) {
+      previousStatus = 'pending';
+      actionMs = new Date(t.started_at).getTime();
+    } else if (t.status === 'completed' && t.completed_at) {
+      previousStatus = t.started_at ? 'in_progress' : 'pending';
+      actionMs = new Date(t.completed_at).getTime();
+    } else if (t.status === 'failed' && (t.completed_at || t.started_at)) {
+      previousStatus = t.started_at ? 'in_progress' : 'pending';
+      actionMs = new Date(t.completed_at || t.started_at!).getTime();
+    }
+
+    if (!previousStatus || actionMs === null || Number.isNaN(actionMs)) continue;
+    if (refMs - actionMs > recentWindowMs || actionMs - refMs > 60_000) continue;
+
+    const diffMs = actionMs - assignedMs;
+    if (diffMs <= thresholdMs) continue;
+
+    const { elapsedHours, elapsedLabel } = formatSlaDurationLabel(diffMs);
+    const changedAt = new Date(actionMs).toISOString();
+
+    alerts.push({
+      eventKey: `${t.id}:${previousStatus}->${t.status}:${changedAt.slice(0, 16)}`,
+      ticketId: t.id,
+      customerName: t.customer_name,
+      ticketType: t.type,
+      previousStatus,
+      newStatus: t.status,
+      previousStatusLabel: TICKET_STATUS_LABELS[previousStatus],
+      newStatusLabel: TICKET_STATUS_LABELS[t.status],
+      installerName: (t.installer_name || '').trim() || 'تیم فنی پیمانکار',
+      elapsedHours,
+      elapsedLabel,
+      changedAt,
+    });
+  }
+
+  alerts.sort((a, b) => new Date(b.changedAt).getTime() - new Date(a.changedAt).getTime());
+  return alerts;
+}
+
+export interface ContractorSpoolConsumptionRow {
+  installerId: number;
+  installerName: string;
+  outdoorMeters: number;
+  indoorMeters: number;
+  totalMeters: number;
+  sharePct: number;
+  eventCount: number;
+}
+
+export interface CurrentMonthSpoolConsumptionSummary {
+  monthKey: string;
+  monthLabel: string;
+  totalOutdoorMeters: number;
+  totalIndoorMeters: number;
+  totalMeters: number;
+  contractorCount: number;
+  contractors: ContractorSpoolConsumptionRow[];
+}
+
+export function computeCurrentMonthSpoolConsumptionByContractor(
+  events: Array<{
+    installer_id: number;
+    installer_name?: string | null;
+    out_total_meter: number;
+    in_total_meter: number;
+    created_at: string | Date;
+  }>,
+  referenceDate: Date = new Date(),
+): CurrentMonthSpoolConsumptionSummary {
+  const refJalali = gregorianToJalali(
+    referenceDate.getFullYear(),
+    referenceDate.getMonth() + 1,
+    referenceDate.getDate(),
+  );
+  const monthKey = `${refJalali.jy}-${String(refJalali.jm).padStart(2, '0')}`;
+  const monthLabel = `${JALALI_MONTH_NAMES[refJalali.jm - 1]} ${toPersianDigits(refJalali.jy)}`;
+
+  const buckets = new Map<
+    number,
+    {
+      installerId: number;
+      installerName: string;
+      outdoorMeters: number;
+      indoorMeters: number;
+      eventCount: number;
+    }
+  >();
+
+  let totalOutdoorMeters = 0;
+  let totalIndoorMeters = 0;
+
+  for (const ev of events) {
+    const d = ev.created_at instanceof Date ? ev.created_at : new Date(ev.created_at);
+    if (Number.isNaN(d.getTime())) continue;
+
+    const j = gregorianToJalali(d.getFullYear(), d.getMonth() + 1, d.getDate());
+    if (j.jy !== refJalali.jy || j.jm !== refJalali.jm) continue;
+
+    const outM = Math.max(0, Number(ev.out_total_meter) || 0);
+    const inM = Math.max(0, Number(ev.in_total_meter) || 0);
+    if (outM + inM <= 0) continue;
+
+    const installerId = Number(ev.installer_id) || 0;
+    const fallbackName =
+      installerId === 0 ? 'انبار مرکزی' : `پیمانکار #${toPersianDigits(installerId)}`;
+    const installerName = (ev.installer_name || '').trim() || fallbackName;
+
+    const existing = buckets.get(installerId) ?? {
+      installerId,
+      installerName,
+      outdoorMeters: 0,
+      indoorMeters: 0,
+      eventCount: 0,
+    };
+    existing.outdoorMeters += outM;
+    existing.indoorMeters += inM;
+    existing.eventCount += 1;
+    if (ev.installer_name?.trim()) {
+      existing.installerName = ev.installer_name.trim();
+    }
+    buckets.set(installerId, existing);
+
+    totalOutdoorMeters += outM;
+    totalIndoorMeters += inM;
+  }
+
+  const totalMeters = totalOutdoorMeters + totalIndoorMeters;
+
+  const contractors: ContractorSpoolConsumptionRow[] = Array.from(buckets.values())
+    .map((b) => {
+      const rowTotal = b.outdoorMeters + b.indoorMeters;
+      return {
+        installerId: b.installerId,
+        installerName: b.installerName,
+        outdoorMeters: b.outdoorMeters,
+        indoorMeters: b.indoorMeters,
+        totalMeters: rowTotal,
+        sharePct: totalMeters > 0 ? Math.round((rowTotal / totalMeters) * 100) : 0,
+        eventCount: b.eventCount,
+      };
+    })
+    .sort((a, b) => b.totalMeters - a.totalMeters);
+
+  return {
+    monthKey,
+    monthLabel,
+    totalOutdoorMeters,
+    totalIndoorMeters,
+    totalMeters,
+    contractorCount: contractors.length,
+    contractors,
+  };
+}
 

@@ -38,7 +38,7 @@ export function TicketCompletionPieWidget({ summary }: TicketCompletionPieWidget
   return (
     <div
       data-testid="ticket-completion-pie-widget"
-      className="rounded-xl border border-slate-200 bg-white p-5 shadow-xs"
+      className="flex h-full flex-col rounded-xl border border-slate-200 bg-white p-5 shadow-xs"
     >
       <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
         <div>

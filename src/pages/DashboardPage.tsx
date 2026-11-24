@@ -1,4 +1,7 @@
 import { AlertTriangle, Cable, CheckCircle2, ClipboardList, Clock, Wallet } from 'lucide-react';
+import { ContractorSlaBarWidget } from '../components/ContractorSlaBarWidget';
+import { ContractorSpoolPieWidget } from '../components/ContractorSpoolPieWidget';
+import { CriticalSlaToast } from '../components/CriticalSlaToast';
 import {
   MonthlyStatsRecharts,
   type MonthlyDashboardPoint,
@@ -6,7 +9,12 @@ import {
 import { ScheduledTicketsCalendarWidget } from '../components/ScheduledTicketsCalendarWidget';
 import { TicketCompletionPieWidget } from '../components/TicketCompletionPieWidget';
 import {
+  computeContractorSlaAveragesLast30Days,
+  computeCurrentMonthSpoolConsumptionByContractor,
   computeLast30DaysCompletionByType,
+  type ContractorSlaSummary,
+  type CriticalSlaTransitionAlert,
+  type CurrentMonthSpoolConsumptionSummary,
   type Last30DaysCompletionSummary,
   type SpoolWarningItem,
 } from '../lib/fiberLogic';
@@ -25,6 +33,9 @@ export interface DashboardPayload {
   lowSpools: SpoolWarningItem[];
   monthlySeries: MonthlyDashboardPoint[];
   completionLast30Days?: Last30DaysCompletionSummary;
+  contractorSlaLast30Days?: ContractorSlaSummary;
+  currentMonthSpoolConsumption?: CurrentMonthSpoolConsumptionSummary;
+  recentCriticalSlaTransitions?: CriticalSlaTransitionAlert[];
   scheduledTickets: TicketItem[];
 }
 
@@ -32,6 +43,8 @@ interface DashboardPageProps {
   data: DashboardPayload | null;
   loading: boolean;
   pendingOutboxCount: number;
+  criticalSlaAlerts: CriticalSlaTransitionAlert[];
+  onDismissCriticalSlaAlert: (eventKey: string) => void;
   onNavigateToTicket: (ticketId: number) => void;
   onNavigateToInventory: () => void;
 }
@@ -40,6 +53,8 @@ export function DashboardPage({
   data,
   loading,
   pendingOutboxCount,
+  criticalSlaAlerts,
+  onDismissCriticalSlaAlert,
   onNavigateToTicket,
   onNavigateToInventory,
 }: DashboardPageProps) {
@@ -92,8 +107,23 @@ export function DashboardPage({
     },
   ];
 
+  const completionSummary =
+    data.completionLast30Days ?? computeLast30DaysCompletionByType(data.scheduledTickets);
+
+  const contractorSlaSummary =
+    data.contractorSlaLast30Days ?? computeContractorSlaAveragesLast30Days(data.scheduledTickets);
+
+  const spoolConsumptionSummary =
+    data.currentMonthSpoolConsumption ?? computeCurrentMonthSpoolConsumptionByContractor([]);
+
   return (
     <div className="space-y-6">
+      <CriticalSlaToast
+        alerts={criticalSlaAlerts}
+        onDismiss={onDismissCriticalSlaAlert}
+        onInspectTicket={onNavigateToTicket}
+      />
+
       {pendingOutboxCount > 0 && (
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900">
           <span>
@@ -154,14 +184,8 @@ export function DashboardPage({
       </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-12">
-        <div className="space-y-6 xl:col-span-7">
+        <div className="xl:col-span-7">
           <MonthlyStatsRecharts data={data.monthlySeries} />
-          <TicketCompletionPieWidget
-            summary={
-              data.completionLast30Days ??
-              computeLast30DaysCompletionByType(data.scheduledTickets)
-            }
-          />
         </div>
         <div className="xl:col-span-5">
           <ScheduledTicketsCalendarWidget
@@ -170,6 +194,22 @@ export function DashboardPage({
           />
         </div>
       </div>
+
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-12">
+        <div className="xl:col-span-6">
+          <TicketCompletionPieWidget summary={completionSummary} />
+        </div>
+        <div className="xl:col-span-6">
+          <ContractorSpoolPieWidget summary={spoolConsumptionSummary} />
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-12">
+        <div className="xl:col-span-12">
+          <ContractorSlaBarWidget summary={contractorSlaSummary} />
+        </div>
+      </div>
     </div>
   );
 }
+
