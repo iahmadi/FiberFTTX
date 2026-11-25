@@ -12,6 +12,22 @@ import {
 } from 'drizzle-orm/pg-core';
 
 // ==========================================
+// 0. SYSTEM SETTINGS & COVERAGE REGIONS
+// ==========================================
+
+export const tblSettings = pgTable('tbl_settings', {
+  setting_key: text('setting_key').primaryKey(),
+  setting_value: text('setting_value').notNull().default(''),
+});
+
+export const tblRegions = pgTable('tbl_regions', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull().unique(),
+  is_active: boolean('is_active').notNull().default(true),
+  created_at: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ==========================================
 // 1. RBAC & USERS
 // ==========================================
 
@@ -46,6 +62,16 @@ export const tblUsers = pgTable('tbl_users', {
   email: text('email').unique(),
   password_hash: text('password_hash').notNull().default(''),
   full_name: text('full_name').notNull(),
+  first_name: text('first_name').notNull().default(''),
+  last_name: text('last_name').notNull().default(''),
+  father_name: text('father_name').notNull().default(''),
+  birth_date: text('birth_date').notNull().default(''),
+  national_code: text('national_code').notNull().default(''),
+  id_number: text('id_number').notNull().default(''),
+  phone_1: text('phone_1').notNull().default(''),
+  phone_2: text('phone_2'),
+  address: text('address').notNull().default(''),
+  referrer: text('referrer'),
   role_id: integer('role_id')
     .notNull()
     .references(() => tblRoles.id),
@@ -54,7 +80,7 @@ export const tblUsers = pgTable('tbl_users', {
 });
 
 // ==========================================
-// 2. TARIFF TEMPLATES, PROMOTIONS & LEDGER
+// 2. TARIFF TEMPLATES, PACKAGES, PROMOTIONS & LEDGER
 // ==========================================
 
 export type TicketTypeKey =
@@ -64,6 +90,8 @@ export type TicketTypeKey =
   | 'ffat_fault'
   | 'voip_install';
 
+export type AnyTicketTypeKey = TicketTypeKey | 'public_preregistration';
+
 export type TariffCalcMode = 'fixed' | 'per_meter' | 'hybrid';
 
 export interface TariffTypeRule {
@@ -71,6 +99,9 @@ export interface TariffTypeRule {
   base_price: number;
   meter_limit: number;
   extra_meter_price: number;
+  fusion_base_price?: number;
+  fusion_limit?: number;
+  extra_fusion_price?: number;
 }
 
 export type TariffTemplateRulesJson = Record<TicketTypeKey, TariffTypeRule>;
@@ -81,10 +112,30 @@ export const tblTariffTemplates = pgTable('tbl_tariff_templates', {
   rules_json: jsonb('rules_json').$type<TariffTemplateRulesJson>().notNull(),
 });
 
+export interface CustomerPackageRules {
+  install_fee: number;
+  install_discount_pct: number;
+  modem_price: number;
+  modem_included: boolean;
+  free_config: boolean;
+  config_fee?: number;
+  free_meter_limit: number;
+  extra_meter_price: number;
+  charge_materials: boolean;
+}
+
+export const tblCustomerPackages = pgTable('tbl_customer_packages', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull().unique(),
+  rules_json: jsonb('rules_json').$type<CustomerPackageRules>().notNull(),
+  is_active: boolean('is_active').notNull().default(true),
+  created_at: timestamp('created_at').defaultNow().notNull(),
+});
+
 export const tblPromotions = pgTable('tbl_promotions', {
   id: serial('id').primaryKey(),
   name: text('name').notNull(),
-  target_type: text('target_type').notNull(), // e.g., 'all', 'installs', 'internet_install', etc.
+  target_type: text('target_type').notNull(), // 'all' | 'installs' | TicketTypeKey
   target_value: integer('target_value').notNull(),
   reward_amount: numeric('reward_amount', { precision: 15, scale: 2 }).notNull(),
   reset_cycle: text('reset_cycle').notNull().default('monthly'), // 'weekly' | 'monthly' | 'campaign'
@@ -105,15 +156,23 @@ export const tblUserTariffs = pgTable('tbl_user_tariffs', {
   }),
 });
 
+export type LedgerEntryCategory = 'installer_work' | 'installer_payout' | 'customer_payment';
+
 export const tblLedger = pgTable('tbl_ledger', {
   id: serial('id').primaryKey(),
-  user_id: integer('user_id')
-    .notNull()
-    .references(() => tblUsers.id),
+  user_id: integer('user_id').references(() => tblUsers.id),
   ticket_id: integer('ticket_id'),
+  ledger_type: text('ledger_type').notNull().default('installer_work'), // 'installer_work' | 'installer_payout' | 'customer_payment'
+  customer_name: text('customer_name'),
   amount: numeric('amount', { precision: 15, scale: 2 }).notNull(),
   type: text('type').notNull(), // 'credit' | 'debit'
   description: text('description').notNull().default(''),
+  bank_name: text('bank_name'),
+  tracking_code: text('tracking_code'),
+  target_account: text('target_account'),
+  source_account: text('source_account'),
+  paid_at: timestamp('paid_at'),
+  receipt_image: text('receipt_image'),
   created_at: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -168,6 +227,7 @@ export const tblInventoryItems = pgTable('tbl_inventory_items', {
   modem_brand_id: integer('modem_brand_id').references(() => tblModemBrands.id, {
     onDelete: 'set null',
   }),
+  unit_price: numeric('unit_price', { precision: 15, scale: 2 }).notNull().default('0'),
   total_quantity: integer('total_quantity').notNull().default(0),
 });
 
@@ -199,20 +259,50 @@ export const tblVanStock = pgTable('tbl_van_stock', {
 });
 
 // ==========================================
-// 5. 5-TYPE TICKETS, TIMELINE COMMENTS & SERVICE RECORDS
+// 5. TICKETS, PUBLIC PRE-REGISTRATION, COMMENTS & SERVICE RECORDS
 // ==========================================
+
+export interface CustomerRegistrationDetails {
+  entity_type: 'real' | 'legal';
+  // Real entity fields
+  first_name?: string;
+  last_name?: string;
+  father_name?: string;
+  national_code?: string;
+  // Legal entity fields
+  company_name?: string;
+  registration_number?: string;
+  national_id?: string;
+  economic_code?: string;
+  // Shared contact/location fields
+  postal_code: string;
+  phone_1: string;
+  phone_2?: string;
+  fault_description?: string;
+}
 
 export const tblTickets = pgTable('tbl_tickets', {
   id: serial('id').primaryKey(),
-  type: text('type').notNull(), // 'internet_install' | 'internet_fault' | 'ffat_install' | 'ffat_fault' | 'voip_install'
+  type: text('type').notNull(), // 'internet_install' | 'internet_fault' | 'ffat_install' | 'ffat_fault' | 'voip_install' | 'public_preregistration'
+  requested_service: text('requested_service'), // 'new_service' | 'fault_report'
+  entity_type: text('entity_type'), // 'real' | 'legal'
   customer_name: text('customer_name').notNull(),
   address: text('address').notNull(),
+  customer_details: jsonb('customer_details').$type<CustomerRegistrationDetails | null>(),
+  location_gps: text('location_gps'),
+  region_id: integer('region_id').references(() => tblRegions.id, { onDelete: 'set null' }),
+  customer_package_id: integer('customer_package_id').references(() => tblCustomerPackages.id, {
+    onDelete: 'set null',
+  }),
+  required_modem_id: integer('required_modem_id').references(() => tblModemBrands.id, {
+    onDelete: 'set null',
+  }),
   pppoe_user: text('pppoe_user'),
   pppoe_pass: text('pppoe_pass'),
   vlan_id: text('vlan_id'),
   voip_config: text('voip_config'),
   operator_notes: text('operator_notes'),
-  status: text('status').notNull().default('pending'), // 'pending' | 'in_progress' | 'completed' | 'failed'
+  status: text('status').notNull().default('pending_installer'), // 'pending_operator' | 'pending_installer' | 'in_progress' | 'completed' | 'failed'
   assigned_installer: integer('assigned_installer').references(() => tblUsers.id, {
     onDelete: 'set null',
   }),
@@ -233,6 +323,8 @@ export const tblTicketComments = pgTable('tbl_ticket_comments', {
     .notNull()
     .references(() => tblUsers.id),
   comment: text('comment').notNull(),
+  is_deleted: boolean('is_deleted').notNull().default(false),
+  edited_at: timestamp('edited_at'),
   created_at: timestamp('created_at').defaultNow().notNull(), // Immutable server-side timestamp
 });
 
@@ -248,10 +340,57 @@ export interface ServicePriceSnapshot {
   total_meter: number;
   billable_extra_meter: number;
   extra_meter_fee: number;
+  fusion_count?: number;
+  fusion_base_price?: number;
+  fusion_limit?: number;
+  extra_fusion_price?: number;
+  fusion_fee?: number;
   promotion_name: string | null;
   promotion_bonus: number;
   total_earned: number;
   computed_at: string;
+}
+
+export interface CustomerInvoiceMaterialItem {
+  item_id: number;
+  item_name: string;
+  quantity: number;
+  unit_price: number;
+  line_total: number;
+}
+
+export interface CustomerInvoiceSnapshot {
+  package_id: number | null;
+  package_name: string;
+  install_fee_gross: number;
+  install_discount_pct: number;
+  install_fee_net: number;
+  config_fee: number;
+  free_meter_limit: number;
+  total_meter: number;
+  billable_extra_meter: number;
+  extra_meter_price: number;
+  extra_meter_fee: number;
+  modem_source: 'company' | 'customer';
+  modem_included: boolean;
+  modem_fee: number;
+  charge_materials: boolean;
+  materials_breakdown: CustomerInvoiceMaterialItem[];
+  materials_fee: number;
+  total_customer_payable: number;
+  computed_at: string;
+}
+
+export interface DynamicMaterialUsageItem {
+  item_id: number;
+  item_name: string;
+  quantity: number;
+}
+
+export interface SplitterChangesData {
+  parent_fat_removed_splitter: string;
+  parent_fat_installed_splitters: string[];
+  ffat_installed_splitter: string;
 }
 
 export const tblServiceRecords = pgTable('tbl_service_records', {
@@ -265,6 +404,8 @@ export const tblServiceRecords = pgTable('tbl_service_records', {
     .references(() => tblUsers.id),
   source_type: text('source_type').notNull(), // 'FAT' | 'FFAT'
   source_id: integer('source_id').notNull(),
+  port_number: integer('port_number'),
+  fusion_count: integer('fusion_count').notNull().default(0),
   out_spool_id: integer('out_spool_id').references(() => tblSpools.id),
   out_total_meter: integer('out_total_meter').notNull().default(0),
   in_spool_id: integer('in_spool_id').references(() => tblSpools.id),
@@ -273,10 +414,26 @@ export const tblServiceRecords = pgTable('tbl_service_records', {
   modem_serial: text('modem_serial'),
   modem_source: text('modem_source').notNull().default('company'), // 'company' | 'customer'
   van_stock_id: integer('van_stock_id'),
+  dynamic_materials: jsonb('dynamic_materials')
+    .$type<DynamicMaterialUsageItem[]>()
+    .notNull()
+    .default([]),
+  splitter_changes: jsonb('splitter_changes').$type<SplitterChangesData | null>(),
   price_snapshot: jsonb('price_snapshot').$type<ServicePriceSnapshot>().notNull(),
+  customer_invoice_snapshot: jsonb('customer_invoice_snapshot').$type<CustomerInvoiceSnapshot | null>(),
   service_date_jalali: text('service_date_jalali'),
   notes: text('notes'),
   created_at: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const tblServiceRecordsHistory = pgTable('tbl_service_records_history', {
+  id: serial('id').primaryKey(),
+  record_id: integer('record_id')
+    .notNull()
+    .references(() => tblServiceRecords.id, { onDelete: 'cascade' }),
+  old_data: jsonb('old_data').$type<Record<string, unknown>>().notNull(),
+  changed_by: integer('changed_by').references(() => tblUsers.id, { onDelete: 'set null' }),
+  changed_at: timestamp('changed_at').defaultNow().notNull(),
 });
 
 export const tblServiceImages = pgTable('tbl_service_images', {
@@ -289,6 +446,17 @@ export const tblServiceImages = pgTable('tbl_service_images', {
     .references(() => tblTickets.id, { onDelete: 'cascade' }),
   image_type: text('image_type').notNull(),
   file_path: text('file_path').notNull(),
+  caption: text('caption'),
+  created_at: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const tblImages = pgTable('tbl_images', {
+  id: serial('id').primaryKey(),
+  entity_type: text('entity_type').notNull(), // 'service_record' | 'ledger_receipt' | 'ticket_identity'
+  entity_id: integer('entity_id').notNull(),
+  image_type: text('image_type').notNull().default('photo'),
+  file_path: text('file_path').notNull(),
+  caption: text('caption'),
   created_at: timestamp('created_at').defaultNow().notNull(),
 });
 

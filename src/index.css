@@ -4,6 +4,10 @@
 @import '@fontsource/vazirmatn/700.css';
 @import 'tailwindcss';
 
+:root {
+  --brand-primary: #0f766e;
+}
+
 @layer base {
   html,
   body {
@@ -30,8 +34,26 @@
     color: #000000 !important;
   }
 
-  body.printing-service-record > *:not(.print-portal-root) {
+  body.printing-service-record .no-print {
     display: none !important;
+  }
+
+  body.printing-service-record * {
+    visibility: hidden;
+  }
+
+  body.printing-service-record .print-portal-root,
+  body.printing-service-record .print-portal-root * {
+    visibility: visible;
+  }
+
+  body.printing-service-record .print-portal-root {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    background: #ffffff;
+    padding: 0;
+    margin: 0;
   }
 
   .no-print {

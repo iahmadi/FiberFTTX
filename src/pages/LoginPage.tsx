@@ -1,14 +1,21 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { Cable, KeyRound, Lock, ShieldCheck, UserCheck } from 'lucide-react';
+import { ArrowRight, Cable, KeyRound, Lock, ShieldCheck, UserCheck } from 'lucide-react';
 import { GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
 import { auth } from '../lib/firebase';
+import type { SystemSettings } from '../types/erp';
 import { apiFetch, setMemoryAuthToken } from '../utils/api';
 
 interface LoginPageProps {
+  systemSettings: SystemSettings;
   onAuthenticated: () => Promise<void>;
+  onNavigatePublicPortal: () => void;
 }
 
-export function LoginPage({ onAuthenticated }: LoginPageProps) {
+export function LoginPage({
+  systemSettings,
+  onAuthenticated,
+  onNavigatePublicPortal,
+}: LoginPageProps) {
   const [adminNeedsClaim, setAdminNeedsClaim] = useState<boolean>(false);
   const [checkingStatus, setCheckingStatus] = useState<boolean>(true);
   const [mode, setMode] = useState<'login' | 'claim'>('login');
@@ -113,11 +120,14 @@ export function LoginPage({ onAuthenticated }: LoginPageProps) {
     <div className="flex min-h-screen items-center justify-center bg-slate-100 p-4">
       <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-xl sm:p-8">
         <div className="mb-6 flex items-center gap-3 border-b border-slate-100 pb-4">
-          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-teal-700 text-white">
+          <div
+            className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl text-white"
+            style={{ backgroundColor: 'var(--brand-primary)' }}
+          >
             <Cable className="h-6 w-6" />
           </div>
           <div>
-            <h1 className="text-lg font-bold text-slate-900">آوانتورک ERP فیبر نوری</h1>
+            <h1 className="text-lg font-bold text-slate-900">{systemSettings.system_name}</h1>
             <p className="text-xs text-slate-500">سامانه یکپارچه عملیات، انبار و مالی (آفلاین-اول)</p>
           </div>
         </div>
@@ -133,7 +143,8 @@ export function LoginPage({ onAuthenticated }: LoginPageProps) {
           type="button"
           onClick={handleGoogleSignIn}
           disabled={loading}
-          className="flex min-h-[46px] w-full items-center justify-center gap-2.5 rounded-xl bg-teal-700 px-4 py-2.5 text-sm font-bold text-white shadow-xs hover:bg-teal-800 disabled:opacity-60"
+          style={{ backgroundColor: 'var(--brand-primary)' }}
+          className="flex min-h-[46px] w-full items-center justify-center gap-2.5 rounded-xl px-4 py-2.5 text-sm font-bold text-white shadow-xs hover:opacity-95 disabled:opacity-60"
         >
           <ShieldCheck className="h-5 w-5" />
           <span>ورود امن با حساب گوگل</span>
@@ -249,7 +260,19 @@ export function LoginPage({ onAuthenticated }: LoginPageProps) {
             )}
           </form>
         )}
+
+        <div className="mt-5 border-t border-slate-100 pt-4 text-center">
+          <button
+            type="button"
+            onClick={onNavigatePublicPortal}
+            className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-600 hover:text-slate-900"
+          >
+            <ArrowRight className="h-3.5 w-3.5" />
+            <span>بازگشت به پرتال عمومی ثبت درخواست مشترکین</span>
+          </button>
+        </div>
       </div>
     </div>
   );
 }
+

@@ -1,7 +1,8 @@
-import { count } from 'drizzle-orm';
+import { count, eq } from 'drizzle-orm';
 import { db } from './index.ts';
 import {
   tblActivityLogs,
+  tblCustomerPackages,
   tblFats,
   tblFfats,
   tblInventoryItems,
@@ -11,9 +12,11 @@ import {
   tblOlts,
   tblPermissions,
   tblPromotions,
+  tblRegions,
   tblRolePermissions,
   tblRoles,
   tblServiceRecords,
+  tblSettings,
   tblSpools,
   tblTariffTemplates,
   tblTicketComments,
@@ -24,7 +27,10 @@ import {
   type TariffTemplateRulesJson,
 } from './schema.ts';
 import { hashLocalPassword } from '../middleware/auth.ts';
-import { calculateTemplatePriceSnapshot } from '../lib/fiberLogic.ts';
+import {
+  calculateCustomerInvoiceSnapshot,
+  calculateTemplatePriceSnapshot,
+} from '../lib/fiberLogic.ts';
 
 const DEFAULT_PERMISSIONS: Array<{ key_name: string; descr: string }> = [
   { key_name: 'can_view_dashboard', descr: 'مشاهده داشبورد و تقویم عملیاتی' },
@@ -37,15 +43,365 @@ const DEFAULT_PERMISSIONS: Array<{ key_name: string; descr: string }> = [
   { key_name: 'can_manage_inventory', descr: 'مدیریت انبار قرقره‌ها و Van Stock' },
   { key_name: 'can_cross_use_cable', descr: 'مصرف مشترک از قرقره سایر نصابان' },
   { key_name: 'can_view_financials', descr: 'مشاهده دفتر کل و گزارش‌های مالی' },
-  { key_name: 'can_manage_tariffs', descr: 'تعریف الگوهای تعرفه، کمپین و پرداخت' },
+  { key_name: 'can_manage_tariffs', descr: 'تعریف الگوهای تعرفه، پکیج فروش، کمپین و پرداخت' },
   { key_name: 'can_manage_users', descr: 'مدیریت کاربران و ماتریس دسترسی RBAC' },
+  { key_name: 'can_manage_settings', descr: 'مدیریت تنظیمات سیستم، برندینگ و مناطق تحت پوشش' },
+  { key_name: 'can_edit_own_comment', descr: 'ویرایش یادداشت‌های خود در تایم‌لاین تیکت' },
+  { key_name: 'can_delete_own_comment', descr: 'حذف نرم یادداشت‌های خود در تایم‌لاین تیکت' },
+  { key_name: 'can_manage_all_comments', descr: 'ویرایش و حذف تمام یادداشت‌های تیکت' },
+  { key_name: 'can_edit_completed_forms', descr: 'ویرایش فرم‌های عملیات تکمیل‌شده و ثبت نسخه' },
 ];
 
 async function ensureDefaultRbacIntegrity(): Promise<void> {
-  await db
+  const insertedNew = await db
     .insert(tblPermissions)
     .values(DEFAULT_PERMISSIONS)
+    .onConflictDoNothing()
+    .returning();
+
+  if (insertedNew.length > 0) {
+    const roles = await db.select().from(tblRoles);
+    const superRole = roles.find((r) => r.name === 'SuperAdmin');
+    const installerRole = roles.find((r) => r.name === 'تکنسین نصاب');
+    const operatorRole = roles.find((r) => r.name === 'اپراتور تیکتینگ');
+
+    const grants: Array<{ role_id: number; permission_id: number }> = [];
+    for (const perm of insertedNew) {
+      if (superRole) {
+        grants.push({ role_id: superRole.id, permission_id: perm.id });
+      }
+      if (
+        (perm.key_name === 'can_edit_own_comment' || perm.key_name === 'can_delete_own_comment') &&
+        installerRole
+      ) {
+        grants.push({ role_id: installerRole.id, permission_id: perm.id });
+      }
+      if (
+        (perm.key_name === 'can_edit_own_comment' || perm.key_name === 'can_delete_own_comment') &&
+        operatorRole
+      ) {
+        grants.push({ role_id: operatorRole.id, permission_id: perm.id });
+      }
+    }
+    if (grants.length > 0) {
+      await db.insert(tblRolePermissions).values(grants).onConflictDoNothing();
+    }
+  }
+
+  // Ensure unit materials (ATB, OTO, Pigtails, Adapters) exist in inventory & installer van stock
+  const existingUnits = await db
+    .select()
+    .from(tblInventoryItems)
+    .where(eq(tblInventoryItems.type, 'unit'));
+
+  const unitSeeds = [
+    { name: 'پریز دیواری فیبر نوری ATB دوپورت', type: 'unit', total_quantity: 120 },
+    { name: 'پریز فیبر نوری OTO روکار', type: 'unit', total_quantity: 90 },
+    { name: 'پیگتیل SC/APC تک‌رشته', type: 'unit', total_quantity: 200 },
+    { name: 'آداپتور کوپلر SC/APC سبز', type: 'unit', total_quantity: 180 },
+  ];
+
+  const existingNames = new Set(existingUnits.map((u) => u.name));
+  const missingUnits = unitSeeds.filter((u) => !existingNames.has(u.name));
+  if (missingUnits.length > 0) {
+    await db.insert(tblInventoryItems).values(missingUnits);
+  }
+
+  const allUnits = await db
+    .select()
+    .from(tblInventoryItems)
+    .where(eq(tblInventoryItems.type, 'unit'));
+  const vanRows = await db.select().from(tblVanStock);
+  const unitItemIds = new Set(allUnits.map((u) => u.id));
+  const hasAnyUnitVanStock = vanRows.some((v) => unitItemIds.has(v.item_id) && v.quantity > 0);
+
+  if (!hasAnyUnitVanStock && allUnits.length > 0) {
+    const roles = await db.select().from(tblRoles);
+    const installerRole = roles.find((r) => r.name === 'تکنسین نصاب');
+    if (installerRole) {
+      const installers = await db
+        .select()
+        .from(tblUsers)
+        .where(eq(tblUsers.role_id, installerRole.id));
+      const stockToInsert: Array<{ user_id: number; item_id: number; quantity: number }> = [];
+      for (const inst of installers) {
+        for (const u of allUnits.slice(0, 4)) {
+          stockToInsert.push({ user_id: inst.id, item_id: u.id, quantity: 12 });
+        }
+      }
+      if (stockToInsert.length > 0) {
+        await db.insert(tblVanStock).values(stockToInsert);
+      }
+    }
+  }
+
+  // V3.0 Idempotent Settings, Regions, Packages, Inventory Unit Prices, User HR Backfill & Ticket Status Migration
+  await db
+    .insert(tblSettings)
+    .values([
+      { setting_key: 'system_name', setting_value: 'آوانتورک ERP فیبر نوری' },
+      { setting_key: 'primary_color', setting_value: '#0f766e' },
+    ])
     .onConflictDoNothing();
+
+  const existingRegions = await db.select().from(tblRegions);
+  if (existingRegions.length === 0) {
+    await db
+      .insert(tblRegions)
+      .values([
+        { name: 'منطقه ۱ — شمیرانات و تجریش', is_active: true },
+        { name: 'منطقه ۲ — سعادت‌آباد و شهرک غرب', is_active: true },
+        { name: 'منطقه ۳ — ونک و جردن', is_active: true },
+        { name: 'منطقه ۶ — یوسف‌آباد و امیرآباد', is_active: true },
+      ])
+      .onConflictDoNothing();
+  }
+
+  const existingPackages = await db.select().from(tblCustomerPackages);
+  if (existingPackages.length === 0) {
+    await db
+      .insert(tblCustomerPackages)
+      .values([
+        {
+          name: 'نصب رایگان + مودم با مشترک',
+          rules_json: {
+            install_fee: 0,
+            install_discount_pct: 0,
+            modem_price: 0,
+            modem_included: true,
+            free_config: true,
+            config_fee: 0,
+            free_meter_limit: 100,
+            extra_meter_price: 35000,
+            charge_materials: false,
+          },
+          is_active: true,
+        },
+        {
+          name: 'بسته اقتصادی با ۵۰٪ تخفیف نصب + کانفیگ رایگان',
+          rules_json: {
+            install_fee: 1800000,
+            install_discount_pct: 50,
+            modem_price: 3500000,
+            modem_included: false,
+            free_config: true,
+            config_fee: 0,
+            free_meter_limit: 80,
+            extra_meter_price: 35000,
+            charge_materials: true,
+          },
+          is_active: true,
+        },
+        {
+          name: 'بسته ویژه سازمانی (VIP)',
+          rules_json: {
+            install_fee: 2500000,
+            install_discount_pct: 0,
+            modem_price: 4200000,
+            modem_included: true,
+            free_config: false,
+            config_fee: 450000,
+            free_meter_limit: 200,
+            extra_meter_price: 30000,
+            charge_materials: true,
+          },
+          is_active: true,
+        },
+      ])
+      .onConflictDoNothing();
+  }
+
+  // Backfill realistic unit_price on existing inventory items if currently 0
+  const allInventoryItems = await db.select().from(tblInventoryItems);
+  for (const item of allInventoryItems) {
+    if (Number(item.unit_price || 0) <= 0) {
+      let defaultPrice = 0;
+      if (item.name.includes('ATB')) defaultPrice = 180000;
+      else if (item.name.includes('OTO')) defaultPrice = 120000;
+      else if (item.name.includes('پیگتیل')) defaultPrice = 65000;
+      else if (item.name.includes('آداپتور')) defaultPrice = 45000;
+      else if (item.name.includes('پچ‌کورد')) defaultPrice = 110000;
+      else if (item.name.includes('Huawei')) defaultPrice = 3800000;
+      else if (item.name.includes('ZTE')) defaultPrice = 3200000;
+      else if (item.type === 'unit') defaultPrice = 95000;
+      else if (item.type === 'modem') defaultPrice = 3400000;
+      if (defaultPrice > 0) {
+        await db
+          .update(tblInventoryItems)
+          .set({ unit_price: String(defaultPrice) })
+          .where(eq(tblInventoryItems.id, item.id));
+      }
+    }
+  }
+
+  // Backfill V3 HR fields on existing seeded staff if blank
+  const allUsers = await db.select().from(tblUsers);
+  const hrDefaults: Record<
+    string,
+    {
+      first_name: string;
+      last_name: string;
+      father_name: string;
+      birth_date: string;
+      national_code: string;
+      id_number: string;
+      email: string;
+      phone_1: string;
+      address: string;
+    }
+  > = {
+    admin: {
+      first_name: 'علیرضا',
+      last_name: 'محمدی',
+      father_name: 'حسین',
+      birth_date: '1368-04-12',
+      national_code: '0012345678',
+      id_number: '1245',
+      email: 'admin@avafiber.ir',
+      phone_1: '09121001001',
+      address: 'تهران، میدان ونک، دفتر مرکزی آوانتورک',
+    },
+    operator: {
+      first_name: 'سارا',
+      last_name: 'احمدی',
+      father_name: 'محمد',
+      birth_date: '1374-08-20',
+      national_code: '0023456789',
+      id_number: '4521',
+      email: 'operator@avafiber.ir',
+      phone_1: '09122002002',
+      address: 'تهران، سعادت‌آباد، بلوار دریا، پلاک ۱۸',
+    },
+    installer1: {
+      first_name: 'حسین',
+      last_name: 'کریمی',
+      father_name: 'احمد',
+      birth_date: '1370-02-15',
+      national_code: '0034567890',
+      id_number: '7741',
+      email: 'installer1@avafiber.ir',
+      phone_1: '09123003003',
+      address: 'تهران، یوسف‌آباد، خیابان اسدآبادی، پلاک ۶۴',
+    },
+    installer2: {
+      first_name: 'رضا',
+      last_name: 'قاسمی',
+      father_name: 'عباس',
+      birth_date: '1372-11-05',
+      national_code: '0045678901',
+      id_number: '8820',
+      email: 'installer2@avafiber.ir',
+      phone_1: '09124004004',
+      address: 'تهران، جردن، خیابان ظفر، پلاک ۳۲',
+    },
+  };
+
+  for (const u of allUsers) {
+    if (!u.first_name || !u.national_code || !u.phone_1) {
+      const def = hrDefaults[u.username];
+      const parts = u.full_name.split(' ');
+      await db
+        .update(tblUsers)
+        .set({
+          first_name: u.first_name || def?.first_name || parts[0] || u.username,
+          last_name: u.last_name || def?.last_name || parts.slice(1).join(' ') || 'کاربر',
+          father_name: u.father_name || def?.father_name || 'نامشخص',
+          birth_date: u.birth_date || def?.birth_date || '1372-01-01',
+          national_code: u.national_code || def?.national_code || String(1000000000 + u.id),
+          id_number: u.id_number || def?.id_number || String(1000 + u.id),
+          email: u.email || def?.email || `${u.username}@avafiber.ir`,
+          phone_1: u.phone_1 || def?.phone_1 || `091200000${String(u.id).padStart(2, '0')}`,
+          address: u.address || def?.address || 'تهران',
+        })
+        .where(eq(tblUsers.id, u.id));
+    }
+  }
+
+  // Migrate legacy V2 'pending' status to V3 'pending_installer'
+  await db
+    .update(tblTickets)
+    .set({ status: 'pending_installer' })
+    .where(eq(tblTickets.status, 'pending'));
+
+  // Ensure at least 1 public_preregistration ticket exists for Operator Triage testing
+  const preRegExisting = await db
+    .select({ id: tblTickets.id })
+    .from(tblTickets)
+    .where(eq(tblTickets.type, 'public_preregistration'));
+
+  if (preRegExisting.length === 0) {
+    const regionsList = await db.select().from(tblRegions);
+    const defaultRegionId = regionsList[0]?.id ?? null;
+    await db.insert(tblTickets).values({
+      type: 'public_preregistration',
+      requested_service: 'new_service',
+      entity_type: 'real',
+      customer_name: 'مهدی شریفی',
+      address: 'تهران، سعادت‌آباد، بلوار فرهنگ، پلاک ۲۴، واحد ۳',
+      customer_details: {
+        entity_type: 'real',
+        first_name: 'مهدی',
+        last_name: 'شریفی',
+        father_name: 'محمدرضا',
+        national_code: '0078912345',
+        postal_code: '1997714511',
+        phone_1: '09127778899',
+        phone_2: '02188694411',
+      },
+      location_gps: '35.7745, 51.3728',
+      region_id: defaultRegionId,
+      operator_notes: 'درخواست پیش‌ثبت‌نام اینترنت فیبر از پرتال مشتریان (در انتظار تماس اپراتور)',
+      status: 'pending_operator',
+    });
+  }
+
+  // Backfill customer_invoice_snapshot on completed service records where missing
+  const allPackages = await db.select().from(tblCustomerPackages);
+  const fallbackPkg =
+    allPackages.find((p) => p.name.includes('اقتصادی')) || allPackages[0] || null;
+  const allServiceRecords = await db.select().from(tblServiceRecords);
+  for (const rec of allServiceRecords) {
+    if (!rec.customer_invoice_snapshot) {
+      const [parentTicket] = await db
+        .select()
+        .from(tblTickets)
+        .where(eq(tblTickets.id, rec.ticket_id));
+      let pkg = parentTicket?.customer_package_id
+        ? allPackages.find((p) => p.id === parentTicket.customer_package_id) || fallbackPkg
+        : fallbackPkg;
+      if (parentTicket && !parentTicket.customer_package_id && pkg) {
+        await db
+          .update(tblTickets)
+          .set({ customer_package_id: pkg.id })
+          .where(eq(tblTickets.id, parentTicket.id));
+      }
+      const rules = pkg?.rules_json ?? {
+        install_fee: 1500000,
+        install_discount_pct: 0,
+        modem_price: 3500000,
+        modem_included: false,
+        free_config: false,
+        config_fee: 350000,
+        free_meter_limit: 50,
+        extra_meter_price: 35000,
+        charge_materials: true,
+      };
+      const invSnapshot = calculateCustomerInvoiceSnapshot({
+        packageId: pkg?.id ?? null,
+        packageName: pkg?.name ?? 'تعرفه آزاد',
+        rules,
+        outMeter: rec.out_total_meter ?? 0,
+        inMeter: rec.in_total_meter ?? 0,
+        modemSource: rec.modem_source === 'customer' ? 'customer' : 'company',
+        materialsUsed: [],
+        computedAt: rec.created_at?.toISOString() ?? new Date().toISOString(),
+      });
+      await db
+        .update(tblServiceRecords)
+        .set({ customer_invoice_snapshot: invSnapshot })
+        .where(eq(tblServiceRecords.id, rec.id));
+    }
+  }
 }
 
 let seedPromise: Promise<void> | null = null;
@@ -108,11 +464,19 @@ async function runIdempotentSeed(): Promise<void> {
       'can_create_tickets',
       'can_assign_tickets',
       'can_view_all_tickets',
+      'can_edit_own_comment',
+      'can_delete_own_comment',
     ]) {
       const pid = permMap.get(key);
       if (pid) rolePermRows.push({ role_id: operatorRole.id, permission_id: pid });
     }
-    for (const key of ['can_view_dashboard', 'can_execute_service', 'can_add_fat']) {
+    for (const key of [
+      'can_view_dashboard',
+      'can_execute_service',
+      'can_add_fat',
+      'can_edit_own_comment',
+      'can_delete_own_comment',
+    ]) {
       const pid = permMap.get(key);
       if (pid) rolePermRows.push({ role_id: installerRole.id, permission_id: pid });
     }
@@ -137,8 +501,17 @@ async function runIdempotentSeed(): Promise<void> {
       .insert(tblUsers)
       .values({
         username: 'admin',
+        email: 'admin@avafiber.ir',
         password_hash: adminPassHash,
-        full_name: 'علیرضا محمدی (مدیر کل)',
+        full_name: 'علیرضا محمدی',
+        first_name: 'علیرضا',
+        last_name: 'محمدی',
+        father_name: 'حسین',
+        birth_date: '1368-04-12',
+        national_code: '0012345678',
+        id_number: '1245',
+        phone_1: '09121001001',
+        address: 'تهران، میدان ونک، دفتر مرکزی آوانتورک',
         role_id: superRole.id,
         is_active: true,
       })
@@ -148,8 +521,17 @@ async function runIdempotentSeed(): Promise<void> {
       .insert(tblUsers)
       .values({
         username: 'operator',
+        email: 'operator@avafiber.ir',
         password_hash: '',
         full_name: 'سارا احمدی',
+        first_name: 'سارا',
+        last_name: 'احمدی',
+        father_name: 'محمد',
+        birth_date: '1374-08-20',
+        national_code: '0023456789',
+        id_number: '4521',
+        phone_1: '09122002002',
+        address: 'تهران، سعادت‌آباد، بلوار دریا، پلاک ۱۸',
         role_id: operatorRole.id,
         is_active: true,
       })
@@ -159,8 +541,17 @@ async function runIdempotentSeed(): Promise<void> {
       .insert(tblUsers)
       .values({
         username: 'installer1',
+        email: 'installer1@avafiber.ir',
         password_hash: '',
         full_name: 'حسین کریمی',
+        first_name: 'حسین',
+        last_name: 'کریمی',
+        father_name: 'احمد',
+        birth_date: '1370-02-15',
+        national_code: '0034567890',
+        id_number: '7741',
+        phone_1: '09123003003',
+        address: 'تهران، یوسف‌آباد، خیابان اسدآبادی، پلاک ۶۴',
         role_id: installerRole.id,
         is_active: true,
       })
@@ -170,8 +561,17 @@ async function runIdempotentSeed(): Promise<void> {
       .insert(tblUsers)
       .values({
         username: 'installer2',
+        email: 'installer2@avafiber.ir',
         password_hash: '',
         full_name: 'رضا قاسمی',
+        first_name: 'رضا',
+        last_name: 'قاسمی',
+        father_name: 'عباس',
+        birth_date: '1372-11-05',
+        national_code: '0045678901',
+        id_number: '8820',
+        phone_1: '09124004004',
+        address: 'تهران، جردن، خیابان ظفر، پلاک ۳۲',
         role_id: installerRole.id,
         is_active: true,
       })
@@ -347,19 +747,99 @@ async function runIdempotentSeed(): Promise<void> {
 
     // Tariff Templates & Promotions
     const hybridRules: TariffTemplateRulesJson = {
-      internet_install: { calc_type: 'hybrid', base_price: 1000000, meter_limit: 120, extra_meter_price: 25000 },
-      internet_fault: { calc_type: 'fixed', base_price: 450000, meter_limit: 0, extra_meter_price: 0 },
-      ffat_install: { calc_type: 'per_meter', base_price: 350000, meter_limit: 0, extra_meter_price: 20000 },
-      ffat_fault: { calc_type: 'fixed', base_price: 600000, meter_limit: 0, extra_meter_price: 0 },
-      voip_install: { calc_type: 'fixed', base_price: 750000, meter_limit: 0, extra_meter_price: 0 },
+      internet_install: {
+        calc_type: 'hybrid',
+        base_price: 1000000,
+        meter_limit: 120,
+        extra_meter_price: 25000,
+        fusion_base_price: 150000,
+        fusion_limit: 2,
+        extra_fusion_price: 60000,
+      },
+      internet_fault: {
+        calc_type: 'fixed',
+        base_price: 450000,
+        meter_limit: 0,
+        extra_meter_price: 0,
+        fusion_base_price: 100000,
+        fusion_limit: 1,
+        extra_fusion_price: 50000,
+      },
+      ffat_install: {
+        calc_type: 'per_meter',
+        base_price: 350000,
+        meter_limit: 0,
+        extra_meter_price: 20000,
+        fusion_base_price: 250000,
+        fusion_limit: 4,
+        extra_fusion_price: 65000,
+      },
+      ffat_fault: {
+        calc_type: 'fixed',
+        base_price: 600000,
+        meter_limit: 0,
+        extra_meter_price: 0,
+        fusion_base_price: 120000,
+        fusion_limit: 2,
+        extra_fusion_price: 55000,
+      },
+      voip_install: {
+        calc_type: 'fixed',
+        base_price: 750000,
+        meter_limit: 0,
+        extra_meter_price: 0,
+        fusion_base_price: 100000,
+        fusion_limit: 1,
+        extra_fusion_price: 50000,
+      },
     };
 
     const fixedRules: TariffTemplateRulesJson = {
-      internet_install: { calc_type: 'fixed', base_price: 1200000, meter_limit: 0, extra_meter_price: 0 },
-      internet_fault: { calc_type: 'fixed', base_price: 500000, meter_limit: 0, extra_meter_price: 0 },
-      ffat_install: { calc_type: 'fixed', base_price: 900000, meter_limit: 0, extra_meter_price: 0 },
-      ffat_fault: { calc_type: 'fixed', base_price: 650000, meter_limit: 0, extra_meter_price: 0 },
-      voip_install: { calc_type: 'fixed', base_price: 800000, meter_limit: 0, extra_meter_price: 0 },
+      internet_install: {
+        calc_type: 'fixed',
+        base_price: 1200000,
+        meter_limit: 0,
+        extra_meter_price: 0,
+        fusion_base_price: 150000,
+        fusion_limit: 2,
+        extra_fusion_price: 60000,
+      },
+      internet_fault: {
+        calc_type: 'fixed',
+        base_price: 500000,
+        meter_limit: 0,
+        extra_meter_price: 0,
+        fusion_base_price: 100000,
+        fusion_limit: 1,
+        extra_fusion_price: 50000,
+      },
+      ffat_install: {
+        calc_type: 'fixed',
+        base_price: 900000,
+        meter_limit: 0,
+        extra_meter_price: 0,
+        fusion_base_price: 220000,
+        fusion_limit: 4,
+        extra_fusion_price: 60000,
+      },
+      ffat_fault: {
+        calc_type: 'fixed',
+        base_price: 650000,
+        meter_limit: 0,
+        extra_meter_price: 0,
+        fusion_base_price: 120000,
+        fusion_limit: 2,
+        extra_fusion_price: 50000,
+      },
+      voip_install: {
+        calc_type: 'fixed',
+        base_price: 800000,
+        meter_limit: 0,
+        extra_meter_price: 0,
+        fusion_base_price: 100000,
+        fusion_limit: 1,
+        extra_fusion_price: 50000,
+      },
     };
 
     const [tplHybrid] = await tx
@@ -432,7 +912,7 @@ async function runIdempotentSeed(): Promise<void> {
         address: 'تهران، گاندی شمالی، نبش کوچه ششم، پلاک ۱۲',
         voip_config: 'SIP Proxy: 10.40.10.2 | DID: 02188904100',
         operator_notes: 'نیاز به تست خط تلفنی پس از پچ کردن روی مودم',
-        status: 'pending',
+        status: 'pending_installer',
         assigned_installer: installer1.id,
         scheduled_date: '2026-11-24',
         scheduled_time: '14:00',
@@ -443,7 +923,7 @@ async function runIdempotentSeed(): Promise<void> {
         customer_name: 'برج مسکونی سروستان (بلوک B)',
         address: 'تهران، سعادت‌آباد، بلوار سرو غربی، پلاک ۱۸',
         operator_notes: 'نصب باکس F-FAT جدید ۱ به ۸ در رایزر طبقه سوم',
-        status: 'pending',
+        status: 'pending_installer',
         assigned_installer: installer2.id,
         scheduled_date: '2026-11-25',
         scheduled_time: '09:30',
@@ -457,7 +937,7 @@ async function runIdempotentSeed(): Promise<void> {
         pppoe_pass: 'Rz#9910',
         vlan_id: '318',
         operator_notes: 'چراغ LOS قرمز گزارش شده است.',
-        status: 'pending',
+        status: 'pending_installer',
         assigned_installer: null,
         scheduled_date: '2026-11-26',
         scheduled_time: '11:00',
@@ -511,6 +991,27 @@ async function runIdempotentSeed(): Promise<void> {
       computedAt: '2026-11-18T11:45:00Z',
     });
 
+    const custInvSnap1 = calculateCustomerInvoiceSnapshot({
+      packageId: null,
+      packageName: 'تعرفه آزاد نصب و راه‌اندازی',
+      rules: {
+        install_fee: 1800000,
+        install_discount_pct: 20,
+        modem_price: 3800000,
+        modem_included: false,
+        free_config: true,
+        config_fee: 0,
+        free_meter_limit: 80,
+        extra_meter_price: 35000,
+        charge_materials: true,
+      },
+      outMeter: 100,
+      inMeter: 35,
+      modemSource: 'company',
+      materialsUsed: [],
+      computedAt: '2026-11-18T11:45:00Z',
+    });
+
     await tx.insert(tblServiceRecords).values({
       ticket_id: tCompleted1.id,
       installer_id: installer1.id,
@@ -524,6 +1025,7 @@ async function runIdempotentSeed(): Promise<void> {
       modem_serial: '4857544399AA11BB',
       modem_source: 'company',
       price_snapshot: snap1,
+      customer_invoice_snapshot: custInvSnap1,
       service_date_jalali: '1405/08/27',
       notes: 'تست پاور -18.2 dBm، تحویل مودم و آموزش مشترک انجام شد.',
       created_at: new Date('2026-11-18T11:45:00Z'),

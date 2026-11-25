@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { CalendarDays, ChevronLeft, ChevronRight, Clock, MapPin } from 'lucide-react';
-import { TICKET_TYPE_LABELS, groupScheduledTicketsByJalaliDay } from '../lib/fiberLogic';
+import { ALL_TICKET_TYPE_LABELS, groupScheduledTicketsByJalaliDay } from '../lib/fiberLogic';
 import {
   JALALI_MONTH_NAMES,
   JALALI_WEEKDAYS_SHORT,
@@ -162,7 +162,7 @@ export function ScheduledTicketsCalendarWidget({
                     #{toPersianDigits(t.id)} — {t.customer_name}
                   </div>
                   <div className="mt-0.5 text-[11px] text-teal-800">
-                    {TICKET_TYPE_LABELS[t.type]}
+                    {ALL_TICKET_TYPE_LABELS[t.type]}
                   </div>
                   <div className="mt-1 flex items-center gap-1 text-[11px] text-slate-500">
                     <MapPin className="h-3 w-3 shrink-0" />

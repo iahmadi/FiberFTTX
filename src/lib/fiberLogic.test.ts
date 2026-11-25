@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  calculateCustomerInvoiceSnapshot,
   calculateTemplatePriceSnapshot,
+  canUserDeleteComment,
+  canUserEditComment,
   computeContractorSlaAveragesLast30Days,
   computeCurrentMonthSpoolConsumptionByContractor,
   computeLast30DaysCompletionByType,
@@ -16,8 +19,13 @@ import {
   generateFFatCode,
   getTicketTypeFieldVisibility,
   isSpoolLowStock,
+  validateDynamicMaterialRows,
   validateModemSerial,
+  validatePortNumber,
+  validatePublicRegistrationPayload,
+  validateSplitterChanges,
   validateSpoolConsumption,
+  validateUserProfileV3,
   validateVanModemConsumption,
   type PromotionRule,
   type SpoolRecord,
@@ -519,5 +527,294 @@ test('Current-month contractor spool consumption filters strictly to active Jala
   assert.equal(summary.contractors[1].totalMeters, 150);
   assert.equal(summary.contractors[1].sharePct, 15);
 });
+
+test('V2.0 Fusion cost calculation charges base + extra fusions beyond fusion_limit and 0 when fusionCount=0', () => {
+  const rulesWithFusion: TariffTemplateRulesJson = {
+    ...sampleTemplateRules,
+    internet_install: {
+      calc_type: 'hybrid',
+      base_price: 1000000,
+      meter_limit: 120,
+      extra_meter_price: 25000,
+      fusion_base_price: 200000,
+      fusion_limit: 2,
+      extra_fusion_price: 75000,
+    },
+  };
+
+  const zeroFusion = calculateTemplatePriceSnapshot({
+    templateName: 'تعرفه با فیوژن',
+    rulesJson: rulesWithFusion,
+    ticketType: 'internet_install',
+    outMeter: 80,
+    inMeter: 20,
+    fusionCount: 0,
+  });
+  assert.equal(zeroFusion.fusion_fee, 0);
+  assert.equal(zeroFusion.total_earned, 1000000);
+
+  const fourFusions = calculateTemplatePriceSnapshot({
+    templateName: 'تعرفه با فیوژن',
+    rulesJson: rulesWithFusion,
+    ticketType: 'internet_install',
+    outMeter: 100,
+    inMeter: 30, // 130m -> 10m extra * 25,000 = 250,000
+    fusionCount: 4, // 2 base (200k) + 2 extra * 75k (150k) = 350,000
+  });
+  assert.equal(fourFusions.fusion_count, 4);
+  assert.equal(fourFusions.fusion_fee, 350000);
+  assert.equal(fourFusions.extra_meter_fee, 250000);
+  assert.equal(fourFusions.total_earned, 1600000);
+});
+
+test('V2.0 Port number validation enforces integer 1..128 bounds', () => {
+  assert.equal(validatePortNumber(1, true).value, 1);
+  assert.equal(validatePortNumber('64', true).value, 64);
+  assert.equal(validatePortNumber(128, true).value, 128);
+  assert.equal(validatePortNumber('', true).ok, false);
+  assert.equal(validatePortNumber('', false).ok, true);
+  assert.equal(validatePortNumber(0, true).ok, false);
+  assert.equal(validatePortNumber(129, true).ok, false);
+  assert.equal(validatePortNumber(12.5, true).ok, false);
+});
+
+test('V2.0 Dynamic Van Stock material validation aggregates duplicates and blocks over-allocation', () => {
+  const vanStock = [
+    { id: 1, user_id: 5, item_id: 21, item_name: 'پریز ATB دوپورت', item_type: 'unit' as const, serial_number: null, quantity: 4 },
+    { id: 2, user_id: 5, item_id: 22, item_name: 'پیگتیل SC/APC', item_type: 'unit' as const, serial_number: null, quantity: 3 },
+    { id: 3, user_id: 9, item_id: 22, item_name: 'پیگتیل SC/APC', item_type: 'unit' as const, serial_number: null, quantity: 5 },
+  ];
+
+  const valid = validateDynamicMaterialRows(
+    [
+      { item_id: 21, quantity: 2 },
+      { item_id: 22, quantity: 2 },
+    ],
+    vanStock,
+    5,
+    false,
+  );
+  assert.equal(valid.ok, true);
+  assert.equal(valid.normalized.length, 2);
+  assert.equal(valid.normalized[0].item_name, 'پریز ATB دوپورت');
+
+  const exceededOwn = validateDynamicMaterialRows(
+    [{ item_id: 22, quantity: 4 }],
+    vanStock,
+    5,
+    false,
+  );
+  assert.equal(exceededOwn.ok, false);
+
+  const allowedCross = validateDynamicMaterialRows(
+    [{ item_id: 22, quantity: 6 }],
+    vanStock,
+    5,
+    true,
+  );
+  assert.equal(allowedCross.ok, true);
+});
+
+test('V2.0 F-FAT splitter changes validation & comment RBAC rules', () => {
+  assert.equal(validateSplitterChanges('internet_install', null).ok, true);
+  assert.equal(
+    validateSplitterChanges('ffat_install', {
+      parent_fat_removed_splitter: '',
+      parent_fat_installed_splitters: [],
+      ffat_installed_splitter: '',
+    }).ok,
+    false,
+  );
+  const validSplitters = validateSplitterChanges('ffat_install', {
+    parent_fat_removed_splitter: '1:32',
+    parent_fat_installed_splitters: ['1:2', '1:16'],
+    ffat_installed_splitter: '1:8',
+  });
+  assert.equal(validSplitters.ok, true);
+  assert.deepEqual(validSplitters.normalized?.parent_fat_installed_splitters, ['1:2', '1:16']);
+
+  const installerOwnPerm = { id: 5, permissions: ['can_edit_own_comment', 'can_delete_own_comment'] };
+  const moderatorPerm = { id: 9, permissions: ['can_manage_all_comments'] };
+  assert.equal(canUserEditComment(installerOwnPerm, 5, false), true);
+  assert.equal(canUserEditComment(installerOwnPerm, 8, false), false);
+  assert.equal(canUserEditComment(installerOwnPerm, 5, true), false);
+  assert.equal(canUserDeleteComment(moderatorPerm, 5, false), true);
+  assert.equal(canUserDeleteComment({ id: 7, isSuperAdmin: true, permissions: [] }, 5, false), true);
+});
+
+test('V3.0 Customer invoice snapshot calculates package discount, extra meters, modem, and material fees', () => {
+  const invoice = calculateCustomerInvoiceSnapshot({
+    packageId: 2,
+    packageName: 'بسته اقتصادی ۵۰٪',
+    rules: {
+      install_fee: 1800000,
+      install_discount_pct: 50, // net = 900,000
+      modem_price: 3500000,
+      modem_included: false,
+      free_config: false,
+      config_fee: 250000,
+      free_meter_limit: 80,
+      extra_meter_price: 35000, // 110m -> 30m * 35k = 1,050,000
+      charge_materials: true,
+    },
+    outMeter: 80,
+    inMeter: 30,
+    modemSource: 'company',
+    modemItemUnitPrice: 3800000,
+    materialsUsed: [
+      { item_id: 1, item_name: 'پریز ATB', quantity: 1, unit_price: 180000 },
+      { item_id: 2, item_name: 'پیگتیل SC/APC', quantity: 2, unit_price: 65000 }, // 130,000
+    ],
+    computedAt: '2026-11-24T12:00:00Z',
+  });
+
+  assert.equal(invoice.install_fee_net, 900000);
+  assert.equal(invoice.config_fee, 250000);
+  assert.equal(invoice.billable_extra_meter, 30);
+  assert.equal(invoice.extra_meter_fee, 1050000);
+  assert.equal(invoice.modem_fee, 3500000);
+  assert.equal(invoice.materials_fee, 310000);
+  assert.equal(invoice.total_customer_payable, 6010000);
+
+  // Free materials & included modem scenario
+  const freePkgInvoice = calculateCustomerInvoiceSnapshot({
+    packageId: 1,
+    packageName: 'نصب رایگان',
+    rules: {
+      install_fee: 0,
+      install_discount_pct: 0,
+      modem_price: 0,
+      modem_included: true,
+      free_config: true,
+      config_fee: 300000,
+      free_meter_limit: 100,
+      extra_meter_price: 35000,
+      charge_materials: false,
+    },
+    outMeter: 60,
+    inMeter: 20,
+    modemSource: 'company',
+    materialsUsed: [{ item_id: 1, item_name: 'پریز ATB', quantity: 1, unit_price: 180000 }],
+  });
+  assert.equal(freePkgInvoice.total_customer_payable, 0);
+  assert.equal(freePkgInvoice.materials_breakdown.length, 0);
+});
+
+test('V3.0 Public portal registration validator enforces Real & Legal rules, GPS format, and docs', () => {
+  const realMissingDocs = validatePublicRegistrationPayload({
+    requested_service: 'new_service',
+    entity_type: 'real',
+    region_id: 1,
+    first_name: 'علی',
+    last_name: 'کاظمی',
+    father_name: 'محمد',
+    national_code: '0011223344',
+    address: 'تهران، سعادت‌آباد، بلوار دریا، پلاک ۱۰',
+    postal_code: '1997714511',
+    phone_1: '09121112233',
+    location_gps: '35.7745, 51.3728',
+    uploadedImageTypes: ['national_card'],
+  });
+  assert.equal(realMissingDocs.ok, false);
+
+  const realValid = validatePublicRegistrationPayload({
+    requested_service: 'new_service',
+    entity_type: 'real',
+    region_id: 1,
+    first_name: 'علی',
+    last_name: 'کاظمی',
+    father_name: 'محمد',
+    national_code: '0011223344',
+    address: 'تهران، سعادت‌آباد، بلوار دریا، پلاک ۱۰',
+    postal_code: '1997714511',
+    phone_1: '09121112233',
+    location_gps: '35.7745, 51.3728',
+    uploadedImageTypes: ['national_card', 'birth_cert', 'postal_proof'],
+  });
+  assert.equal(realValid.ok, true);
+  assert.equal(realValid.customerName, 'علی کاظمی');
+
+  const legalValid = validatePublicRegistrationPayload({
+    requested_service: 'new_service',
+    entity_type: 'legal',
+    region_id: 2,
+    company_name: 'شرکت فناوری آوا',
+    registration_number: '554433',
+    national_id: '14001234567',
+    economic_code: '411122223333',
+    address: 'تهران، میدان ونک، برج آوا، طبقه ۴',
+    postal_code: '1991912345',
+    phone_1: '02188990011',
+    location_gps: '35.7575, 51.4100',
+    uploadedImageTypes: ['gazette', 'statutes', 'request_letter'],
+  });
+  assert.equal(legalValid.ok, true);
+  assert.equal(legalValid.customerName, 'شرکت فناوری آوا');
+
+  const badGps = validatePublicRegistrationPayload({
+    requested_service: 'fault_report',
+    entity_type: 'real',
+    region_id: 1,
+    first_name: 'سعید',
+    last_name: 'مرادی',
+    father_name: 'رضا',
+    address: 'تهران، ونک، خیابان ملاصدرا، پلاک ۲',
+    postal_code: '1991912345',
+    phone_1: '09123334455',
+    location_gps: '999, 51.4',
+  });
+  assert.equal(badGps.ok, false);
+});
+
+test('V3.0 HR user profile validator enforces mandatory fields and national_code/phone/email formats', () => {
+  const validUser = validateUserProfileV3({
+    first_name: 'نگار',
+    last_name: 'شریفی',
+    father_name: 'حمید',
+    birth_date: '1375-03-18',
+    national_code: '0088776655',
+    id_number: '4451',
+    email: 'negar@avafiber.ir',
+    phone_1: '09125556677',
+    phone_2: '',
+    address: 'تهران، یوسف‌آباد، خیابان دوم',
+    referrer: 'واحد منابع انسانی',
+  });
+  assert.equal(validUser.ok, true);
+  assert.equal(validUser.fullName, 'نگار شریفی');
+
+  const badUser = validateUserProfileV3({
+    first_name: 'نگار',
+    last_name: 'شریفی',
+    father_name: 'حمید',
+    birth_date: '1375-03-18',
+    national_code: '1234',
+    id_number: '4451',
+    email: 'invalid-email',
+    phone_1: '09125556677',
+    address: 'تهران',
+  });
+  assert.equal(badUser.ok, false);
+});
+
+test('V3.0 SLA evaluator ignores pending_operator and evaluates pending_installer', () => {
+  const now = new Date('2026-11-24T12:00:00Z');
+  const waitingOperator = evaluateTicketSla(
+    { status: 'pending_operator', assigned_at: '2026-11-24T01:00:00Z' },
+    4,
+    now,
+  );
+  assert.equal(waitingOperator.isBreached, false);
+
+  const waitingInstaller = evaluateTicketSla(
+    { status: 'pending_installer', assigned_at: '2026-11-24T06:00:00Z' },
+    4,
+    now,
+  );
+  assert.equal(waitingInstaller.isBreached, true);
+  assert.equal(waitingInstaller.elapsedHours, 6);
+});
+
+
 
 

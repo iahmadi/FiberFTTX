@@ -1,11 +1,16 @@
 // Offline-first IndexedDB persistence & auto-sync outbox using `idb`
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 
-export type OutboxItemKind = 'ticket_start' | 'ticket_comment' | 'service_record';
+export type OutboxItemKind =
+  | 'ticket_start'
+  | 'ticket_comment'
+  | 'service_record'
+  | 'public_preregistration';
 
 export interface OutboxStoredImage {
   imageType: string;
   filename: string;
+  caption?: string;
   blob: Blob;
   originalSize: number;
   compressedSize: number;
@@ -78,6 +83,24 @@ export async function loadOfflineSnapshot<T>(key: string): Promise<T | null> {
   return row ? (row.data as T) : null;
 }
 
+export async function removeOfflineSnapshot(key: string): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  const db = await getOfflineDb();
+  await db.delete('snapshots', key);
+}
+
+export async function saveServiceFormDraft<T>(ticketId: number, draft: T): Promise<void> {
+  await saveOfflineSnapshot(`service_form_draft_${ticketId}`, draft);
+}
+
+export async function loadServiceFormDraft<T>(ticketId: number): Promise<T | null> {
+  return loadOfflineSnapshot<T>(`service_form_draft_${ticketId}`);
+}
+
+export async function clearServiceFormDraft(ticketId: number): Promise<void> {
+  await removeOfflineSnapshot(`service_form_draft_${ticketId}`);
+}
+
 export async function queueOfflineMutation(
   item: Omit<OfflineOutboxItem, 'id' | 'createdAt' | 'status'>,
 ): Promise<number> {
@@ -125,6 +148,7 @@ export interface SyncTransport {
     filename: string,
   ) => Promise<{ file_path: string }>;
   apiPost: (url: string, body: unknown) => Promise<unknown>;
+  onlyKinds?: OutboxItemKind[];
 }
 
 export async function syncOutboxQueue(transport: SyncTransport): Promise<{
@@ -135,7 +159,9 @@ export async function syncOutboxQueue(transport: SyncTransport): Promise<{
     return { syncedCount: 0, failedCount: 0 };
   }
 
-  const items = await listOutboxItems();
+  const items = (await listOutboxItems()).filter((item) =>
+    transport.onlyKinds ? transport.onlyKinds.includes(item.kind) : true,
+  );
   let syncedCount = 0;
   let failedCount = 0;
 
@@ -149,7 +175,7 @@ export async function syncOutboxQueue(transport: SyncTransport): Promise<{
       } else if (item.kind === 'ticket_comment') {
         await transport.apiPost(`/api/tickets/${item.ticketId}/comments`, item.payload);
       } else if (item.kind === 'service_record') {
-        const uploadedImages: Array<{ image_type: string; file_path: string }> = [];
+        const uploadedImages: Array<{ image_type: string; file_path: string; caption?: string }> = [];
         for (const img of item.images || []) {
           const res = await transport.uploadBlob(
             item.ticketId,
@@ -157,15 +183,57 @@ export async function syncOutboxQueue(transport: SyncTransport): Promise<{
             img.blob,
             img.filename,
           );
-          uploadedImages.push({ image_type: img.imageType, file_path: res.file_path });
+          uploadedImages.push({
+            image_type: img.imageType,
+            file_path: res.file_path,
+            caption: img.caption || undefined,
+          });
         }
         const existingImages = Array.isArray(item.payload.images)
-          ? (item.payload.images as Array<{ image_type: string; file_path: string }>)
+          ? (item.payload.images as Array<{ image_type: string; file_path: string; caption?: string }>)
           : [];
         await transport.apiPost('/api/service-records', {
           ...item.payload,
           images: [...existingImages, ...uploadedImages],
         });
+      } else if (item.kind === 'public_preregistration') {
+        const uploadedImages: Array<{ image_type: string; file_path: string; caption?: string }> = [];
+        for (const img of item.images || []) {
+          const fd = new FormData();
+          fd.append('image_type', img.imageType);
+          fd.append('image', img.blob, img.filename);
+          const res = await fetch('/api/public/upload-identity', {
+            method: 'POST',
+            headers: { 'X-Requested-With': 'XMLHttpRequest' },
+            body: fd,
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data?.file_path) {
+            throw new Error(typeof data?.error === 'string' ? data.error : 'خطا در آپلود مدرک آفلاین');
+          }
+          uploadedImages.push({
+            image_type: img.imageType,
+            file_path: String(data.file_path),
+            caption: img.caption || undefined,
+          });
+        }
+        const resReq = await fetch('/api/public/requests', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+          body: JSON.stringify({
+            ...item.payload,
+            images: uploadedImages,
+          }),
+        });
+        const reqData = await resReq.json().catch(() => ({}));
+        if (!resReq.ok) {
+          throw new Error(
+            typeof reqData?.error === 'string' ? reqData.error : 'خطا در همگام‌سازی درخواست عمومی',
+          );
+        }
       }
 
       await removeOutboxItem(item.id);

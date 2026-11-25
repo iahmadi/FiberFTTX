@@ -53,7 +53,7 @@ export function ContractorMonthlyEarningsReport({
       monthlySummary: filteredMonths,
       ledgerRows: ledger.map((l) => ({
         id: l.id,
-        user_full_name: l.user_full_name,
+        user_full_name: l.user_full_name || l.customer_name || '—',
         ticket_id: l.ticket_id,
         type: l.type,
         amount: l.amount,

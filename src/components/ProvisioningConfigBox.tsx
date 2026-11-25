@@ -9,6 +9,7 @@ interface ProvisioningConfigBoxProps {
 
 export function ProvisioningConfigBox({ ticket }: ProvisioningConfigBoxProps) {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  if (ticket.type === 'public_preregistration') return null;
   const vis = getTicketTypeFieldVisibility(ticket.type);
 
   const hasPppoe = vis.showPppoeVlan && (ticket.pppoe_user || ticket.pppoe_pass || ticket.vlan_id);

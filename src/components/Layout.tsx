@@ -3,18 +3,22 @@ import {
   Activity,
   Cable,
   ClipboardList,
+  Globe,
   HardDrive,
+  KeyRound,
   LayoutDashboard,
   LogOut,
   Menu,
   Package,
+  Settings,
   ShieldCheck,
   Wallet,
   Wrench,
   X,
 } from 'lucide-react';
 import { userHasPermission } from '../lib/permissions';
-import type { AuthUser } from '../types/erp';
+import type { AuthUser, SystemSettings } from '../types/erp';
+import { ChangePasswordModal } from './ChangePasswordModal';
 import { OfflineIndicator } from './OfflineIndicator';
 import { PWAInstallButton } from './PWAInstallButton';
 
@@ -25,13 +29,17 @@ export type NavTab =
   | 'hardware'
   | 'inventory'
   | 'financial'
-  | 'users';
+  | 'users'
+  | 'settings';
 
 interface LayoutProps {
   user: AuthUser;
+  systemSettings: SystemSettings;
   activeTab: NavTab;
   onSelectTab: (tab: NavTab) => void;
+  onNavigatePublicPortal: () => void;
   onLogout: () => void;
+  onNotify: (type: 'success' | 'error' | 'warning' | 'info', title: string, desc?: string) => void;
   isOnline: boolean;
   pendingSyncCount: number;
   isSyncing: boolean;
@@ -69,7 +77,7 @@ const NAV_ITEMS: NavItemDef[] = [
   },
   {
     id: 'financial',
-    label: 'مالی، تعرفه و کمپین',
+    label: 'مالی، پکیج و تعرفه',
     icon: Wallet,
     requiredPerms: ['can_view_financials', 'can_manage_tariffs', 'can_execute_service'],
   },
@@ -79,13 +87,22 @@ const NAV_ITEMS: NavItemDef[] = [
     icon: ShieldCheck,
     requiredPerms: ['can_manage_users'],
   },
+  {
+    id: 'settings',
+    label: 'تنظیمات و مناطق',
+    icon: Settings,
+    requiredPerms: ['can_manage_settings'],
+  },
 ];
 
 export function Layout({
   user,
+  systemSettings,
   activeTab,
   onSelectTab,
+  onNavigatePublicPortal,
   onLogout,
+  onNotify,
   isOnline,
   pendingSyncCount,
   isSyncing,
@@ -93,6 +110,7 @@ export function Layout({
   children,
 }: LayoutProps) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [changePwOpen, setChangePwOpen] = useState(false);
 
   const visibleNav = NAV_ITEMS.filter(
     (item) =>
@@ -108,12 +126,17 @@ export function Layout({
     <div className="flex h-full flex-col justify-between bg-slate-900 text-slate-100">
       <div>
         <div className="flex items-center justify-between border-b border-slate-800 px-4 py-4">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-teal-600 text-white shadow-sm">
+          <div className="flex min-w-0 items-center gap-3">
+            <div
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-white shadow-sm"
+              style={{ backgroundColor: 'var(--brand-primary)' }}
+            >
               <Cable className="h-5 w-5" />
             </div>
-            <div>
-              <div className="text-sm font-bold text-white">آوانتورک ERP</div>
+            <div className="min-w-0">
+              <div className="truncate text-sm font-bold text-white">
+                {systemSettings.system_name}
+              </div>
               <div className="text-[11px] text-slate-400">عملیات فیبر نوری</div>
             </div>
           </div>
@@ -136,10 +159,9 @@ export function Layout({
                 key={item.id}
                 type="button"
                 onClick={() => handleNavClick(item.id)}
+                style={active ? { backgroundColor: 'var(--brand-primary)' } : undefined}
                 className={`flex min-h-[44px] w-full items-center gap-3 rounded-lg px-3 py-2.5 text-right text-sm font-medium transition-colors ${
-                  active
-                    ? 'bg-teal-700 text-white'
-                    : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+                  active ? 'text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'
                 }`}
               >
                 <Icon className="h-4 w-4 shrink-0" />
@@ -160,14 +182,40 @@ export function Layout({
             </div>
           </div>
         </div>
-        <button
-          type="button"
-          onClick={onLogout}
-          className="flex min-h-[42px] w-full items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-200 hover:bg-red-950/60 hover:text-red-200"
-        >
-          <LogOut className="h-4 w-4" />
-          <span>خروج از سامانه</span>
-        </button>
+        <div className="space-y-2">
+          <button
+            type="button"
+            onClick={() => {
+              setMobileMenuOpen(false);
+              onNavigatePublicPortal();
+            }}
+            className="flex min-h-[38px] w-full items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-800/80 px-3 py-1.5 text-xs font-semibold text-teal-300 hover:bg-slate-700"
+          >
+            <Globe className="h-3.5 w-3.5" />
+            <span>مشاهده پرتال مشتریان</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setMobileMenuOpen(false);
+              setChangePwOpen(true);
+            }}
+            className="flex min-h-[38px] w-full items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-800/80 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-700"
+          >
+            <KeyRound className="h-3.5 w-3.5 text-teal-400" />
+            <span>تغییر رمز عبور</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={onLogout}
+            className="flex min-h-[42px] w-full items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-200 hover:bg-red-950/60 hover:text-red-200"
+          >
+            <LogOut className="h-4 w-4" />
+            <span>خروج از سامانه</span>
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -201,7 +249,7 @@ export function Layout({
             </button>
             <div>
               <h1 className="text-base font-bold text-slate-900">
-                {visibleNav.find((n) => n.id === activeTab)?.label || 'آوانتورک ERP'}
+                {visibleNav.find((n) => n.id === activeTab)?.label || systemSettings.system_name}
               </h1>
               <p className="hidden text-xs text-slate-500 sm:block">
                 شبکه اینترانت یکپارچه مدیریت تیکتینگ، قرقره کابل، توپولوژی و حسابداری فیبر نوری
@@ -222,6 +270,13 @@ export function Layout({
 
         <main className="flex-1 p-4 sm:p-6">{children}</main>
       </div>
+
+      <ChangePasswordModal
+        open={changePwOpen}
+        onClose={() => setChangePwOpen(false)}
+        onNotify={onNotify}
+      />
     </div>
   );
 }
+

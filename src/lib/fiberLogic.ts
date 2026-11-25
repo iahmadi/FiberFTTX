@@ -7,7 +7,14 @@
 
 import { JALALI_MONTH_NAMES, gregorianToJalali, toPersianDigits } from './jalali.ts';
 import type {
+  AnyTicketTypeKey,
+  CustomerInvoiceMaterialItem,
+  CustomerInvoiceSnapshot,
+  CustomerPackageRules,
+  CustomerRegistrationDetails,
+  DynamicMaterialUsageItem,
   ServicePriceSnapshot,
+  SplitterChangesData,
   TariffCalcMode,
   TariffTemplateRulesJson,
   TariffTypeRule,
@@ -15,7 +22,14 @@ import type {
 } from '../db/schema.ts';
 
 export type {
+  AnyTicketTypeKey,
+  CustomerInvoiceMaterialItem,
+  CustomerInvoiceSnapshot,
+  CustomerPackageRules,
+  CustomerRegistrationDetails,
+  DynamicMaterialUsageItem,
   ServicePriceSnapshot,
+  SplitterChangesData,
   TariffCalcMode,
   TariffTemplateRulesJson,
   TariffTypeRule,
@@ -23,7 +37,13 @@ export type {
 };
 export type ModemSource = 'company' | 'customer';
 export type ServiceSourceType = 'FAT' | 'FFAT';
-export type TicketStatus = 'pending' | 'in_progress' | 'completed' | 'failed';
+export type TicketStatus =
+  | 'pending_operator'
+  | 'pending_installer'
+  | 'pending'
+  | 'in_progress'
+  | 'completed'
+  | 'failed';
 
 export const TICKET_TYPES: TicketTypeKey[] = [
   'internet_install',
@@ -32,6 +52,15 @@ export const TICKET_TYPES: TicketTypeKey[] = [
   'ffat_fault',
   'voip_install',
 ];
+
+export const ALL_TICKET_TYPE_LABELS: Record<AnyTicketTypeKey, string> = {
+  internet_install: 'نصب اینترنت FTTH',
+  internet_fault: 'رفع خرابی اینترنت',
+  ffat_install: 'نصب F-FAT جدید',
+  ffat_fault: 'رفع خرابی F-FAT',
+  voip_install: 'راه‌اندازی تلفن VoIP',
+  public_preregistration: 'پیش‌ثبت‌نام آنلاین مشترک',
+};
 
 export const TICKET_TYPE_LABELS: Record<TicketTypeKey, string> = {
   internet_install: 'نصب اینترنت FTTH',
@@ -374,6 +403,7 @@ export function calculateTemplatePriceSnapshot(params: {
   ticketType: TicketTypeKey;
   outMeter: number;
   inMeter: number;
+  fusionCount?: number;
   promotionName?: string | null;
   promotionBonus?: number;
   computedAt?: string;
@@ -383,6 +413,9 @@ export function calculateTemplatePriceSnapshot(params: {
     base_price: 500000,
     meter_limit: 0,
     extra_meter_price: 0,
+    fusion_base_price: 0,
+    fusion_limit: 0,
+    extra_fusion_price: 0,
   };
 
   const safeOut = Math.max(0, Math.round(params.outMeter));
@@ -409,8 +442,16 @@ export function calculateTemplatePriceSnapshot(params: {
     subtotal = basePrice + extraMeterFee;
   }
 
+  const safeFusionCount = Math.max(0, Math.round(Number(params.fusionCount) || 0));
+  const fusionBasePrice = Math.max(0, Number(rule.fusion_base_price) || 0);
+  const fusionLimit = Math.max(0, Math.round(Number(rule.fusion_limit) || 0));
+  const extraFusionPrice = Math.max(0, Number(rule.extra_fusion_price) || 0);
+  const billableExtraFusion = Math.max(0, safeFusionCount - fusionLimit);
+  const fusionFee =
+    safeFusionCount > 0 ? fusionBasePrice + billableExtraFusion * extraFusionPrice : 0;
+
   const promoBonus = Math.max(0, Number(params.promotionBonus) || 0);
-  const totalEarned = Math.round((subtotal + promoBonus) * 100) / 100;
+  const totalEarned = Math.round((subtotal + fusionFee + promoBonus) * 100) / 100;
 
   return {
     template_name: params.templateName,
@@ -424,6 +465,11 @@ export function calculateTemplatePriceSnapshot(params: {
     total_meter: totalMeter,
     billable_extra_meter: billableExtraMeter,
     extra_meter_fee: extraMeterFee,
+    fusion_count: safeFusionCount,
+    fusion_base_price: fusionBasePrice,
+    fusion_limit: fusionLimit,
+    extra_fusion_price: extraFusionPrice,
+    fusion_fee: fusionFee,
     promotion_name: params.promotionName || null,
     promotion_bonus: promoBonus,
     total_earned: totalEarned,
@@ -565,7 +611,7 @@ export function filterMonthlyEarningsByRange(
 
 export interface ScheduledTicketLike {
   id: number;
-  type: TicketTypeKey;
+  type: AnyTicketTypeKey;
   status: TicketStatus;
   scheduled_date?: string | null;
   scheduled_time?: string | null;
@@ -588,7 +634,14 @@ export function groupScheduledTicketsByJalaliDay<T extends ScheduledTicketLike>(
 ): Record<number, T[]> {
   const grouped: Record<number, T[]> = {};
   for (const t of tickets) {
-    if (t.status === 'completed' || t.status === 'failed') continue;
+    if (
+      t.status === 'completed' ||
+      t.status === 'failed' ||
+      t.status === 'pending_operator' ||
+      t.type === 'public_preregistration'
+    ) {
+      continue;
+    }
     if (
       onlyInstalls &&
       t.type !== 'internet_install' &&
@@ -633,7 +686,7 @@ export interface Last30DaysCompletionSummary {
 
 export function computeLast30DaysCompletionByType(
   tickets: Array<{
-    type: TicketTypeKey;
+    type: AnyTicketTypeKey;
     status: TicketStatus;
     created_at: string | Date;
     completed_at?: string | Date | null;
@@ -649,6 +702,7 @@ export function computeLast30DaysCompletionByType(
   }
 
   for (const ticket of tickets) {
+    if (ticket.type === 'public_preregistration') continue;
     const createdMs = new Date(ticket.created_at).getTime();
     const completedMs = ticket.completed_at ? new Date(ticket.completed_at).getTime() : NaN;
     const activeMs =
@@ -1005,6 +1059,10 @@ export interface TicketSlaStatus {
   elapsedLabel: string;
 }
 
+export function isWaitingInstallerStatus(status: TicketStatus): boolean {
+  return status === 'pending_installer' || status === 'pending';
+}
+
 export function evaluateTicketSla(
   ticket: {
     status: TicketStatus;
@@ -1013,7 +1071,7 @@ export function evaluateTicketSla(
   thresholdHours = 4,
   referenceDate: Date = new Date(),
 ): TicketSlaStatus {
-  if (ticket.status !== 'pending' || !ticket.assigned_at) {
+  if (!isWaitingInstallerStatus(ticket.status) || !ticket.assigned_at) {
     return { isBreached: false, elapsedHours: 0, elapsedMinutes: 0, elapsedLabel: '' };
   }
   const assignedMs = new Date(ticket.assigned_at).getTime();
@@ -1057,7 +1115,7 @@ export interface TicketFilterCriteria {
 
 export interface FilterableTicket {
   id: number;
-  type: TicketTypeKey;
+  type: AnyTicketTypeKey;
   customer_name: string;
   address: string;
   status: TicketStatus;
@@ -1120,7 +1178,7 @@ export function filterTicketsAdvanced<T extends FilterableTicket>(
 
 export interface SlaDurationTicketInput {
   id?: number;
-  type: TicketTypeKey;
+  type: AnyTicketTypeKey;
   status: TicketStatus;
   assigned_installer?: number | null;
   installer_name?: string | null;
@@ -1172,7 +1230,14 @@ export function computeContractorSlaAveragesLast30Days(
   let totalCompletedAnalyzed = 0;
 
   for (const t of tickets) {
-    if (t.status !== 'completed' || !t.completed_at || !t.assigned_installer) continue;
+    if (
+      t.status !== 'completed' ||
+      !t.completed_at ||
+      !t.assigned_installer ||
+      t.type === 'public_preregistration'
+    ) {
+      continue;
+    }
     const completedMs = new Date(t.completed_at).getTime();
     if (Number.isNaN(completedMs) || completedMs < startMs || completedMs > endMs) continue;
 
@@ -1265,6 +1330,8 @@ export function computeContractorSlaAveragesLast30Days(
 }
 
 export const TICKET_STATUS_LABELS: Record<TicketStatus, string> = {
+  pending_operator: 'در انتظار بررسی اپراتور',
+  pending_installer: 'در انتظار ارجاع / اجرا',
   pending: 'در انتظار شروع',
   in_progress: 'در حال اجرا',
   completed: 'تکمیل‌شده',
@@ -1273,7 +1340,7 @@ export const TICKET_STATUS_LABELS: Record<TicketStatus, string> = {
 
 export interface CriticalSlaComparableTicket {
   id: number;
-  type: TicketTypeKey;
+  type: AnyTicketTypeKey;
   customer_name: string;
   status: TicketStatus;
   installer_name?: string | null;
@@ -1286,7 +1353,7 @@ export interface CriticalSlaTransitionAlert {
   eventKey: string;
   ticketId: number;
   customerName: string;
-  ticketType: TicketTypeKey;
+  ticketType: AnyTicketTypeKey;
   previousStatus: TicketStatus;
   newStatus: TicketStatus;
   previousStatusLabel: string;
@@ -1346,7 +1413,8 @@ export function detectCriticalSlaStatusTransitions(
     if (diffMs <= thresholdMs) continue;
 
     // Critical SLA applies specifically when a breached pending ticket or overdue ticket advances
-    if (prev.status !== 'pending' && curr.status === 'pending') continue;
+    if (!isWaitingInstallerStatus(prev.status) && isWaitingInstallerStatus(curr.status)) continue;
+    if (prev.status === 'pending_operator') continue;
 
     const { elapsedHours, elapsedLabel } = formatSlaDurationLabel(diffMs);
     const changedAt = new Date(actionMs).toISOString();
@@ -1382,7 +1450,13 @@ export function findRecentCriticalSlaTransitions(
   const alerts: CriticalSlaTransitionAlert[] = [];
 
   for (const t of tickets) {
-    if (t.status === 'pending' || !t.assigned_at) continue;
+    if (
+      t.status === 'pending_operator' ||
+      isWaitingInstallerStatus(t.status) ||
+      !t.assigned_at
+    ) {
+      continue;
+    }
     const assignedMs = new Date(t.assigned_at).getTime();
     if (Number.isNaN(assignedMs)) continue;
 
@@ -1390,13 +1464,13 @@ export function findRecentCriticalSlaTransitions(
     let actionMs: number | null = null;
 
     if (t.status === 'in_progress' && t.started_at) {
-      previousStatus = 'pending';
+      previousStatus = 'pending_installer';
       actionMs = new Date(t.started_at).getTime();
     } else if (t.status === 'completed' && t.completed_at) {
-      previousStatus = t.started_at ? 'in_progress' : 'pending';
+      previousStatus = t.started_at ? 'in_progress' : 'pending_installer';
       actionMs = new Date(t.completed_at).getTime();
     } else if (t.status === 'failed' && (t.completed_at || t.started_at)) {
-      previousStatus = t.started_at ? 'in_progress' : 'pending';
+      previousStatus = t.started_at ? 'in_progress' : 'pending_installer';
       actionMs = new Date(t.completed_at || t.started_at!).getTime();
     }
 
@@ -1543,4 +1617,563 @@ export function computeCurrentMonthSpoolConsumptionByContractor(
     contractors,
   };
 }
+
+// ==========================================
+// V2.0 DOMAIN VALIDATORS & COMMENT RBAC
+// ==========================================
+
+export const SPLITTER_OPTIONS = ['none', '1:2', '1:4', '1:8', '1:16', '1:32', '1:64'] as const;
+
+export function validatePortNumber(
+  portInput: number | string | null | undefined,
+  required: boolean,
+): { ok: boolean; value: number | null; error?: string } {
+  if (portInput === null || portInput === undefined || String(portInput).trim() === '') {
+    if (required) {
+      return { ok: false, value: null, error: 'وارد کردن شماره پورت باکس (۱ تا ۱۲۸) الزامی است.' };
+    }
+    return { ok: true, value: null };
+  }
+  const num = Number(portInput);
+  if (!Number.isInteger(num) || num < 1 || num > 128) {
+    return { ok: false, value: null, error: 'شماره پورت باید عدد صحیح بین ۱ تا ۱۲۸ باشد.' };
+  }
+  return { ok: true, value: num };
+}
+
+export interface DynamicMaterialRequestRow {
+  item_id: number;
+  quantity: number;
+}
+
+export interface VanStockUnitRecord extends VanStockRecord {
+  item_name?: string;
+}
+
+export function validateDynamicMaterialRows(
+  rows: DynamicMaterialRequestRow[],
+  vanStockRows: VanStockUnitRecord[],
+  installerId: number,
+  canCrossUseInventory: boolean,
+): { ok: boolean; normalized: DynamicMaterialUsageItem[]; error?: string } {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { ok: true, normalized: [] };
+  }
+
+  const aggregated = new Map<number, number>();
+  for (const r of rows) {
+    const itemId = Number(r.item_id);
+    const qty = Number(r.quantity);
+    if (!Number.isInteger(itemId) || itemId <= 0) {
+      return { ok: false, normalized: [], error: 'شناسه تجهیز انتخاب‌شده نامعتبر است.' };
+    }
+    if (!Number.isInteger(qty) || qty <= 0) {
+      return { ok: false, normalized: [], error: 'تعداد مصرفی هر تجهیز باید عدد صحیح مثبت باشد.' };
+    }
+    aggregated.set(itemId, (aggregated.get(itemId) ?? 0) + qty);
+  }
+
+  const normalized: DynamicMaterialUsageItem[] = [];
+
+  for (const [itemId, neededQty] of aggregated.entries()) {
+    const matchingRows = vanStockRows.filter(
+      (v) =>
+        v.item_id === itemId &&
+        v.item_type === 'unit' &&
+        v.quantity > 0 &&
+        (v.user_id === installerId || canCrossUseInventory),
+    );
+    const totalAvailable = matchingRows.reduce((sum, v) => sum + Number(v.quantity || 0), 0);
+    if (totalAvailable < neededQty) {
+      const sampleName = matchingRows[0]?.item_name || `تجهیز #${itemId}`;
+      return {
+        ok: false,
+        normalized: [],
+        error: `موجودی «${sampleName}» در انبار خودرو (${totalAvailable} عدد) برای کسر ${neededQty} عدد کافی نیست.`,
+      };
+    }
+    normalized.push({
+      item_id: itemId,
+      item_name: matchingRows[0]?.item_name || `تجهیز #${itemId}`,
+      quantity: neededQty,
+    });
+  }
+
+  return { ok: true, normalized };
+}
+
+export function validateSplitterChanges(
+  ticketType: TicketTypeKey,
+  input: Partial<SplitterChangesData> | null | undefined,
+): { ok: boolean; normalized: SplitterChangesData | null; error?: string } {
+  if (ticketType !== 'ffat_install') {
+    return { ok: true, normalized: null };
+  }
+  const removed = (input?.parent_fat_removed_splitter || '').trim();
+  const installedParents = Array.isArray(input?.parent_fat_installed_splitters)
+    ? input.parent_fat_installed_splitters.map((s) => String(s).trim()).filter(Boolean)
+    : [];
+  const ffatSplitter = (input?.ffat_installed_splitter || '').trim();
+
+  if (!removed || installedParents.length === 0 || !ffatSplitter) {
+    return {
+      ok: false,
+      normalized: null,
+      error:
+        'برای عملیات نصب F-FAT، ثبت اسپلیتر حذف/تعویض‌شده FAT والد، اسپلیترهای نصب‌شده والد و اسپلیتر باکس F-FAT الزامی است.',
+    };
+  }
+
+  return {
+    ok: true,
+    normalized: {
+      parent_fat_removed_splitter: removed,
+      parent_fat_installed_splitters: installedParents,
+      ffat_installed_splitter: ffatSplitter,
+    },
+  };
+}
+
+export interface CommentPermissionSubject {
+  id: number;
+  isSuperAdmin?: boolean;
+  role_name?: string;
+  permissions: string[];
+}
+
+export function canUserEditComment(
+  user: CommentPermissionSubject | null | undefined,
+  commentOwnerId: number,
+  isDeleted = false,
+): boolean {
+  if (!user || isDeleted) return false;
+  if (user.isSuperAdmin || user.role_name === 'SuperAdmin') return true;
+  if (user.permissions.includes('can_manage_all_comments')) return true;
+  return user.id === commentOwnerId && user.permissions.includes('can_edit_own_comment');
+}
+
+export function canUserDeleteComment(
+  user: CommentPermissionSubject | null | undefined,
+  commentOwnerId: number,
+  isDeleted = false,
+): boolean {
+  if (!user || isDeleted) return false;
+  if (user.isSuperAdmin || user.role_name === 'SuperAdmin') return true;
+  if (user.permissions.includes('can_manage_all_comments')) return true;
+  return user.id === commentOwnerId && user.permissions.includes('can_delete_own_comment');
+}
+
+// ==========================================
+// V3.0 CUSTOMER INVOICE, PUBLIC PORTAL & HR VALIDATION
+// ==========================================
+
+export function calculateCustomerInvoiceSnapshot(params: {
+  packageId: number | null;
+  packageName: string;
+  rules: CustomerPackageRules;
+  outMeter: number;
+  inMeter: number;
+  modemSource: ModemSource;
+  modemItemUnitPrice?: number;
+  materialsUsed: Array<{
+    item_id: number;
+    item_name: string;
+    quantity: number;
+    unit_price: number;
+  }>;
+  computedAt?: string;
+}): CustomerInvoiceSnapshot {
+  const rules = params.rules;
+  const installFeeGross = Math.max(0, Number(rules.install_fee) || 0);
+  const discountPct = Math.max(0, Math.min(100, Number(rules.install_discount_pct) || 0));
+  const installFeeNet = Math.round(installFeeGross * (1 - discountPct / 100));
+
+  const configFee = rules.free_config ? 0 : Math.max(0, Number(rules.config_fee) || 0);
+
+  const safeOut = Math.max(0, Math.round(Number(params.outMeter) || 0));
+  const safeIn = Math.max(0, Math.round(Number(params.inMeter) || 0));
+  const totalMeter = safeOut + safeIn;
+  const freeMeterLimit = Math.max(0, Math.round(Number(rules.free_meter_limit) || 0));
+  const billableExtraMeter = Math.max(0, totalMeter - freeMeterLimit);
+  const extraMeterPrice = Math.max(0, Number(rules.extra_meter_price) || 0);
+  const extraMeterFee = Math.round(billableExtraMeter * extraMeterPrice);
+
+  let modemFee = 0;
+  if (params.modemSource === 'company' && !rules.modem_included) {
+    const pkgModemPrice = Math.max(0, Number(rules.modem_price) || 0);
+    const invModemPrice = Math.max(0, Number(params.modemItemUnitPrice) || 0);
+    modemFee = pkgModemPrice > 0 ? pkgModemPrice : invModemPrice;
+  }
+
+  const chargeMaterials = Boolean(rules.charge_materials);
+  const materialsBreakdown: CustomerInvoiceMaterialItem[] = chargeMaterials
+    ? params.materialsUsed.map((m) => {
+        const qty = Math.max(0, Math.round(Number(m.quantity) || 0));
+        const unitPrice = Math.max(0, Number(m.unit_price) || 0);
+        return {
+          item_id: m.item_id,
+          item_name: m.item_name,
+          quantity: qty,
+          unit_price: unitPrice,
+          line_total: Math.round(qty * unitPrice),
+        };
+      })
+    : [];
+  const materialsFee = materialsBreakdown.reduce((acc, m) => acc + m.line_total, 0);
+
+  const totalCustomerPayable = Math.round(
+    installFeeNet + configFee + extraMeterFee + modemFee + materialsFee,
+  );
+
+  return {
+    package_id: params.packageId,
+    package_name: params.packageName,
+    install_fee_gross: installFeeGross,
+    install_discount_pct: discountPct,
+    install_fee_net: installFeeNet,
+    config_fee: configFee,
+    free_meter_limit: freeMeterLimit,
+    total_meter: totalMeter,
+    billable_extra_meter: billableExtraMeter,
+    extra_meter_price: extraMeterPrice,
+    extra_meter_fee: extraMeterFee,
+    modem_source: params.modemSource,
+    modem_included: Boolean(rules.modem_included),
+    modem_fee: modemFee,
+    charge_materials: chargeMaterials,
+    materials_breakdown: materialsBreakdown,
+    materials_fee: materialsFee,
+    total_customer_payable: totalCustomerPayable,
+    computed_at: params.computedAt || new Date().toISOString(),
+  };
+}
+
+export interface PublicRegistrationInput {
+  requested_service: 'new_service' | 'fault_report';
+  entity_type: 'real' | 'legal';
+  region_id: number | string;
+  address: string;
+  location_gps: string;
+  postal_code: string;
+  phone_1: string;
+  phone_2?: string;
+  // Real entity
+  first_name?: string;
+  last_name?: string;
+  father_name?: string;
+  national_code?: string;
+  // Legal entity
+  company_name?: string;
+  registration_number?: string;
+  national_id?: string;
+  economic_code?: string;
+  fault_description?: string;
+  // Uploaded identity image types
+  uploadedImageTypes?: string[];
+}
+
+export function isValidGpsCoordinates(gps: string): boolean {
+  const match = /^\s*(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*$/.exec(gps);
+  if (!match) return false;
+  const lat = Number(match[1]);
+  const lng = Number(match[2]);
+  return lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+}
+
+export function validatePublicRegistrationPayload(input: PublicRegistrationInput): {
+  ok: boolean;
+  error?: string;
+  customerName: string;
+  details: CustomerRegistrationDetails;
+} {
+  const emptyDetails: CustomerRegistrationDetails = {
+    entity_type: input.entity_type === 'legal' ? 'legal' : 'real',
+    postal_code: '',
+    phone_1: '',
+  };
+
+  if (input.requested_service !== 'new_service' && input.requested_service !== 'fault_report') {
+    return {
+      ok: false,
+      error: 'نوع درخواست باید «سرویس اینترنت جدید» یا «اعلام خرابی» باشد.',
+      customerName: '',
+      details: emptyDetails,
+    };
+  }
+  if (input.entity_type !== 'real' && input.entity_type !== 'legal') {
+    return {
+      ok: false,
+      error: 'نوع مشترک باید حقیقی یا حقوقی انتخاب شود.',
+      customerName: '',
+      details: emptyDetails,
+    };
+  }
+
+  const regionId = Number(input.region_id);
+  if (!Number.isInteger(regionId) || regionId <= 0) {
+    return {
+      ok: false,
+      error: 'انتخاب منطقه تحت پوشش الزامی است.',
+      customerName: '',
+      details: emptyDetails,
+    };
+  }
+
+  const address = (input.address || '').trim();
+  const postalCode = (input.postal_code || '').trim();
+  const phone1 = (input.phone_1 || '').trim();
+  const phone2 = (input.phone_2 || '').trim();
+  const gps = (input.location_gps || '').trim();
+
+  if (address.length < 5) {
+    return {
+      ok: false,
+      error: 'نشانی دقیق محل سرویس باید وارد شود.',
+      customerName: '',
+      details: emptyDetails,
+    };
+  }
+  if (!/^\d{10}$/.test(postalCode)) {
+    return {
+      ok: false,
+      error: 'کد پستی باید دقیقاً ۱۰ رقم عددی باشد.',
+      customerName: '',
+      details: emptyDetails,
+    };
+  }
+  if (!/^0\d{10}$/.test(phone1)) {
+    return {
+      ok: false,
+      error: 'شماره تماس اصلی باید ۱۱ رقم و با ۰ شروع شود (مثال: 09121234567).',
+      customerName: '',
+      details: emptyDetails,
+    };
+  }
+  if (phone2 && !/^0\d{10}$/.test(phone2)) {
+    return {
+      ok: false,
+      error: 'شماره تماس دوم (در صورت ورود) باید ۱۱ رقم و با ۰ شروع شود.',
+      customerName: '',
+      details: emptyDetails,
+    };
+  }
+  if (!isValidGpsCoordinates(gps)) {
+    return {
+      ok: false,
+      error: 'مختصات موقعیت مکانی (GPS) معتبر نیست (فرمت صحیح: 35.7219, 51.3347).',
+      customerName: '',
+      details: emptyDetails,
+    };
+  }
+
+  const uploadedTypes = new Set((input.uploadedImageTypes || []).map((t) => t.trim()));
+
+  if (input.entity_type === 'real') {
+    const firstName = (input.first_name || '').trim();
+    const lastName = (input.last_name || '').trim();
+    const fatherName = (input.father_name || '').trim();
+    const nationalCode = (input.national_code || '').trim();
+
+    if (!firstName || !lastName || !fatherName) {
+      return {
+        ok: false,
+        error: 'نام، نام خانوادگی و نام پدر برای مشترک حقیقی الزامی است.',
+        customerName: '',
+        details: emptyDetails,
+      };
+    }
+    if (nationalCode && !/^\d{10}$/.test(nationalCode)) {
+      return {
+        ok: false,
+        error: 'کد ملی باید ۱۰ رقم عددی باشد.',
+        customerName: '',
+        details: emptyDetails,
+      };
+    }
+
+    if (input.requested_service === 'new_service') {
+      const requiredRealDocs = ['national_card', 'birth_cert', 'postal_proof'];
+      const missing = requiredRealDocs.filter((d) => !uploadedTypes.has(d));
+      if (missing.length > 0) {
+        return {
+          ok: false,
+          error: 'آپلود تصویر کارت ملی، شناسنامه و تاییدیه کد پستی برای سرویس جدید حقیقی الزامی است.',
+          customerName: '',
+          details: emptyDetails,
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      customerName: `${firstName} ${lastName}`,
+      details: {
+        entity_type: 'real',
+        first_name: firstName,
+        last_name: lastName,
+        father_name: fatherName,
+        national_code: nationalCode || undefined,
+        postal_code: postalCode,
+        phone_1: phone1,
+        phone_2: phone2 || undefined,
+        fault_description: (input.fault_description || '').trim() || undefined,
+      },
+    };
+  }
+
+  // Legal entity validation
+  const companyName = (input.company_name || '').trim();
+  const registrationNumber = (input.registration_number || '').trim();
+  const nationalId = (input.national_id || '').trim();
+  const economicCode = (input.economic_code || '').trim();
+
+  if (!companyName || !registrationNumber || !nationalId || !economicCode) {
+    return {
+      ok: false,
+      error: 'نام شرکت، شماره ثبت، شناسه ملی و کد اقتصادی برای مشترک حقوقی الزامی است.',
+      customerName: '',
+      details: emptyDetails,
+    };
+  }
+
+  if (input.requested_service === 'new_service') {
+    const requiredLegalDocs = ['gazette', 'statutes', 'request_letter'];
+    const missing = requiredLegalDocs.filter((d) => !uploadedTypes.has(d));
+    if (missing.length > 0) {
+      return {
+        ok: false,
+        error: 'آپلود تصویر روزنامه رسمی، اساسنامه و نامه درخواست با مهر شرکت الزامی است.',
+        customerName: '',
+        details: emptyDetails,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    customerName: companyName,
+    details: {
+      entity_type: 'legal',
+      company_name: companyName,
+      registration_number: registrationNumber,
+      national_id: nationalId,
+      economic_code: economicCode,
+      postal_code: postalCode,
+      phone_1: phone1,
+      phone_2: phone2 || undefined,
+      fault_description: (input.fault_description || '').trim() || undefined,
+    },
+  };
+}
+
+export interface UserProfileV3Input {
+  first_name: string;
+  last_name: string;
+  father_name: string;
+  birth_date: string;
+  national_code: string;
+  id_number: string;
+  email: string;
+  phone_1: string;
+  phone_2?: string | null;
+  address: string;
+  referrer?: string | null;
+}
+
+export function validateUserProfileV3(input: UserProfileV3Input): {
+  ok: boolean;
+  error?: string;
+  fullName: string;
+  normalized: {
+    first_name: string;
+    last_name: string;
+    father_name: string;
+    birth_date: string;
+    national_code: string;
+    id_number: string;
+    email: string;
+    phone_1: string;
+    phone_2: string | null;
+    address: string;
+    referrer: string | null;
+    full_name: string;
+  };
+} {
+  const firstName = (input.first_name || '').trim();
+  const lastName = (input.last_name || '').trim();
+  const fatherName = (input.father_name || '').trim();
+  const birthDate = (input.birth_date || '').trim();
+  const nationalCode = (input.national_code || '').trim();
+  const idNumber = (input.id_number || '').trim();
+  const email = (input.email || '').trim().toLowerCase();
+  const phone1 = (input.phone_1 || '').trim();
+  const phone2 = (input.phone_2 || '').trim() || null;
+  const address = (input.address || '').trim();
+  const referrer = (input.referrer || '').trim() || null;
+
+  const fullName = `${firstName} ${lastName}`.trim();
+  const emptyNormalized = {
+    first_name: firstName,
+    last_name: lastName,
+    father_name: fatherName,
+    birth_date: birthDate,
+    national_code: nationalCode,
+    id_number: idNumber,
+    email,
+    phone_1: phone1,
+    phone_2: phone2,
+    address,
+    referrer,
+    full_name: fullName,
+  };
+
+  if (!firstName || !lastName || !fatherName || !birthDate || !idNumber || !address) {
+    return {
+      ok: false,
+      error: 'تمامی فیلدهای هویتی پرسنل (نام، نام خانوادگی، نام پدر، تاریخ تولد، شماره شناسنامه و آدرس) الزامی هستند.',
+      fullName,
+      normalized: emptyNormalized,
+    };
+  }
+  if (!/^\d{10}$/.test(nationalCode)) {
+    return {
+      ok: false,
+      error: 'کد ملی پرسنل باید دقیقاً ۱۰ رقم عددی باشد.',
+      fullName,
+      normalized: emptyNormalized,
+    };
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return {
+      ok: false,
+      error: 'فرمت ایمیل پرسنل معتبر نیست.',
+      fullName,
+      normalized: emptyNormalized,
+    };
+  }
+  if (!/^0\d{10}$/.test(phone1)) {
+    return {
+      ok: false,
+      error: 'شماره تماس ۱ باید ۱۱ رقم و با ۰ شروع شود.',
+      fullName,
+      normalized: emptyNormalized,
+    };
+  }
+  if (phone2 && !/^0\d{10}$/.test(phone2)) {
+    return {
+      ok: false,
+      error: 'شماره تماس ۲ (در صورت ورود) باید ۱۱ رقم و با ۰ شروع شود.',
+      fullName,
+      normalized: emptyNormalized,
+    };
+  }
+
+  return {
+    ok: true,
+    fullName,
+    normalized: emptyNormalized,
+  };
+}
+
+
 

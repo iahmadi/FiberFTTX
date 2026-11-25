@@ -15,6 +15,10 @@ export function ServiceRecordPdfReport({ record }: ServiceRecordPdfReportProps) 
   };
 
   const snap = record.price_snapshot;
+  const fusionCount = snap.fusion_count ?? record.fusion_count ?? 0;
+  const fusionFee = snap.fusion_fee ?? 0;
+  const dynamicMaterials = Array.isArray(record.dynamic_materials) ? record.dynamic_materials : [];
+  const historyList = Array.isArray(record.history) ? record.history : [];
 
   return (
     <div className="print-portal-root space-y-4">
@@ -88,6 +92,7 @@ export function ServiceRecordPdfReport({ record }: ServiceRecordPdfReportProps) 
                     {record.source_label}
                   </strong>{' '}
                   ({record.source_type})
+                  {record.port_number ? ` — پورت #${toPersianDigits(record.port_number)}` : ''}
                 </span>
               </div>
               <div>
@@ -101,6 +106,28 @@ export function ServiceRecordPdfReport({ record }: ServiceRecordPdfReportProps) 
             </div>
           </div>
         </div>
+
+        {record.splitter_changes && (
+          <div className="mt-4 rounded-lg border border-teal-200 bg-teal-50/40 p-3 text-xs">
+            <div className="mb-1.5 font-bold text-teal-950">تغییرات اسپلیتر F-FAT</div>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+              <div>
+                <span className="text-slate-500">اسپلیتر حذف‌شده والد: </span>
+                <strong dir="ltr">{record.splitter_changes.parent_fat_removed_splitter}</strong>
+              </div>
+              <div>
+                <span className="text-slate-500">اسپلیترهای نصب‌شده والد: </span>
+                <strong dir="ltr">
+                  {record.splitter_changes.parent_fat_installed_splitters.join(' , ')}
+                </strong>
+              </div>
+              <div>
+                <span className="text-slate-500">اسپلیتر باکس F-FAT: </span>
+                <strong dir="ltr">{record.splitter_changes.ffat_installed_splitter}</strong>
+              </div>
+            </div>
+          </div>
+        )}
 
         <div className="mt-4 overflow-hidden rounded-lg border border-slate-200">
           <table className="w-full text-right text-xs">
@@ -125,7 +152,7 @@ export function ServiceRecordPdfReport({ record }: ServiceRecordPdfReportProps) 
                 <td className="px-3 py-2 tabular-nums">
                   سقف مشمول: {toPersianDigits(snap.meter_limit)} متر
                 </td>
-                <td className="px-3 py-2 tabular-nums font-semibold">
+                <td className="px-3 py-2 font-semibold tabular-nums">
                   {formatCurrencyToman(snap.base_price)}
                 </td>
               </tr>
@@ -149,8 +176,18 @@ export function ServiceRecordPdfReport({ record }: ServiceRecordPdfReportProps) 
                   {toPersianDigits(snap.billable_extra_meter)} متر ×{' '}
                   {formatCurrencyToman(snap.extra_meter_price)}
                 </td>
-                <td className="px-3 py-2 tabular-nums font-semibold">
+                <td className="px-3 py-2 font-semibold tabular-nums">
                   {formatCurrencyToman(snap.extra_meter_fee)}
+                </td>
+              </tr>
+              <tr>
+                <td className="px-3 py-2">تعداد و اجرت فیوژن (Fusion)</td>
+                <td className="px-3 py-2 tabular-nums">
+                  {toPersianDigits(fusionCount)} عدد (سقف پایه:{' '}
+                  {toPersianDigits(snap.fusion_limit ?? 0)})
+                </td>
+                <td className="px-3 py-2 font-semibold tabular-nums">
+                  {formatCurrencyToman(fusionFee)}
                 </td>
               </tr>
               {snap.promotion_bonus > 0 && (
@@ -159,7 +196,7 @@ export function ServiceRecordPdfReport({ record }: ServiceRecordPdfReportProps) 
                     پاداش کمپین ({snap.promotion_name})
                   </td>
                   <td className="px-3 py-2 text-emerald-800">محقق‌شده در این سرویس</td>
-                  <td className="px-3 py-2 tabular-nums font-bold text-emerald-900">
+                  <td className="px-3 py-2 font-bold tabular-nums text-emerald-900">
                     {formatCurrencyToman(snap.promotion_bonus)}
                   </td>
                 </tr>
@@ -176,6 +213,24 @@ export function ServiceRecordPdfReport({ record }: ServiceRecordPdfReportProps) 
           </table>
         </div>
 
+        {dynamicMaterials.length > 0 && (
+          <div className="mt-4 rounded-lg border border-slate-200 p-3 text-xs">
+            <div className="mb-2 font-bold text-slate-800">
+              متریال و تجهیزات جانبی مصرفی از انبار خودرو (Van Stock)
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {dynamicMaterials.map((m) => (
+                <span
+                  key={m.item_id}
+                  className="rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1 font-medium tabular-nums"
+                >
+                  {m.item_name}: {toPersianDigits(m.quantity)} عدد
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
         {record.notes && (
           <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
             <strong>توضیحات فنی نصاب: </strong>
@@ -191,15 +246,31 @@ export function ServiceRecordPdfReport({ record }: ServiceRecordPdfReportProps) 
                 <div key={img.id} className="overflow-hidden rounded-lg border border-slate-200">
                   <img
                     src={img.file_path}
-                    alt={img.image_type}
+                    alt={img.caption || img.image_type}
                     className="h-32 w-full object-cover"
                   />
-                  <div className="bg-slate-50 px-2 py-1 text-[11px] text-slate-600">
-                    {img.image_type}
+                  <div className="bg-slate-50 px-2 py-1 text-[11px] text-slate-700">
+                    {img.caption ? img.caption : img.image_type}
                   </div>
                 </div>
               ))}
             </div>
+          </div>
+        )}
+
+        {historyList.length > 0 && (
+          <div className="no-print mt-4 rounded-lg border border-amber-200 bg-amber-50/50 p-3 text-xs">
+            <div className="mb-1.5 font-bold text-amber-950">
+              تاریخچه ویرایش‌های پس از تکمیل ({toPersianDigits(historyList.length)} مورد)
+            </div>
+            <ul className="space-y-1 text-[11px] text-amber-900">
+              {historyList.map((h) => (
+                <li key={h.id} className="tabular-nums">
+                  • ویرایش توسط <strong>{h.changed_by_name || 'سیستم'}</strong> در تاریخ{' '}
+                  {formatIsoToJalaliDisplay(h.changed_at)}
+                </li>
+              ))}
+            </ul>
           </div>
         )}
 

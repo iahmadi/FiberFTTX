@@ -1,12 +1,23 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { AlertTriangle, Cable, Package, Plus, TrendingDown, Truck } from 'lucide-react';
+import {
+  AlertTriangle,
+  Cable,
+  Package,
+  Pencil,
+  Plus,
+  Trash2,
+  TrendingDown,
+  Truck,
+} from 'lucide-react';
 import { InventoryForecastPanel } from '../components/InventoryForecastPanel';
+import { Modal } from '../components/Modal';
 import { getLowSpoolWarnings, getSpoolPercentRemaining, isSpoolLowStock } from '../lib/fiberLogic';
-import { toPersianDigits } from '../lib/jalali';
+import { formatCurrencyToman, toPersianDigits } from '../lib/jalali';
 import { userHasPermission } from '../lib/permissions';
 import type {
   AuthUser,
   InventoryItemRecord,
+  ModemBrandItem,
   SpoolConsumptionHistoryItem,
   SpoolItem,
   VanStockItem,
@@ -18,17 +29,25 @@ interface InventoryPageProps {
   spools: SpoolItem[];
   items: InventoryItemRecord[];
   vanStock: VanStockItem[];
+  modemBrands: ModemBrandItem[];
   installers: Array<{ id: number; full_name: string }>;
   consumptionHistory: SpoolConsumptionHistoryItem[];
   onRefresh: () => Promise<void>;
   onNotify: (type: 'success' | 'error' | 'warning' | 'info', title: string, desc?: string) => void;
 }
 
+const ITEM_TYPE_LABELS: Record<InventoryItemRecord['type'], string> = {
+  unit: 'اقلام مصرفی (عددی)',
+  spool: 'قرقره کابل',
+  modem: 'تجهیز مودم',
+};
+
 export function InventoryPage({
   user,
   spools,
   items,
   vanStock,
+  modemBrands,
   installers,
   consumptionHistory,
   onRefresh,
@@ -37,6 +56,16 @@ export function InventoryPage({
   const canManage = userHasPermission(user, 'can_manage_inventory');
   const alertedSpoolsRef = useRef<Set<string>>(new Set());
   const [activeSubTab, setActiveSubTab] = useState<'stock' | 'forecast'>('stock');
+
+  // Dynamic Inventory Item CRUD Modal state
+  const [itemModalOpen, setItemModalOpen] = useState(false);
+  const [editingItem, setEditingItem] = useState<InventoryItemRecord | null>(null);
+  const [itemName, setItemName] = useState('');
+  const [itemType, setItemType] = useState<'unit' | 'spool' | 'modem'>('unit');
+  const [itemBrandId, setItemBrandId] = useState('');
+  const [itemUnitPrice, setItemUnitPrice] = useState('0');
+  const [itemQty, setItemQty] = useState('0');
+  const [savingItem, setSavingItem] = useState(false);
 
   const [newSpoolCode, setNewSpoolCode] = useState('');
   const [newSpoolType, setNewSpoolType] = useState<'outdoor' | 'indoor'>('outdoor');
@@ -137,6 +166,69 @@ export function InventoryPage({
       await onRefresh();
     } catch (err) {
       onNotify('error', 'خطا در انتقال کالا به خودرو', err instanceof Error ? err.message : undefined);
+    }
+  };
+
+  const openCreateItemModal = () => {
+    setEditingItem(null);
+    setItemName('');
+    setItemType('unit');
+    setItemBrandId(modemBrands[0] ? String(modemBrands[0].id) : '');
+    setItemUnitPrice('0');
+    setItemQty('0');
+    setItemModalOpen(true);
+  };
+
+  const openEditItemModal = (it: InventoryItemRecord) => {
+    setEditingItem(it);
+    setItemName(it.name);
+    setItemType(it.type);
+    setItemBrandId(it.modem_brand_id ? String(it.modem_brand_id) : '');
+    setItemUnitPrice(String(it.unit_price || 0));
+    setItemQty(String(it.total_quantity || 0));
+    setItemModalOpen(true);
+  };
+
+  const handleSaveItem = async (e: FormEvent) => {
+    e.preventDefault();
+    setSavingItem(true);
+    try {
+      const payload = {
+        name: itemName.trim(),
+        type: itemType,
+        modem_brand_id: itemType === 'modem' && itemBrandId ? Number(itemBrandId) : null,
+        unit_price: Number(itemUnitPrice) || 0,
+        total_quantity: Number(itemQty) || 0,
+      };
+      if (editingItem) {
+        await apiFetch(`/api/inventory/items/${editingItem.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify(payload),
+        });
+        onNotify('success', `کالای «${payload.name}» بروزرسانی شد`);
+      } else {
+        await apiFetch('/api/inventory/items', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        onNotify('success', `کالای جدید «${payload.name}» به انبار مرکزی اضافه شد`);
+      }
+      setItemModalOpen(false);
+      await onRefresh();
+    } catch (err) {
+      onNotify('error', 'خطا در ذخیره کالای انبار', err instanceof Error ? err.message : undefined);
+    } finally {
+      setSavingItem(false);
+    }
+  };
+
+  const handleDeleteItem = async (it: InventoryItemRecord) => {
+    try {
+      await apiFetch(`/api/inventory/items/${it.id}`, { method: 'DELETE' });
+      onNotify('success', `کالای «${it.name}» حذف شد`);
+      await onRefresh();
+    } catch (err) {
+      onNotify('error', 'خطا در حذف کالا', err instanceof Error ? err.message : undefined);
     }
   };
 
@@ -366,32 +458,76 @@ export function InventoryPage({
       {/* Central Inventory + Van Stock */}
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
         <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-xs">
-          <div className="mb-3 flex items-center gap-2 text-sm font-bold text-slate-900">
-            <Package className="h-5 w-5 text-teal-700" />
-            <span>موجودی انبار مرکزی و تخصیص به خودروها</span>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-sm font-bold text-slate-900">
+              <Package className="h-5 w-5 text-teal-700" />
+              <span>موجودی انبار مرکزی، قیمت واحد و تخصیص به خودروها</span>
+            </div>
+            {canManage && (
+              <button
+                type="button"
+                data-testid="add-inventory-item-btn"
+                onClick={openCreateItemModal}
+                className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                <span>افزودن کالای جدید</span>
+              </button>
+            )}
           </div>
-          <table className="w-full text-right text-xs">
-            <thead className="border-b border-slate-200 bg-slate-50 text-slate-600">
-              <tr>
-                <th className="px-3 py-2 font-bold">نام کالا</th>
-                <th className="px-3 py-2 font-bold">در انبار مرکزی</th>
-                <th className="px-3 py-2 font-bold">تحویل‌شده به خودروها</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {items.map((it) => (
-                <tr key={it.id}>
-                  <td className="px-3 py-2 font-medium text-slate-900">{it.name}</td>
-                  <td className="px-3 py-2 tabular-nums font-bold">
-                    {toPersianDigits(it.total_quantity)}
-                  </td>
-                  <td className="px-3 py-2 tabular-nums text-teal-800">
-                    {toPersianDigits(it.van_allocated_quantity)}
-                  </td>
+          <div className="overflow-x-auto">
+            <table className="w-full text-right text-xs">
+              <thead className="border-b border-slate-200 bg-slate-50 text-slate-600">
+                <tr>
+                  <th className="px-3 py-2 font-bold">نام کالا</th>
+                  <th className="px-3 py-2 font-bold">نوع</th>
+                  <th className="px-3 py-2 font-bold">قیمت واحد</th>
+                  <th className="px-3 py-2 font-bold">انبار مرکزی</th>
+                  <th className="px-3 py-2 font-bold">انبار خودروها</th>
+                  {canManage && <th className="px-3 py-2 font-bold">عملیات</th>}
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {items.map((it) => (
+                  <tr key={it.id}>
+                    <td className="px-3 py-2 font-medium text-slate-900">{it.name}</td>
+                    <td className="px-3 py-2 text-slate-600">{ITEM_TYPE_LABELS[it.type]}</td>
+                    <td className="px-3 py-2 tabular-nums text-slate-700">
+                      {formatCurrencyToman(it.unit_price)}
+                    </td>
+                    <td className="px-3 py-2 tabular-nums font-bold">
+                      {toPersianDigits(it.total_quantity)}
+                    </td>
+                    <td className="px-3 py-2 tabular-nums text-teal-800">
+                      {toPersianDigits(it.van_allocated_quantity)}
+                    </td>
+                    {canManage && (
+                      <td className="px-3 py-2">
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => openEditItemModal(it)}
+                            aria-label={`ویرایش ${it.name}`}
+                            className="inline-flex h-7 w-7 items-center justify-center rounded border border-slate-200 text-slate-600 hover:bg-slate-100"
+                          >
+                            <Pencil className="h-3 w-3" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleDeleteItem(it)}
+                            aria-label={`حذف ${it.name}`}
+                            className="inline-flex h-7 w-7 items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        </div>
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
 
           {canManage && (
             <form
@@ -497,6 +633,106 @@ export function InventoryPage({
       </div>
         </>
       )}
+
+      {/* Create / Edit Inventory Item Modal */}
+      <Modal
+        open={itemModalOpen}
+        onClose={() => setItemModalOpen(false)}
+        title={editingItem ? `ویرایش کالا: ${editingItem.name}` : 'افزودن قلم کالای جدید به انبار'}
+        maxWidthClass="max-w-lg"
+      >
+        <form onSubmit={handleSaveItem} className="space-y-4">
+          <div>
+            <label className="mb-1 block text-xs font-semibold text-slate-700">نام کالا / تجهیز</label>
+            <input
+              type="text"
+              required
+              value={itemName}
+              onChange={(e) => setItemName(e.target.value)}
+              placeholder="مثلاً پیگ‌تیل SC/APC یا پریز OTO"
+              className="min-h-[42px] w-full rounded-lg border border-slate-300 px-3 text-sm"
+            />
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">نوع کالا</label>
+              <select
+                value={itemType}
+                onChange={(e) => setItemType(e.target.value as 'unit' | 'spool' | 'modem')}
+                className="min-h-[42px] w-full rounded-lg border border-slate-300 bg-white px-2.5 text-xs"
+              >
+                <option value="unit">اقلام مصرفی عددی (ATB/پچ‌کورد/...)</option>
+                <option value="modem">تجهیز مودم (سریال‌دار)</option>
+                <option value="spool">قرقره کابل</option>
+              </select>
+            </div>
+
+            {itemType === 'modem' && (
+              <div>
+                <label className="mb-1 block text-xs font-semibold text-slate-700">برند مودم</label>
+                <select
+                  value={itemBrandId}
+                  onChange={(e) => setItemBrandId(e.target.value)}
+                  className="min-h-[42px] w-full rounded-lg border border-slate-300 bg-white px-2.5 text-xs"
+                >
+                  <option value="">انتخاب برند...</option>
+                  {modemBrands.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">
+                قیمت واحد فروش به مشترک (تومان)
+              </label>
+              <input
+                type="number"
+                min={0}
+                required
+                value={itemUnitPrice}
+                onChange={(e) => setItemUnitPrice(e.target.value)}
+                className="min-h-[42px] w-full rounded-lg border border-slate-300 px-3 text-sm tabular-nums"
+              />
+            </div>
+
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">
+                موجودی انبار مرکزی
+              </label>
+              <input
+                type="number"
+                min={0}
+                required
+                value={itemQty}
+                onChange={(e) => setItemQty(e.target.value)}
+                className="min-h-[42px] w-full rounded-lg border border-slate-300 px-3 text-sm tabular-nums"
+              />
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2 border-t border-slate-100 pt-3">
+            <button
+              type="button"
+              onClick={() => setItemModalOpen(false)}
+              className="min-h-[40px] rounded-lg border border-slate-200 px-4 text-xs font-semibold text-slate-700"
+            >
+              انصراف
+            </button>
+            <button
+              type="submit"
+              disabled={savingItem}
+              className="min-h-[40px] rounded-lg bg-teal-700 px-5 text-xs font-bold text-white hover:bg-teal-800 disabled:opacity-60"
+            >
+              {savingItem ? 'در حال ذخیره...' : editingItem ? 'ذخیره تغییرات' : 'ایجاد کالا'}
+            </button>
+          </div>
+        </form>
+      </Modal>
     </div>
   );
 }

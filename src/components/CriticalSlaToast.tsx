@@ -1,5 +1,5 @@
 import { AlertTriangle, ArrowLeft, Eye, X } from 'lucide-react';
-import { TICKET_TYPE_LABELS, type CriticalSlaTransitionAlert } from '../lib/fiberLogic';
+import { ALL_TICKET_TYPE_LABELS, type CriticalSlaTransitionAlert } from '../lib/fiberLogic';
 import { formatIsoToJalaliDisplay, toPersianDigits } from '../lib/jalali';
 
 interface CriticalSlaToastProps {
@@ -68,7 +68,7 @@ export function CriticalSlaToast({
                   تیکت #{toPersianDigits(alert.ticketId)} — {alert.customerName}
                 </p>
                 <p className="mt-0.5 text-xs text-slate-600">
-                  {TICKET_TYPE_LABELS[alert.ticketType]} · مجری فنی:{' '}
+                  {ALL_TICKET_TYPE_LABELS[alert.ticketType]} · مجری فنی:{' '}
                   <strong className="font-semibold text-slate-800">{alert.installerName}</strong>
                 </p>
 

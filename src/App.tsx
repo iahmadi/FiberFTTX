@@ -22,13 +22,16 @@ import { FinancialPage } from './pages/FinancialPage';
 import { HardwarePage } from './pages/HardwarePage';
 import { InventoryPage } from './pages/InventoryPage';
 import { LoginPage } from './pages/LoginPage';
+import { PublicPortalPage } from './pages/PublicPortalPage';
 import { ServiceFormPage } from './pages/ServiceFormPage';
+import { SettingsPage } from './pages/SettingsPage';
 import { TicketsPage } from './pages/TicketsPage';
 import { UsersRbacPage } from './pages/UsersRbacPage';
 import type {
   ActivityLogItem,
   AuthUser,
   ContractorBalanceSummary,
+  CustomerPackageItem,
   FatItem,
   FFatItem,
   InventoryItemRecord,
@@ -38,9 +41,11 @@ import type {
   OltItem,
   PermissionDef,
   PromotionItem,
+  RegionItem,
   RoleWithPerms,
   SpoolConsumptionHistoryItem,
   SpoolItem,
+  SystemSettings,
   TariffTemplateItem,
   TicketItem,
   UserAccountRow,
@@ -55,13 +60,26 @@ import {
   uploadCompressedImage,
 } from './utils/api';
 
+const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
+  system_name: 'آوانتورک ERP فیبر نوری',
+  primary_color: '#0f766e',
+};
+
+function isDashboardPath(pathname: string): boolean {
+  return pathname.startsWith('/dashboard');
+}
+
 export default function App() {
   const isOnline = useOnlineStatus();
 
+  const [routePath, setRoutePath] = useState<string>(() =>
+    typeof window !== 'undefined' ? window.location.pathname || '/' : '/',
+  );
   const [authReady, setAuthReady] = useState(false);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
   const [selectedServiceTicketId, setSelectedServiceTicketId] = useState<number | null>(null);
+  const [editingCompletedTicketId, setEditingCompletedTicketId] = useState<number | null>(null);
   const [focusTicketId, setFocusTicketId] = useState<number | null>(null);
 
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
@@ -84,6 +102,11 @@ export default function App() {
       return new Set<string>();
     })(),
   );
+
+  // Branding & Public Portal states
+  const [systemSettings, setSystemSettings] = useState<SystemSettings>(DEFAULT_SYSTEM_SETTINGS);
+  const [publicRegions, setPublicRegions] = useState<RegionItem[]>([]);
+  const [adminRegions, setAdminRegions] = useState<RegionItem[]>([]);
 
   // Domain states
   const [dashboardData, setDashboardData] = useState<DashboardPayload | null>(null);
@@ -108,6 +131,7 @@ export default function App() {
 
   const [templates, setTemplates] = useState<TariffTemplateItem[]>([]);
   const [promotions, setPromotions] = useState<PromotionItem[]>([]);
+  const [customerPackages, setCustomerPackages] = useState<CustomerPackageItem[]>([]);
   const [userTariffs, setUserTariffs] = useState<UserTariffAssignment[]>([]);
   const [ledger, setLedger] = useState<LedgerEntryItem[]>([]);
   const [contractorSummaries, setContractorSummaries] = useState<ContractorBalanceSummary[]>([]);
@@ -119,6 +143,55 @@ export default function App() {
   const [roles, setRoles] = useState<RoleWithPerms[]>([]);
   const [permissions, setPermissions] = useState<PermissionDef[]>([]);
   const [activityLogs, setActivityLogs] = useState<ActivityLogItem[]>([]);
+
+  const navigateTo = useCallback((path: string) => {
+    if (typeof window !== 'undefined' && window.location.pathname !== path) {
+      window.history.pushState({}, '', path);
+    }
+    setRoutePath(path);
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => {
+      setRoutePath(window.location.pathname || '/');
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  useEffect(() => {
+    const color = systemSettings.primary_color || '#0f766e';
+    const name = systemSettings.system_name || DEFAULT_SYSTEM_SETTINGS.system_name;
+    document.documentElement.style.setProperty('--brand-primary', color);
+    document.title = `${name} — سامانه جامع عملیات فیبر نوری`;
+  }, [systemSettings]);
+
+  const loadPortalConfig = useCallback(async () => {
+    try {
+      const cfg = await apiFetch<{
+        settings: SystemSettings;
+        regions: RegionItem[];
+      }>('/api/public/portal-config');
+      if (cfg.settings) {
+        setSystemSettings(cfg.settings);
+      }
+      if (Array.isArray(cfg.regions)) {
+        setPublicRegions(cfg.regions);
+      }
+      await saveOfflineSnapshot('portal_config', cfg);
+    } catch {
+      const snap = await loadOfflineSnapshot<{
+        settings: SystemSettings;
+        regions: RegionItem[];
+      }>('portal_config');
+      if (snap?.settings) setSystemSettings(snap.settings);
+      if (Array.isArray(snap?.regions)) setPublicRegions(snap.regions);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadPortalConfig();
+  }, [loadPortalConfig]);
 
   const pushCriticalSlaAlerts = useCallback((incoming: CriticalSlaTransitionAlert[] | undefined) => {
     if (!incoming || incoming.length === 0) return;
@@ -181,52 +254,61 @@ export default function App() {
       'can_execute_service',
     );
     const canUsers = userHasPermission(currentUser, 'can_manage_users');
+    const canSettings = userHasPermission(currentUser, 'can_manage_settings');
 
-    const [dashRes, tktRes, hwRes, invRes, finRes, usersRes, logsRes] = await Promise.allSettled([
-      apiFetch<DashboardPayload>('/api/dashboard'),
-      apiFetch<{
-        tickets: TicketItem[];
-        installers: Array<{ id: number; full_name: string; username: string; role_name: string }>;
-      }>('/api/tickets'),
-      canHardware
-        ? apiFetch<{
-            kafs: KafItem[];
-            olts: OltItem[];
-            fats: FatItem[];
-            ffats: FFatItem[];
-            modemBrands: ModemBrandItem[];
-          }>('/api/hardware')
-        : Promise.resolve(null),
-      canInventory
-        ? apiFetch<{
-            spools: SpoolItem[];
-            items: InventoryItemRecord[];
-            vanStock: VanStockItem[];
-            installers: Array<{ id: number; full_name: string }>;
-            consumptionHistory?: SpoolConsumptionHistoryItem[];
-          }>('/api/inventory')
-        : Promise.resolve(null),
-      canFinancial
-        ? apiFetch<{
-            templates: TariffTemplateItem[];
-            promotions: PromotionItem[];
-            userTariffs: UserTariffAssignment[];
-            ledger: LedgerEntryItem[];
-            contractorSummaries: ContractorBalanceSummary[];
-            users: Array<{ id: number; username: string; full_name: string }>;
-          }>('/api/financial')
-        : Promise.resolve(null),
-      canUsers
-        ? apiFetch<{
-            users: UserAccountRow[];
-            roles: RoleWithPerms[];
-            permissions: PermissionDef[];
-          }>('/api/users')
-        : Promise.resolve(null),
-      canUsers
-        ? apiFetch<{ logs: ActivityLogItem[] }>('/api/activity-logs')
-        : Promise.resolve(null),
-    ]);
+    const [dashRes, tktRes, hwRes, invRes, finRes, usersRes, logsRes, settingsRes] =
+      await Promise.allSettled([
+        apiFetch<DashboardPayload>('/api/dashboard'),
+        apiFetch<{
+          tickets: TicketItem[];
+          installers: Array<{ id: number; full_name: string; username: string; role_name: string }>;
+          packages?: CustomerPackageItem[];
+          modemBrands?: ModemBrandItem[];
+          regions?: RegionItem[];
+        }>('/api/tickets'),
+        canHardware
+          ? apiFetch<{
+              kafs: KafItem[];
+              olts: OltItem[];
+              fats: FatItem[];
+              ffats: FFatItem[];
+              modemBrands: ModemBrandItem[];
+            }>('/api/hardware')
+          : Promise.resolve(null),
+        canInventory
+          ? apiFetch<{
+              spools: SpoolItem[];
+              items: InventoryItemRecord[];
+              vanStock: VanStockItem[];
+              installers: Array<{ id: number; full_name: string }>;
+              consumptionHistory?: SpoolConsumptionHistoryItem[];
+            }>('/api/inventory')
+          : Promise.resolve(null),
+        canFinancial
+          ? apiFetch<{
+              templates: TariffTemplateItem[];
+              promotions: PromotionItem[];
+              packages?: CustomerPackageItem[];
+              userTariffs: UserTariffAssignment[];
+              ledger: LedgerEntryItem[];
+              contractorSummaries: ContractorBalanceSummary[];
+              users: Array<{ id: number; username: string; full_name: string }>;
+            }>('/api/financial')
+          : Promise.resolve(null),
+        canUsers
+          ? apiFetch<{
+              users: UserAccountRow[];
+              roles: RoleWithPerms[];
+              permissions: PermissionDef[];
+            }>('/api/users')
+          : Promise.resolve(null),
+        canUsers
+          ? apiFetch<{ logs: ActivityLogItem[] }>('/api/activity-logs')
+          : Promise.resolve(null),
+        canSettings
+          ? apiFetch<{ settings: SystemSettings; regions: RegionItem[] }>('/api/settings')
+          : Promise.resolve(null),
+      ]);
 
     if (dashRes.status === 'fulfilled') {
       setDashboardData(dashRes.value);
@@ -246,6 +328,10 @@ export default function App() {
       if (dashSnap) setDashboardData(dashSnap);
     }
 
+    let fallbackPackages: CustomerPackageItem[] = [];
+    let fallbackModemBrands: ModemBrandItem[] = [];
+    let fallbackRegions: RegionItem[] = [];
+
     if (tktRes.status === 'fulfilled') {
       if (lastComparableTicketsRef.current.length > 0) {
         pushCriticalSlaAlerts(
@@ -258,15 +344,24 @@ export default function App() {
       lastComparableTicketsRef.current = tktRes.value.tickets;
       setTickets(tktRes.value.tickets);
       setTicketInstallers(tktRes.value.installers);
+      fallbackPackages = tktRes.value.packages ?? [];
+      fallbackModemBrands = tktRes.value.modemBrands ?? [];
+      fallbackRegions = tktRes.value.regions ?? [];
       await saveOfflineSnapshot('tickets', tktRes.value);
     } else {
       const tktSnap = await loadOfflineSnapshot<{
         tickets: TicketItem[];
         installers: Array<{ id: number; full_name: string; username: string; role_name: string }>;
+        packages?: CustomerPackageItem[];
+        modemBrands?: ModemBrandItem[];
+        regions?: RegionItem[];
       }>('tickets');
       if (tktSnap) {
         setTickets(tktSnap.tickets);
         setTicketInstallers(tktSnap.installers);
+        fallbackPackages = tktSnap.packages ?? [];
+        fallbackModemBrands = tktSnap.modemBrands ?? [];
+        fallbackRegions = tktSnap.regions ?? [];
       }
     }
 
@@ -292,6 +387,8 @@ export default function App() {
           setFats(hwSnap.fats);
           setFfats(hwSnap.ffats);
           setModemBrands(hwSnap.modemBrands);
+        } else {
+          setModemBrands(fallbackModemBrands);
         }
       }
     } else {
@@ -299,7 +396,7 @@ export default function App() {
       setOlts([]);
       setFats([]);
       setFfats([]);
-      setModemBrands([]);
+      setModemBrands(fallbackModemBrands);
     }
 
     if (canInventory) {
@@ -338,6 +435,7 @@ export default function App() {
       if (finRes.status === 'fulfilled' && finRes.value) {
         setTemplates(finRes.value.templates);
         setPromotions(finRes.value.promotions);
+        setCustomerPackages(finRes.value.packages ?? fallbackPackages);
         setUserTariffs(finRes.value.userTariffs);
         setLedger(finRes.value.ledger);
         setContractorSummaries(finRes.value.contractorSummaries);
@@ -347,6 +445,7 @@ export default function App() {
         const finSnap = await loadOfflineSnapshot<{
           templates: TariffTemplateItem[];
           promotions: PromotionItem[];
+          packages?: CustomerPackageItem[];
           userTariffs: UserTariffAssignment[];
           ledger: LedgerEntryItem[];
           contractorSummaries: ContractorBalanceSummary[];
@@ -355,15 +454,19 @@ export default function App() {
         if (finSnap) {
           setTemplates(finSnap.templates);
           setPromotions(finSnap.promotions);
+          setCustomerPackages(finSnap.packages ?? fallbackPackages);
           setUserTariffs(finSnap.userTariffs);
           setLedger(finSnap.ledger);
           setContractorSummaries(finSnap.contractorSummaries);
           setFinancialUsers(finSnap.users);
+        } else {
+          setCustomerPackages(fallbackPackages);
         }
       }
     } else {
       setTemplates([]);
       setPromotions([]);
+      setCustomerPackages(fallbackPackages);
       setUserTariffs([]);
       setLedger([]);
       setContractorSummaries([]);
@@ -385,6 +488,14 @@ export default function App() {
     } else if (!canUsers) {
       setActivityLogs([]);
     }
+
+    if (canSettings && settingsRes.status === 'fulfilled' && settingsRes.value) {
+      setSystemSettings(settingsRes.value.settings);
+      setAdminRegions(settingsRes.value.regions);
+      setPublicRegions(settingsRes.value.regions.filter((r) => r.is_active));
+    } else {
+      setAdminRegions(fallbackRegions);
+    }
   }, [pushCriticalSlaAlerts]);
 
   const refreshSessionAndData = useCallback(async () => {
@@ -395,16 +506,21 @@ export default function App() {
   }, [loadAllData]);
 
   const handleSyncNow = useCallback(async () => {
-    if (!isOnline || isSyncing || !user) return;
+    if (!isOnline || isSyncing) return;
     const pending = await listOutboxItems();
-    if (pending.length === 0) {
-      setPendingSyncCount(0);
+    const relevantPending = user
+      ? pending
+      : pending.filter((p) => p.kind === 'public_preregistration');
+
+    if (relevantPending.length === 0) {
+      if (user) setPendingSyncCount(pending.length);
       return;
     }
 
     setIsSyncing(true);
     try {
       const result = await syncOutboxQueue({
+        onlyKinds: user ? undefined : ['public_preregistration'],
         uploadBlob: uploadCompressedImage,
         apiPost: (url, body) =>
           apiFetch(url, {
@@ -418,7 +534,9 @@ export default function App() {
           'success',
           `${toPersianDigits(result.syncedCount)} مورد آفلاین با سرور همگام‌سازی شد`,
         );
-        await loadAllData(user);
+        if (user) {
+          await loadAllData(user);
+        }
       }
       if (result.failedCount > 0) {
         notify(
@@ -490,14 +608,14 @@ export default function App() {
 
   // Auto-sync IndexedDB outbox immediately when online state returns
   useEffect(() => {
-    if (isOnline && user) {
+    if (isOnline) {
       void handleSyncNow();
     }
   }, [isOnline, user, handleSyncNow]);
 
   // Live poll dashboard every 5s while active so Critical SLA updates by technicians alert immediately
   useEffect(() => {
-    if (activeTab !== 'dashboard' || !isOnline || !user) return;
+    if (!isDashboardPath(routePath) || activeTab !== 'dashboard' || !isOnline || !user) return;
     let cancelled = false;
 
     const timer = setInterval(async () => {
@@ -524,7 +642,7 @@ export default function App() {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [activeTab, isOnline, user, pushCriticalSlaAlerts]);
+  }, [routePath, activeTab, isOnline, user, pushCriticalSlaAlerts]);
 
   const handleLogout = async () => {
     setMemoryAuthToken(null);
@@ -536,10 +654,34 @@ export default function App() {
     }
   };
 
+  // Public Customer Landing Portal (/)
+  if (!isDashboardPath(routePath)) {
+    return (
+      <>
+        <PublicPortalPage
+          settings={systemSettings}
+          regions={publicRegions}
+          isOnline={isOnline}
+          pendingSyncCount={pendingSyncCount}
+          isSyncing={isSyncing}
+          onSyncNow={handleSyncNow}
+          onOutboxChanged={refreshOutboxCount}
+          onNavigateDashboard={() => navigateTo('/dashboard')}
+          onNotify={notify}
+        />
+        <ToastContainer
+          toasts={toasts}
+          onDismiss={(id) => setToasts((prev) => prev.filter((t) => t.id !== id))}
+        />
+      </>
+    );
+  }
+
+  // Protected ERP Dashboard (/dashboard)
   if (!authReady) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-slate-50 text-sm text-slate-600">
-        در حال بارگذاری سامانه آوانتورک ERP...
+        در حال بارگذاری {systemSettings.system_name}...
       </div>
     );
   }
@@ -547,7 +689,11 @@ export default function App() {
   if (!user) {
     return (
       <>
-        <LoginPage onAuthenticated={refreshSessionAndData} />
+        <LoginPage
+          systemSettings={systemSettings}
+          onAuthenticated={refreshSessionAndData}
+          onNavigatePublicPortal={() => navigateTo('/')}
+        />
         <ToastContainer
           toasts={toasts}
           onDismiss={(id) => setToasts((prev) => prev.filter((t) => t.id !== id))}
@@ -560,9 +706,17 @@ export default function App() {
     <>
       <Layout
         user={user}
+        systemSettings={systemSettings}
         activeTab={activeTab}
-        onSelectTab={setActiveTab}
+        onSelectTab={(tab) => {
+          if (tab !== 'service') {
+            setEditingCompletedTicketId(null);
+          }
+          setActiveTab(tab);
+        }}
+        onNavigatePublicPortal={() => navigateTo('/')}
         onLogout={handleLogout}
+        onNotify={notify}
         isOnline={isOnline}
         pendingSyncCount={pendingSyncCount}
         isSyncing={isSyncing}
@@ -588,11 +742,21 @@ export default function App() {
             user={user}
             tickets={tickets}
             installers={ticketInstallers}
+            packages={customerPackages}
+            modemBrands={modemBrands}
+            regions={adminRegions}
+            systemSettings={systemSettings}
             isOnline={isOnline}
             initialFocusTicketId={focusTicketId}
             onRefresh={() => loadAllData(user)}
-            onOpenServiceForm={(ticketId) => {
-              setSelectedServiceTicketId(ticketId);
+            onOpenServiceForm={(ticketId, editCompleted) => {
+              if (editCompleted) {
+                setEditingCompletedTicketId(ticketId);
+                setSelectedServiceTicketId(ticketId);
+              } else {
+                setEditingCompletedTicketId(null);
+                setSelectedServiceTicketId(ticketId);
+              }
               setActiveTab('service');
             }}
             onNotify={notify}
@@ -610,9 +774,15 @@ export default function App() {
             spools={spools}
             vanStock={vanStock}
             selectedTicketId={selectedServiceTicketId}
+            editingCompletedTicketId={editingCompletedTicketId}
             isOnline={isOnline}
             onSelectTicketId={setSelectedServiceTicketId}
+            onCancelEdit={() => {
+              setEditingCompletedTicketId(null);
+              setActiveTab('tickets');
+            }}
             onCompleted={async () => {
+              setEditingCompletedTicketId(null);
               await loadAllData(user);
               setActiveTab('tickets');
             }}
@@ -640,6 +810,7 @@ export default function App() {
             spools={spools}
             items={inventoryItems}
             vanStock={vanStock}
+            modemBrands={modemBrands}
             installers={inventoryInstallers}
             consumptionHistory={consumptionHistory}
             onRefresh={() => loadAllData(user)}
@@ -652,6 +823,8 @@ export default function App() {
             user={user}
             templates={templates}
             promotions={promotions}
+            packages={customerPackages}
+            tickets={tickets}
             userTariffs={userTariffs}
             ledger={ledger}
             contractorSummaries={contractorSummaries}
@@ -671,6 +844,16 @@ export default function App() {
             onNotify={notify}
           />
         )}
+
+        {activeTab === 'settings' && (
+          <SettingsPage
+            settings={systemSettings}
+            regions={adminRegions}
+            onRefresh={() => loadAllData(user)}
+            onSettingsUpdated={(next) => setSystemSettings(next)}
+            onNotify={notify}
+          />
+        )}
       </Layout>
 
       <ToastContainer
@@ -680,3 +863,4 @@ export default function App() {
     </>
   );
 }
+
